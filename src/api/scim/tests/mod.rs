@@ -203,6 +203,26 @@ async fn minted_token_round_trips_and_rotation_kills_the_old_one() {
 }
 
 #[rocket::async_test]
+async fn malformed_resource_id_is_scim_enveloped_not_html() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-malformed-id-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    // A path id that is not a uuid fails Rocket's param guard with a 422 before
+    // any handler runs. Without a 422 catcher that surfaces as Rocket's default
+    // HTML page, which a SCIM client parsing JSON cannot handle.
+    let response = client.get(format!("/scim/v2/{org}/Users/not-a-uuid")).header(bearer(&token)).dispatch().await;
+    let content_type = response.headers().get_one("Content-Type").expect("content type").to_owned();
+    assert!(content_type.starts_with(SCIM_CONTENT_TYPE), "malformed id returned {content_type}, expected SCIM json");
+
+    let body = body_of(response).await;
+    assert!(body.contains("urn:ietf:params:scim:api:messages:2.0:Error"), "not a SCIM error envelope: {body}");
+    assert!(!body.contains("<!DOCTYPE"), "returned an HTML page: {body}");
+}
+
+#[rocket::async_test]
 async fn unknown_scim_route_is_scim_enveloped_404() {
     let _guard = TEST_LOCK.lock().await;
     let (client, _pool) = scim_client().await;

@@ -168,6 +168,7 @@ pub fn catchers() -> Vec<Catcher> {
         scim_bad_request,
         scim_unauthorized,
         scim_not_found,
+        scim_unprocessable_entity,
         scim_payload_too_large,
         scim_too_many_requests,
         scim_internal
@@ -187,6 +188,16 @@ fn scim_unauthorized() -> ScimError {
 #[catch(404)]
 fn scim_not_found() -> ScimError {
     ScimError::not_found()
+}
+
+// Rocket answers 422 when a path or query parameter fails its guard - a
+// malformed resource id, or a non-numeric startIndex. Without this catcher the
+// caller receives Rocket's default HTML error page instead of a SCIM envelope,
+// which a SCIM client parsing JSON cannot make sense of. Reported as 400
+// invalidValue: 422 is not a status RFC 7644 uses.
+#[catch(422)]
+fn scim_unprocessable_entity() -> ScimError {
+    ScimError::bad_request("invalidValue", "Malformed request parameter")
 }
 
 #[catch(413)]
