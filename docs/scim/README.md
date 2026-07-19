@@ -229,10 +229,24 @@ In the Entra admin center (`entra.microsoft.com`):
 
 ### The one rule
 
-> **Only what you assign to the enterprise app is synced.**
+> **Only what you assign to the enterprise app is synced, and only its direct
+> members.**
 > Assigning a group makes it a Vaultwarden group and provisions its members.
 > Every Entra group you do **not** assign is invisible to Vaultwarden - even the
 > other groups that a provisioned user happens to belong to.
+
+Two consequences worth stating plainly:
+
+- **Assign as many groups as you like.** There is no limit imposed here - assign
+  one group or fifty. Each assigned group becomes a Vaultwarden group (when group
+  provisioning is on) and contributes its members. The assignment list is simply
+  the set of groups you want synced.
+- **Nesting is not followed.** Entra itself allows nested groups, but the
+  provisioning service does **not** traverse them: only the *direct* members of
+  an assigned group are provisioned. A sub-group inside an assigned group
+  contributes nothing - neither its users nor itself. You do not need to
+  restructure your directory; just **assign every group you want synced,
+  individually**, including the nested ones.
 
 There is no group allowlist in Vaultwarden itself. The server accepts whatever
 the organization's SCIM token sends it, so **Entra's assignment list is the
@@ -254,11 +268,15 @@ becomes a *group object* inside Vaultwarden depends on the second switch.
 ### Steps
 
 1. In Entra, decide (or create) the groups that should exist in Vaultwarden -
-   for example `VW-Engineering`, `VW-Finance`. A naming prefix makes the
-   in-scope set obvious to whoever audits it later.
+   for example `VW-Engineering`, `VW-Finance`, `VW-Support`. A naming prefix
+   makes the in-scope set obvious to whoever audits it later.
 2. Enterprise app > **Users and groups** > **Add user/group**. Assign **exactly
-   those groups** and nothing else. This list is your allowlist: add a group here
-   to bring it into Vaultwarden, remove it to take it out of scope.
+   those groups** and nothing else. Assign as many as you need - the picker takes
+   multiple groups. This list is your allowlist: add a group here to bring it
+   into Vaultwarden, remove it to take it out of scope.
+   - If any group you want is **nested inside** another assigned group, assign it
+     here **in its own right** as well. Provisioning does not look inside nested
+     groups, so an unassigned sub-group syncs nothing.
 3. **Provisioning > Start provisioning** (initial cycle), or **Provision on
    demand** to push a single user immediately while testing.
 4. Watch **Provisioning logs**. The first cycle *lists* existing users
@@ -279,11 +297,14 @@ becomes a *group object* inside Vaultwarden depends on the second switch.
 
 ### Traps to know before you design your groups
 
-- **Nested groups are not followed.** Entra provisions only the *direct* members
-  of an assigned group. If you assign `VW-All-Staff` and it contains other
-  groups, those nested members are **not** provisioned. This is an Entra
-  limitation, not something this server can work around - assign flat groups, or
-  assign each sub-group individually.
+- **Nested groups are not followed.** Entra lets you nest groups, but its
+  provisioning service does not traverse them - only the *direct* members of an
+  assigned group are provisioned. Assign `VW-All-Staff` and it contains
+  `VW-Engineering`, and you get neither the engineers nor an Engineering group in
+  Vaultwarden. This is an Entra limitation, not something this server can work
+  around. Fix it by assigning each group you want individually (nesting in the
+  directory is fine, it is just ignored by the sync), or by flattening the groups
+  you assign.
 - **Assign users before (or together with) their groups.** A group member whose
   org membership does not exist yet is rejected with a `400`. Entra provisions
   users before groups, so assigning both at once is fine.
