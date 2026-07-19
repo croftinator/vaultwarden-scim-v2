@@ -14,3 +14,7 @@ data
 
 # Web vault
 web-vault
+
+# gstack local tooling artifacts (security reports, review logs, etc.)
+# These stay on the developer's machine; never commit them to this public repo.
+.gstack/
