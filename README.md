@@ -1,3 +1,9 @@
+> [!NOTE]
+> **This fork adds a SCIM v2 provisioning server** (RFC 7643 / RFC 7644) for
+> identity-provider-driven organization membership, tested against Microsoft
+> Entra ID. Setup and rollout: **[docs/scim/](docs/scim/)**.
+> Everything below is the upstream Vaultwarden README.
+
 ![Vaultwarden Logo](./resources/vaultwarden-logo-auto.svg)
 
 An alternative server implementation of the Bitwarden Client API, written in Rust and compatible with [official Bitwarden clients](https://bitwarden.com/download/) [[disclaimer](#disclaimer)], perfect for self-hosted deployment where running the official resource-heavy service might not be ideal.
