@@ -32,6 +32,14 @@ behaviour, but no real Entra sync has run against this build yet.
 
 **Context:** User-driven (needs a tenant). Never production. The rate limiter
 keys on `IP_HEADER` (`X-Real-IP`) - the deployment in front must set it.
+Note that Entra automatic provisioning needs an Entra ID P1/P2 licence, so a
+free tenant will not offer it.
+
+**Cheaper rungs first** (see "Testing this implementation" in
+docs/scim/README.md): `tools/scim-entra-replay.sh` replays Entra's exact
+request shapes at a running server, and Microsoft's hosted SCIM Validator
+checks Entra compatibility without any tenant. Only assignment scoping, sync
+cycles, and nested-group behaviour genuinely require a tenant.
 
 **Effort:** M
 **Priority:** P1
