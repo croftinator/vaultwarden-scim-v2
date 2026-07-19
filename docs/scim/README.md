@@ -211,23 +211,92 @@ In the Entra admin center (`entra.microsoft.com`):
 
 6. Set **matching precedence 1** on `userName` (and optionally `externalId`) so
    Entra correlates existing members instead of creating duplicates.
-7. Leave **Provision Microsoft Entra ID Groups** disabled unless you are syncing
-   groups. If you are (and `ORG_GROUPS_ENABLED=true` on the server), enable it
-   and map `displayName` and `objectId` -> `externalId`.
-8. Under **Settings**, set **Scope** to *Sync only assigned users and groups*
-   (recommended), and set a notification email for sync failures. **Save**.
+7. Leave **Provision Microsoft Entra ID Groups** disabled unless you want the
+   Entra groups to exist as **Vaultwarden groups**. If you do (and
+   `ORG_GROUPS_ENABLED=true` on the server), enable it and map `displayName` and
+   `objectId` -> `externalId`. This switch only controls whether *group objects*
+   are created - which users get provisioned is decided by assignment; see
+   [Part D](#part-d---choose-which-users-and-groups-sync).
+8. Under **Settings**, set **Scope** to *Sync only assigned users and groups*,
+   and set a notification email for sync failures. **Save**.
+   This setting is what makes your assignment list act as an allowlist - the
+   other option syncs your whole directory. Part D covers how to choose what to
+   assign.
 
-## Part D - Assign users and start provisioning
+## Part D - Choose which users and groups sync
 
-1. Back on the app: **Users and groups > Add user/group**. Assign the test
-   users (and groups, if enabled).
-   - **Assign users before their groups.** A group member who is not yet
-     provisioned as a user is rejected until the user sync runs. Assigning both
-     together is fine; Entra provisions users first.
-2. **Provisioning > Start provisioning** (initial cycle), or **Provision on
-   demand** to push a single user immediately for testing.
-3. Watch **Provisioning logs**. The first cycle *lists* existing users
+**This is the allowlist.** Read this part before assigning anything.
+
+### The one rule
+
+> **Only what you assign to the enterprise app is synced.**
+> Assigning a group makes it a Vaultwarden group and provisions its members.
+> Every Entra group you do **not** assign is invisible to Vaultwarden - even the
+> other groups that a provisioned user happens to belong to.
+
+There is no group allowlist in Vaultwarden itself. The server accepts whatever
+the organization's SCIM token sends it, so **Entra's assignment list is the
+control**. Keep `Scope` set to *Sync only assigned users and groups* (Part C
+step 8); the alternative syncs your entire directory.
+
+### Two independent switches
+
+Decide these separately - they are often confused:
+
+| You want | Do this |
+|---|---|
+| Provision **users** into the org, no Vaultwarden groups | Assign the groups (or users). Leave **Provision Microsoft Entra ID Groups** disabled. Members get provisioned; no groups are created. |
+| Also create the groups **as Vaultwarden groups**, with membership | Additionally set `ORG_GROUPS_ENABLED=true` on the server and enable the **Provision Microsoft Entra ID Groups** mapping (Part C step 7). |
+
+Assigning a group always provisions its member *users*. Whether that group also
+becomes a *group object* inside Vaultwarden depends on the second switch.
+
+### Steps
+
+1. In Entra, decide (or create) the groups that should exist in Vaultwarden -
+   for example `VW-Engineering`, `VW-Finance`. A naming prefix makes the
+   in-scope set obvious to whoever audits it later.
+2. Enterprise app > **Users and groups** > **Add user/group**. Assign **exactly
+   those groups** and nothing else. This list is your allowlist: add a group here
+   to bring it into Vaultwarden, remove it to take it out of scope.
+3. **Provisioning > Start provisioning** (initial cycle), or **Provision on
+   demand** to push a single user immediately while testing.
+4. Watch **Provisioning logs**. The first cycle *lists* existing users
    (`userName eq` filters return empty for a fresh org), then *creates* them.
+
+### What happens on an ongoing basis
+
+- **User added to an assigned group** -> provisioned on the next cycle: account
+  created if new, invite emailed, org membership at *Invited*, and added to the
+  corresponding Vaultwarden group if group sync is on.
+- **User removed from the group** (and not in any other assigned group) -> falls
+  out of scope, so Entra sends `active: false` and the membership is **revoked**
+  immediately. Their group membership is removed too.
+- **User re-added** -> restored losslessly, back to exactly the state they were
+  revoked from (see the deprovision note below).
+- **Group unassigned from the app** -> its members fall out of scope and are
+  revoked. Deleting the group in Entra deletes the Vaultwarden group.
+
+### Traps to know before you design your groups
+
+- **Nested groups are not followed.** Entra provisions only the *direct* members
+  of an assigned group. If you assign `VW-All-Staff` and it contains other
+  groups, those nested members are **not** provisioned. This is an Entra
+  limitation, not something this server can work around - assign flat groups, or
+  assign each sub-group individually.
+- **Assign users before (or together with) their groups.** A group member whose
+  org membership does not exist yet is rejected with a `400`. Entra provisions
+  users before groups, so assigning both at once is fine.
+- **Confirm is still manual.** Group membership gets people to *Invited* /
+  *Accepted*. An admin must still confirm them in the web vault before they have
+  vault access (Part E) - end-to-end encryption makes this unavoidable.
+- **Group membership is the source of truth for access.** Because restore is
+  lossless, re-adding someone to an assigned group reinstates them, including
+  back to *Confirmed* with no re-confirmation. Offboard people in Entra, not by
+  revoking in the web vault.
+- **Scoping filters** are an optional extra lever if assignment alone is too
+  coarse: **Provisioning > Settings > Scoping filters** can narrow by attribute
+  (for example `department eq "Finance"`) on top of the assigned set.
 
 ## Part E - Verify and confirm members
 
