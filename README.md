@@ -11,11 +11,20 @@ stays a manual admin action - the docs explain why.
 
 ## Documentation (this fork)
 
-- **[docs/scim/README.md](docs/scim/README.md)** - operator setup, the Microsoft
-  Entra ID walkthrough, rolling the server out to the Bitwarden client apps, and
-  troubleshooting.
-- **[docs/scim/design.md](docs/scim/design.md)** - architecture, the end-to-end
-  encryption security model, and diagrams.
+Start at **[docs/scim/](docs/scim/README.md)** - it indexes the rest.
+
+| Guide | Covers |
+|---|---|
+| [deployment.md](docs/scim/deployment.md) | Cloud-agnostic containers, PostgreSQL, secrets, SSO, break-glass Owner |
+| [setup.md](docs/scim/setup.md) | Server config, org token, the Entra enterprise application |
+| [client-rollout.md](docs/scim/client-rollout.md) | Pointing staff Bitwarden apps at your server, zero-touch and manual |
+| [operations.md](docs/scim/operations.md) | Member lifecycle and troubleshooting |
+| [reference.md](docs/scim/reference.md) | Deliberate behaviours and named RFC divergences |
+| [upgrading.md](docs/scim/upgrading.md) | Whether an upgrade needs downtime, and the exact sequence |
+| [testing.md](docs/scim/testing.md) | Validating a change, from the unit suite to a live tenant |
+| [design.md](docs/scim/design.md) | Architecture, E2EE security model, threat model, decision log |
+
+What changed and why, including the security fixes: **[CHANGELOG.md](CHANGELOG.md)**.
 
 ## The base project
 
