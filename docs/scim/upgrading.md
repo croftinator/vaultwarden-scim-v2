@@ -122,12 +122,15 @@ retry through.
 migrations are sub-second on a self-host-sized database - but because the failure
 modes need a human awake and the rollback needs a quiet database.
 
-### Picking the window (Sydney)
+### Picking the window
 
-- Business hours are the thing to avoid, not "daylight". Sydney is UTC+10 (AEST)
-  or UTC+11 (AEDT, October to April) - check which applies on the day, because
-  scheduled jobs and cron expressions in `.env` are evaluated in the server's
-  timezone, not yours.
+- Business hours are the thing to avoid, not "daylight". Pick the window against
+  your own users' working day.
+- **Confirm the server's timezone before you schedule anything.** Cron
+  expressions and scheduled jobs in `.env` are evaluated in the server's
+  timezone, not yours, and the two are frequently different. If either observes
+  daylight saving, check which offset applies on the date you have chosen rather
+  than the one in effect when you wrote the schedule.
 - **Saturday morning is usually better than Friday night.** You get a full
   working weekend to react if something is wrong, instead of discovering it on
   Monday. Friday-night deploys optimise for the deployer's convenience and
