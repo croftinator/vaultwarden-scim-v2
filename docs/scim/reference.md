@@ -191,7 +191,7 @@ should read these first.
 
 ### Upgrading from an earlier build of this branch
 
-Only relevant if you ran a pre-release build of `feature/scim-v2`; it does not
+Only relevant if you ran an earlier build of `feature/scim-v2`; it does not
 affect a first-time install.
 
 - **The `scim_api_key` migration was reissued** under a new version
@@ -202,6 +202,6 @@ affect a first-time install.
   table, so **existing SCIM tokens are invalidated: re-mint each organization's
   token and update it in Entra.** Nothing else references the table.
 - **PostgreSQL only:** the synthetic event actor changed length. Org event rows
-  written by a pre-release build carry the old value and will not match the new
+  written by an earlier build carry the old value and will not match the new
   one, so old SCIM entries may show an unresolved actor. There is no backfill;
   delete them or ignore them.

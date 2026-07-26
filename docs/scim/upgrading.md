@@ -23,8 +23,8 @@ decide, and you can tell which before you deploy.**
 | A destructive migration (`DROP`, `RENAME`, type change, backfill) | **Yes** | **Yes** |
 | A one-way data migration (2FA format changes) | Short, and **rollback is gone** | Yes |
 
-**The first SCIM release is in the destructive row.** See
-[This upgrade specifically](#this-upgrade-specifically-the-first-scim-release)
+**The SCIM branch's migrations are in the destructive row.** See
+[This upgrade specifically](#this-upgrade-specifically-deploying-the-scim-branch)
 at the bottom.
 
 ---
@@ -248,12 +248,20 @@ one, migrate, scale back up - or take the window.
 
 ---
 
-## This upgrade specifically: the first SCIM release
+## This upgrade specifically: deploying the SCIM branch
 
 Meaning the upgrade that first brings this fork's SCIM feature into an existing
-deployment. Not a protocol version: this server speaks **SCIM 2.0** (RFC 7643 /
-RFC 7644) and nothing else, and it has no relationship to the superseded SCIM
-1.1 protocol.
+deployment.
+
+Two clarifications, because both numbers are easy to misread:
+
+- **There is no SCIM release.** The feature lives on `feature/scim-v2` and has
+  never been tagged or released; the changelog entry is `Unreleased` for that
+  reason. Deploying it today means building from the branch. It becomes a
+  release only if and when it merges to `main` and is tagged.
+- **`v2` is the protocol, not a version of this feature.** This server speaks
+  **SCIM 2.0** (RFC 7643 / RFC 7644) and nothing else, at `/scim/v2/<org_id>`.
+  It has no relationship to the superseded SCIM 1.1 protocol.
 
 **Class B. Take a window.**
 
@@ -307,7 +315,7 @@ hundreds of pages per cycle.
 curl -fsS https://your.domain/alive
 
 # 6. Re-mint each organization's SCIM token - the old ones no longer exist.
-#    Requires an OWNER session (not merely an admin) as of this release.
+#    Requires an OWNER session (not merely an admin) on the current branch.
 #    Full sequence: docs/scim/setup.md, "Part B - Generate the organization's
 #    SCIM token".
 
@@ -321,7 +329,7 @@ curl -fsS https://your.domain/alive
 If you have no live instances yet, none of this costs you anything - it is a
 first install, and the `DROP TABLE IF EXISTS` is a no-op on an empty database.
 
-### Note if you were running a pre-release build of this branch
+### Note if you were running an earlier build of this branch
 
 The synthetic actor recorded in the organization event log changed length.
 Event rows written by an older build carry the previous value and will not match
