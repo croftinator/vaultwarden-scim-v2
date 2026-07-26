@@ -18,3 +18,10 @@ web-vault
 # gstack local tooling artifacts (security reports, review logs, etc.)
 # These stay on the developer's machine; never commit them to this public repo.
 .gstack/
+
+# Local agent configuration. .claude/settings.local.json carries absolute paths
+# from the developer's machine and command templates that embed an admin token,
+# so a single `git add -A` in this PUBLIC fork would publish both. Ignored
+# rather than left merely untracked, because untracked is one careless `add .`
+# away from committed. See CLAUDE.md hard rules 4 and 5.
+.claude/

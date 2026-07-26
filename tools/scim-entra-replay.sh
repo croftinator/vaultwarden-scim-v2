@@ -36,11 +36,15 @@ KEEP=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --domain) DOMAIN="$2"; shift 2 ;;
-        --org)    ORG_ID="$2"; shift 2 ;;
-        --token)  SCIM_TOKEN="$2"; shift 2 ;;
+        # ${2:-} guards set -u: a trailing "--domain" with no value would
+        # otherwise abort with a bash unbound-variable error instead of usage.
+        --domain) DOMAIN="${2:-}"; [ -n "$DOMAIN" ] || { echo "--domain needs a value" >&2; exit 2; }; shift 2 ;;
+        --org)    ORG_ID="${2:-}"; [ -n "$ORG_ID" ] || { echo "--org needs a value" >&2; exit 2; }; shift 2 ;;
+        --token)  SCIM_TOKEN="${2:-}"; [ -n "$SCIM_TOKEN" ] || { echo "--token needs a value" >&2; exit 2; }; shift 2 ;;
         --keep)   KEEP=1; shift ;;          # leave test data behind for inspection
-        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        # Print the header comment block, stopping at the first non-comment
+        # line so the help text cannot drift when the header is edited.
+        -h|--help) sed -n '2,${/^#/!q;p;}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -76,20 +80,36 @@ section(){ printf '\n\033[1m%s\033[0m\n' "$1"; }
 BODY_FILE="$(mktemp)"
 trap 'rm -f "$BODY_FILE"' EXIT
 
+# curl's own diagnostics (-S) go to stderr on purpose: a DNS failure, refused
+# connection, or TLS error is the most likely first-run problem, and swallowing
+# it would leave every later check reporting "got " with no cause. On transport
+# failure curl writes no status, so emit 000 and let expect name it.
+# The Authorization header goes in via `curl -K -` rather than -H, so the
+# bearer token never appears in curl's argv where any local user could read it
+# from ps(1) for the lifetime of the process. stdin is otherwise unused here.
 req() {
-    local method="$1" url="$2" body="${3:-}" auth="${4:-Bearer $SCIM_TOKEN}"
+    local method="$1" url="$2" body="${3:-}" auth="${4:-Bearer $SCIM_TOKEN}" status
     if [ -n "$body" ]; then
-        curl -sS -o "$BODY_FILE" -w '%{http_code}' -X "$method" "$url" \
-            -H "Authorization: $auth" -H "Content-Type: $CT" --data "$body" 2>/dev/null
+        status=$(printf 'header = "Authorization: %s"\n' "$auth" | curl -sS -K - \
+            -o "$BODY_FILE" -w '%{http_code}' -X "$method" "$url" \
+            -H "Content-Type: $CT" --data "$body")
     else
-        curl -sS -o "$BODY_FILE" -w '%{http_code}' -X "$method" "$url" \
-            -H "Authorization: $auth" 2>/dev/null
+        status=$(printf 'header = "Authorization: %s"\n' "$auth" | curl -sS -K - \
+            -o "$BODY_FILE" -w '%{http_code}' -X "$method" "$url")
     fi
+    printf '%s' "${status:-000}"
 }
 
 # expect <description> <actual_status> <expected_status> [jq_filter] [expected_value]
 expect() {
     local desc="$1" got="$2" want="$3" filter="${4:-}" want_val="${5:-}"
+    # 000 means curl never got a response at all. Abort rather than let the
+    # same transport failure be re-reported as ~40 unrelated check failures.
+    if [ "$got" = "000" ]; then
+        c_bad "$desc (could not reach $BASE - see the curl error above)"
+        printf '\nAborting: the server is unreachable. Check DOMAIN, TLS, and that Vaultwarden is running.\n' >&2
+        exit 1
+    fi
     if [ "$got" != "$want" ]; then
         c_bad "$desc (expected HTTP $want, got $got)"
         [ -s "$BODY_FILE" ] && sed 's/^/       /' "$BODY_FILE" | head -3
