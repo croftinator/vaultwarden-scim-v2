@@ -5379,6 +5379,7 @@ name = "test-support"
 version = "0.1.0"
 dependencies = [
  "ctor",
+ "rustls 0.23.42",
 ]
 
 [[package]]
