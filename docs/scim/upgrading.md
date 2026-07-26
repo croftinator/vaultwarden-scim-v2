@@ -23,8 +23,9 @@ decide, and you can tell which before you deploy.**
 | A destructive migration (`DROP`, `RENAME`, type change, backfill) | **Yes** | **Yes** |
 | A one-way data migration (2FA format changes) | Short, and **rollback is gone** | Yes |
 
-**The SCIM v1 upgrade is in the destructive row.** See
-[This upgrade specifically](#this-upgrade-specifically-scim-v1) at the bottom.
+**The first SCIM release is in the destructive row.** See
+[This upgrade specifically](#this-upgrade-specifically-the-first-scim-release)
+at the bottom.
 
 ---
 
@@ -247,7 +248,12 @@ one, migrate, scale back up - or take the window.
 
 ---
 
-## This upgrade specifically: SCIM v1
+## This upgrade specifically: the first SCIM release
+
+Meaning the upgrade that first brings this fork's SCIM feature into an existing
+deployment. Not a protocol version: this server speaks **SCIM 2.0** (RFC 7643 /
+RFC 7644) and nothing else, and it has no relationship to the superseded SCIM
+1.1 protocol.
 
 **Class B. Take a window.**
 
