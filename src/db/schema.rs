@@ -263,6 +263,7 @@ table! {
         enabled -> Bool,
         created_at -> Timestamp,
         revision_date -> Timestamp,
+        last_used_at -> Nullable<Timestamp>,
     }
 }
 

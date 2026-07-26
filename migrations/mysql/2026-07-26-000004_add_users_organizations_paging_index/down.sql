@@ -1,0 +1,1 @@
+DROP INDEX idx_users_organizations_org_uuid_paged ON users_organizations;

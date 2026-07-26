@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_users_organizations_org_uuid_paged;

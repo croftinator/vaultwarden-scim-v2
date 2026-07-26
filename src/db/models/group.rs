@@ -212,6 +212,29 @@ impl Group {
         .await
     }
 
+    /// One ordered page of an organization's groups.
+    ///
+    /// Same reasoning as `Membership::find_by_org_paged`: the SCIM list endpoint
+    /// pages across separate requests, so the order has to be total and stable
+    /// or a group can land on two pages or on none.
+    pub async fn find_by_organization_paged(
+        org_uuid: &OrganizationId,
+        limit: i64,
+        offset: i64,
+        conn: &DbConn,
+    ) -> Vec<Self> {
+        conn.run(move |conn| {
+            groups::table
+                .filter(groups::organizations_uuid.eq(org_uuid))
+                .order(groups::uuid.asc())
+                .limit(limit)
+                .offset(offset)
+                .load::<Self>(conn)
+                .expect("Error loading groups")
+        })
+        .await
+    }
+
     pub async fn count_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> i64 {
         conn.run(move |conn| {
             groups::table.filter(groups::organizations_uuid.eq(org_uuid)).count().first::<i64>(conn).ok().unwrap_or(0)
@@ -554,6 +577,30 @@ impl GroupUser {
                 .select(groups_users::all_columns)
                 .load::<Self>(conn)
                 .expect("Error loading group users")
+        })
+        .await
+    }
+
+    /// Same scoping as `find_by_group`, for several groups in one query.
+    ///
+    /// Serializing a page of groups otherwise costs one three-table join per
+    /// group; at the default SCIM page size that is 100 sequential queries on a
+    /// single pooled connection for one request.
+    pub async fn find_by_groups(group_uuids: &[GroupId], org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
+        let group_uuids = group_uuids.to_vec();
+        conn.run(move |conn| {
+            groups_users::table
+                .inner_join(groups::table.on(groups::uuid.eq(groups_users::groups_uuid)))
+                .inner_join(
+                    users_organizations::table.on(users_organizations::uuid
+                        .eq(groups_users::users_organizations_uuid)
+                        .and(users_organizations::org_uuid.eq(groups::organizations_uuid))),
+                )
+                .filter(groups_users::groups_uuid.eq_any(group_uuids))
+                .filter(groups::organizations_uuid.eq(org_uuid))
+                .select(groups_users::all_columns)
+                .load::<Self>(conn)
+                .unwrap_or_default()
         })
         .await
     }

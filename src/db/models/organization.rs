@@ -259,6 +259,14 @@ impl Organization {
 // It should also provide enough room for 100+ types, which i doubt will ever happen.
 const ACTIVATE_REVOKE_DIFF: i32 = 128;
 
+/// Largest number of values bound into one `eq_any` here.
+///
+/// Each element of an `eq_any` is a bound parameter, and older SQLite builds
+/// cap `SQLITE_MAX_VARIABLE_NUMBER` at 999 - right where a maximum-size SCIM
+/// group member list (`SCIM_MAX_GROUP_MEMBERS` = 1000) lands. Named rather than
+/// inlined so the value and the constraint that produced it stay together.
+const SQLITE_SAFE_BIND_CHUNK: usize = 500;
+
 impl Membership {
     pub fn new(user_uuid: UserId, org_uuid: OrganizationId, invited_by_email: Option<String>) -> Self {
         Self {
@@ -928,6 +936,32 @@ impl Membership {
         .await
     }
 
+    /// One ordered page of an organization's memberships.
+    ///
+    /// Added for the SCIM list endpoint, where both halves matter. The LIMIT
+    /// keeps a full directory sync from loading every row once per page: Entra
+    /// pages at 100, so a 20k-member organization would otherwise deserialize
+    /// 20k rows 200 times per cycle on a single pooled connection.
+    ///
+    /// The ORDER BY is the correctness half. A client pages by issuing separate
+    /// requests, so each page is its own query; without a total order the
+    /// database is free to return rows differently between them. On PostgreSQL
+    /// an UPDATE relocates a row in the heap and changes sequential-scan order,
+    /// and a concurrent revoke is an UPDATE - so a member could appear on two
+    /// pages or on none, and a sync would silently skip them.
+    pub async fn find_by_org_paged(org_uuid: &OrganizationId, limit: i64, offset: i64, conn: &DbConn) -> Vec<Self> {
+        conn.run(move |conn| {
+            users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .order(users_organizations::uuid.asc())
+                .limit(limit)
+                .offset(offset)
+                .load::<Self>(conn)
+                .expect("Error loading user organizations")
+        })
+        .await
+    }
+
     pub async fn find_confirmed_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             users_organizations::table
@@ -991,6 +1025,83 @@ impl Membership {
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .filter(users_organizations::atype.eq(atype as i32))
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+                .count()
+                .first::<i64>(conn)
+                .unwrap_or(0)
+        })
+        .await
+    }
+
+    /// Members of `atype` that are not revoked, in any status.
+    ///
+    /// Revocation is stored as an offset (`status - ACTIVATE_REVOKE_DIFF`), so
+    /// every revoked row is `<= MembershipStatus::Revoked`; `Revoked` itself is
+    /// a sentinel that is never written. Comparing `> Revoked` is therefore the
+    /// only correct active test, and `.ne(Revoked)` would match every row.
+    ///
+    /// Used by the SCIM last-owner guard, which has to know whether an
+    /// organization would be left with no administrator at all - not merely
+    /// with no *confirmed* one.
+    pub async fn count_active_by_org_and_type(org_uuid: &OrganizationId, atype: MembershipType, conn: &DbConn) -> i64 {
+        conn.run(move |conn| {
+            users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(users_organizations::atype.eq(atype as i32))
+                .filter(users_organizations::status.gt(MembershipStatus::Revoked as i32))
+                .count()
+                .first::<i64>(conn)
+                .unwrap_or(0)
+        })
+        .await
+    }
+
+    /// The subset of `member_uuids` that really are memberships of this org.
+    ///
+    /// One query per chunk instead of one per value. The SCIM Group write paths
+    /// resolve an entire member list before touching anything, so at
+    /// `SCIM_MAX_GROUP_MEMBERS` = 1000 a single legal request would otherwise
+    /// drive 1000 sequential round trips while holding one pooled connection.
+    ///
+    /// Chunked rather than one `eq_any`, because each element is a bound
+    /// parameter and older SQLite builds cap `SQLITE_MAX_VARIABLE_NUMBER` at
+    /// 999 - right where a maximum-size member list lands.
+    pub async fn find_by_uuids_and_org(
+        member_uuids: &[MembershipId],
+        org_uuid: &OrganizationId,
+        conn: &DbConn,
+    ) -> Vec<Self> {
+        let mut found: Vec<Self> = Vec::with_capacity(member_uuids.len());
+        for chunk in member_uuids.chunks(SQLITE_SAFE_BIND_CHUNK) {
+            let chunk = chunk.to_vec();
+            let mut rows = conn
+                .run(move |conn| {
+                    users_organizations::table
+                        .filter(users_organizations::uuid.eq_any(chunk))
+                        .filter(users_organizations::org_uuid.eq(org_uuid))
+                        .load::<Self>(conn)
+                        .unwrap_or_default()
+                })
+                .await;
+            found.append(&mut rows);
+        }
+        found
+    }
+
+    /// Confirmed members of `atype` that carry a SCIM externalId, i.e. that are
+    /// linked to a directory object. Counted in the database rather than by
+    /// loading every membership, because the SCIM status endpoint only needs
+    /// the two numbers.
+    pub async fn count_confirmed_directory_linked_by_org_and_type(
+        org_uuid: &OrganizationId,
+        atype: MembershipType,
+        conn: &DbConn,
+    ) -> i64 {
+        conn.run(move |conn| {
+            users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(users_organizations::atype.eq(atype as i32))
+                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+                .filter(users_organizations::external_id.is_not_null())
                 .count()
                 .first::<i64>(conn)
                 .unwrap_or(0)
