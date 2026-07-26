@@ -23,7 +23,9 @@ decide, and you can tell which before you deploy.**
 | A destructive migration (`DROP`, `RENAME`, type change, backfill) | **Yes** | **Yes** |
 | A one-way data migration (2FA format changes) | Short, and **rollback is gone** | Yes |
 
-**The SCIM branch's migrations are in the destructive row.** See
+**Deploying the SCIM branch is additive on a fresh install, and destructive only
+if you already ran an earlier build of that branch.** Which case you are in, and
+what the second one costs, is in
 [This upgrade specifically](#this-upgrade-specifically-deploying-the-scim-branch)
 at the bottom.
 
@@ -263,9 +265,21 @@ Two clarifications, because both numbers are easy to misread:
   **SCIM 2.0** (RFC 7643 / RFC 7644) and nothing else, at `/scim/v2/<org_id>`.
   It has no relationship to the superseded SCIM 1.1 protocol.
 
-**Class B. Take a window.**
+**Which case are you in?**
 
-Two things make it destructive:
+- **Installing SCIM for the first time: no window, nothing to plan.** The
+  migrations are effectively additive against a database that has never had a
+  `scim_api_key` table - the `DROP TABLE IF EXISTS` is a no-op on an empty
+  schema - and there are no SCIM tokens yet to invalidate. This is almost
+  certainly you. Skip ahead to [Pre-flight checklist](#pre-flight-checklist);
+  the `Sequence` below is not for you.
+- **You already ran an earlier build of `feature/scim-v2`: Class B, take a
+  window.** This is the only case the rest of this section is about, and it
+  exists because the branch's first migration was edited in place before the
+  branch was published. If you have never deployed this branch, that history
+  cannot affect you.
+
+For the second case only, two things make it destructive:
 
 1. **The migration drops and recreates a table.**
    `migrations/*/2026-07-26-000000_add_scim_api_key/up.sql` begins with
@@ -306,6 +320,9 @@ hundreds of pages per cycle.
 
 ### Sequence
 
+Only for a deployment that already ran an earlier build of this branch. On a
+first install there is nothing here to do.
+
 ```bash
 # 1. Notify users. Impact: vault reads keep working offline; sync pauses.
 # 2. Back up and PROVE the restore (see pre-flight above).
@@ -326,8 +343,8 @@ curl -fsS https://your.domain/alive
 #    declaring the upgrade done.
 ```
 
-If you have no live instances yet, none of this costs you anything - it is a
-first install, and the `DROP TABLE IF EXISTS` is a no-op on an empty database.
+As above: on a first install none of this costs you anything, and the sequence
+below is only for a deployment that already ran an earlier build of this branch.
 
 ### Note if you were running an earlier build of this branch
 
