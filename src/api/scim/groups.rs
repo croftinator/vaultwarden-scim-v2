@@ -11,25 +11,26 @@
 // groups when disabled, these endpoints fail loudly so a misconfigured
 // deployment is visible in the IdP instead of quietly not syncing.
 //
+use std::collections::{HashMap, HashSet};
+
 use rocket::Route;
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    CONFIG,
     api::{
         core::log_event,
         scim::{
-            SCIM_ACTOR, SCIM_DEVICE_TYPE, ScimJson, ScimResponse,
+            SCIM_ACTOR, SCIM_DEVICE_TYPE, SCIM_MAX_GROUP_MEMBERS, ScimJson, ScimResponse,
             error::ScimError,
             filter::parse_eq_filter,
             guard::ScimToken,
-            patch::{PatchOp, parse_group_patch},
+            patch::{MemberOp, PatchOp, parse_group_patch},
         },
     },
     db::{
         DbConn,
-        models::{EventType, Group, GroupId, GroupUser, Membership, MembershipId},
+        models::{CollectionGroup, EventType, Group, GroupId, GroupUser, Membership, MembershipId},
     },
 };
 
@@ -38,7 +39,7 @@ pub fn routes() -> Vec<Route> {
 }
 
 fn check_groups_enabled() -> Result<(), ScimError> {
-    if !CONFIG.org_groups_enabled() {
+    if !crate::api::scim::org_groups_enabled() {
         return Err(ScimError::not_implemented("Group support is disabled on this server (ORG_GROUPS_ENABLED=false)"));
     }
     Ok(())
@@ -62,7 +63,28 @@ struct ScimGroupRequest {
 }
 
 async fn to_scim_group(group: &Group, token: &ScimToken, include_members: bool, conn: &DbConn) -> Value {
+    let members: Option<Vec<MembershipId>> = if include_members {
+        Some(
+            GroupUser::find_by_group(&group.uuid, &token.org_uuid, conn)
+                .await
+                .into_iter()
+                .map(|gu| gu.users_organizations_uuid)
+                .collect(),
+        )
+    } else {
+        None
+    };
+    scim_group_body(group, token, members.as_deref())
+}
+
+// Serializes a group from member ids already in hand, so a list response can
+// load every page's members in one query instead of one per group.
+fn scim_group_body(group: &Group, token: &ScimToken, members: Option<&[MembershipId]>) -> Value {
     let location = crate::api::scim::resource_location(&token.org_uuid, "Groups", &group.uuid);
+    // meta.lastModified is populated for Groups because the row carries a
+    // revision date. Users deliberately omit it: Membership has no equivalent
+    // column, and inventing one would let a client build a delta sync on a
+    // timestamp that does not track the data. See docs/scim/reference.md.
     let mut body = json!({
         "schemas": [crate::api::scim::discovery::GROUP_SCHEMA_URN],
         "id": group.uuid,
@@ -71,15 +93,12 @@ async fn to_scim_group(group: &Group, token: &ScimToken, include_members: bool, 
         "meta": {
             "resourceType": "Group",
             "location": location,
+            "created": crate::util::format_date(&group.creation_date),
+            "lastModified": crate::util::format_date(&group.revision_date),
         },
     });
-    if include_members {
-        let members: Vec<Value> = GroupUser::find_by_group(&group.uuid, &token.org_uuid, conn)
-            .await
-            .iter()
-            .map(|gu| json!({"value": gu.users_organizations_uuid}))
-            .collect();
-        body["members"] = json!(members);
+    if let Some(members) = members {
+        body["members"] = json!(members.iter().map(|id| json!({"value": id})).collect::<Vec<Value>>());
     }
     body
 }
@@ -89,17 +108,53 @@ async fn log_group_event(event_type: EventType, group_uuid: &GroupId, token: &Sc
         .await;
 }
 
-// Resolves a SCIM member value to a membership of THIS org, or a 400: group
+// The 400 every unresolvable member value produces. Deliberately identical for
+// "no such membership anywhere" and "belongs to another organization", so the
+// endpoint cannot be used to probe for ids outside this org.
+fn unresolvable_member() -> ScimError {
+    ScimError::bad_request(
+        "invalidValue",
+        "members must reference existing members of this organization (provision the user first)",
+    )
+}
+
+// Resolves SCIM member values to memberships of THIS org, or a 400: group
 // assignment requires the user to be provisioned into the org first.
-async fn resolve_member(value: &str, token: &ScimToken, conn: &DbConn) -> Result<MembershipId, ScimError> {
-    let member_id: MembershipId = value.to_owned().into();
-    match Membership::find_by_uuid_and_org(&member_id, &token.org_uuid, conn).await {
-        Some(member) => Ok(member.uuid),
-        None => Err(ScimError::bad_request(
-            "invalidValue",
-            "members must reference existing members of this organization (provision the user first)",
-        )),
+//
+// Batched, not one lookup per value. Every write path resolves the whole list
+// up front so a bad value cannot leave a half-applied change behind, which at
+// the 1000-member cap meant 1000 sequential queries for one request.
+async fn resolve_members(values: &[String], token: &ScimToken, conn: &DbConn) -> Result<Vec<MembershipId>, ScimError> {
+    if values.is_empty() {
+        return Ok(Vec::new());
     }
+    let requested: Vec<MembershipId> = values.iter().map(|value| value.clone().into()).collect();
+    let known: HashSet<MembershipId> = Membership::find_by_uuids_and_org(&requested, &token.org_uuid, conn)
+        .await
+        .into_iter()
+        .map(|member| member.uuid)
+        .collect();
+    if requested.iter().any(|member_id| !known.contains(member_id)) {
+        return Err(unresolvable_member());
+    }
+    Ok(requested)
+}
+
+// Every member value costs a database round trip, so an uncapped list turns one
+// legal request into tens of thousands of sequential queries holding a pooled
+// connection. Reject oversized sets before any of that work happens.
+fn check_member_count(count: usize) -> Result<(), ScimError> {
+    if count > SCIM_MAX_GROUP_MEMBERS {
+        // invalidValue, not tooMany. RFC 7644 section 3.12 defines tooMany
+        // narrowly as "the specified FILTER yields many more results than the
+        // server is willing to calculate" - a client branching on it would
+        // retry with a narrower filter, which never fixes an oversized body.
+        return Err(ScimError::bad_request(
+            "invalidValue",
+            "Too many members in one request; split the membership update across several requests",
+        ));
+    }
+    Ok(())
 }
 
 // The externalId is the correlation key: enforce uniqueness within the org on
@@ -111,6 +166,7 @@ async fn check_external_id_available(
     token: &ScimToken,
     conn: &DbConn,
 ) -> Result<(), ScimError> {
+    crate::api::scim::check_attribute_len("externalId", external_id, crate::api::scim::SCIM_MAX_EXTERNAL_ID_LEN)?;
     match Group::find_by_external_id_and_org(external_id, &token.org_uuid, conn).await {
         Some(existing) if existing.uuid != group.uuid => {
             Err(ScimError::conflict("uniqueness", "A group with this externalId already exists"))
@@ -119,16 +175,157 @@ async fn check_external_id_available(
     }
 }
 
+// Whether SCIM may ADD members to this group.
+//
+// SCIM resolves a group by its GroupId, so without this every group in the
+// organization is reachable - including one an administrator created in the web
+// vault and granted access to a sensitive collection. Vaultwarden grants
+// collection access through `groups_users -> collections_groups` with no
+// per-collection key, so adding a member to such a group hands that member real
+// plaintext access to collections nobody granted them. The token holder gains
+// nothing directly (they hold no org key), but they can hand access to someone
+// they control, which is a privilege escalation by any useful definition.
+//
+// The rule targets groups that actually CONFER access, not every group SCIM did
+// not create. Two are off limits for additions:
+//
+//   - `access_all`: blanket access to every collection in the organization.
+//     SCIM never sets it (`post_group` hardcodes false and `put_group` leaves it
+//     alone), so a group carrying it was escalated by a human. Refused
+//     unconditionally - there is no externalId that makes this safe.
+//   - carries collection grants AND has no `external_id`: an administrator
+//     curated it in the web vault and SCIM never correlated it to a directory
+//     object. This is the scoping `ldap_import` gets for free, because it
+//     resolves groups strictly by external_id (`src/api/core/public.rs`) and so
+//     cannot see a web-vault group at all. SCIM resolving by uuid is a genuine
+//     widening of the precedent it was modelled on.
+//
+// A group with an externalId and collection grants is the INTENDED workflow -
+// an admin grants the group its collections once, the IdP owns its membership -
+// so it stays writable. A SCIM-created group with no grants confers nothing, so
+// adding members to it escalates nothing and is also allowed; that keeps a
+// non-Entra client that omits externalId working, and RFC 7643 makes externalId
+// optional, so refusing it outright would be a spec deviation for no gain.
+async fn scim_may_add_members(group: &Group, token: &ScimToken, conn: &DbConn) -> bool {
+    if group.access_all {
+        return false;
+    }
+    if group.external_id.is_some() {
+        return true;
+    }
+    CollectionGroup::find_by_group(&group.uuid, &token.org_uuid, conn).await.is_empty()
+}
+
+// Refuses an addition to a group SCIM does not own.
+//
+// Deliberately asymmetric: this gates ADDITIONS only, and removals always
+// proceed. It is the same asymmetry as revoke-yes/restore-no on Users, for the
+// same reason. A removal reduces access and is the deprovisioning path, which is
+// the highest-value thing this feature does; refusing it would also leave the
+// IdP re-sending a write it can never satisfy, and Entra retries a failing write
+// every cycle until it quarantines the whole application - taking deprovisioning
+// down with it. Failing closed on the safe direction costs more than it protects.
+async fn reject_unmanaged_group_add(group: &Group, token: &ScimToken, conn: &DbConn) -> Result<(), ScimError> {
+    if scim_may_add_members(group, token, conn).await {
+        return Ok(());
+    }
+    Err(ScimError::bad_request(
+        "mutability",
+        "This group grants collection access and is not managed by SCIM (no externalId, or it \
+         grants access to all collections); members can be removed from it but not added. Add \
+         them in the web vault",
+    ))
+}
+
+// Replaces the group's member set with exactly member_ids, as a diff rather
+// than delete-all-then-reinsert. There is no transaction available here, so a
+// wipe-and-rebuild leaves the group empty (and its collection access dead) if
+// any single insert fails partway through. Diffing touches only the rows that
+// actually change, so a failure can never remove a member it was not asked to.
+// Whether `set_members` applies the unmanaged-group guard.
+#[derive(PartialEq, Eq)]
+enum AddPolicy {
+    /// Refuse additions to a group SCIM does not own.
+    Enforce,
+    /// The group was created by this same request, so it is empty and carries no
+    /// collection grants at all: there is nothing to escalate into, and its
+    /// externalId (if the client sent none) is not a signal about ownership.
+    NewGroup,
+}
+
 async fn set_members(
     group: &Group,
     member_ids: Vec<MembershipId>,
+    add_policy: &AddPolicy,
     token: &ScimToken,
     conn: &DbConn,
 ) -> Result<(), ScimError> {
-    GroupUser::delete_all_by_group(&group.uuid, &token.org_uuid, conn).await.map_err(|_| ScimError::internal())?;
-    for member_id in member_ids {
-        let mut group_user = GroupUser::new(group.uuid.clone(), member_id);
+    let wanted: HashSet<MembershipId> = member_ids.into_iter().collect();
+    let current: HashSet<MembershipId> = GroupUser::find_by_group(&group.uuid, &token.org_uuid, conn)
+        .await
+        .into_iter()
+        .map(|group_user| group_user.users_organizations_uuid)
+        .collect();
+
+    // Checked before the first write, not per row, so a refused replace leaves
+    // the group exactly as it was rather than half-applied. A replace that only
+    // REMOVES members is still allowed on an unmanaged group.
+    let mut additions = wanted.difference(&current).peekable();
+    if *add_policy == AddPolicy::Enforce && additions.peek().is_some() {
+        reject_unmanaged_group_add(group, token, conn).await?;
+    }
+    for member_id in wanted.difference(&current) {
+        let mut group_user = GroupUser::new(group.uuid.clone(), member_id.clone());
         group_user.save(conn).await.map_err(|_| ScimError::internal())?;
+    }
+    for member_id in current.difference(&wanted) {
+        GroupUser::delete_by_group_and_member(&group.uuid, member_id, conn).await.map_err(|_| ScimError::internal())?;
+    }
+    Ok(())
+}
+
+// Applies one PATCH member operation. Removes resolve through the org scope
+// like adds do: GroupUser::delete_by_group_and_member looks the membership up
+// globally to bump its sync revision, so an unscoped id would let this org
+// touch a member of another one. A value that is not a member of this org was
+// already a no-op, and stays one - Entra retries removals.
+async fn apply_member_op(
+    group: &Group,
+    member_op: &MemberOp,
+    token: &ScimToken,
+    conn: &DbConn,
+) -> Result<(), ScimError> {
+    match member_op {
+        MemberOp::Replace(values) => {
+            let member_ids = resolve_members(values, token, conn).await?;
+            set_members(group, member_ids, &AddPolicy::Enforce, token, conn).await?;
+        }
+        MemberOp::Add(values) => {
+            if !values.is_empty() {
+                reject_unmanaged_group_add(group, token, conn).await?;
+            }
+            for member_id in resolve_members(values, token, conn).await? {
+                let mut group_user = GroupUser::new(group.uuid.clone(), member_id);
+                group_user.save(conn).await.map_err(|_| ScimError::internal())?;
+            }
+        }
+        MemberOp::Remove(values) => {
+            // One batched lookup for the whole list, same as the add path. A
+            // value that is not a member of this org stays a silent no-op
+            // rather than a 400: Entra retries removals, and "already gone" is
+            // the expected steady state for one.
+            let requested: Vec<MembershipId> = values.iter().map(|value| value.clone().into()).collect();
+            let known: HashSet<MembershipId> = Membership::find_by_uuids_and_org(&requested, &token.org_uuid, conn)
+                .await
+                .into_iter()
+                .map(|member| member.uuid)
+                .collect();
+            for member_id in requested.iter().filter(|member_id| known.contains(member_id)) {
+                GroupUser::delete_by_group_and_member(&group.uuid, member_id, conn)
+                    .await
+                    .map_err(|_| ScimError::internal())?;
+            }
+        }
     }
     Ok(())
 }
@@ -147,13 +344,27 @@ pub struct GroupListParams {
 async fn list_groups(params: GroupListParams, token: ScimToken, conn: DbConn) -> Result<ScimResponse, ScimError> {
     check_groups_enabled()?;
 
-    let groups: Vec<Group> = if let Some(raw_filter) = params.filter.as_deref() {
+    // Entra requests excludedAttributes=members on list syncs; honoring it
+    // avoids loading every group's member set.
+    let include_members = !params.excluded_attributes.as_deref().is_some_and(|excluded| excluded.contains("members"));
+
+    let (start_index, count) = crate::api::scim::page_bounds(params.start_index, params.count);
+
+    // As in list_users: a filtered lookup is small and pages in memory, while
+    // the unfiltered enumeration pages in the database on a stable order so a
+    // group cannot be skipped or repeated across a client's separate requests.
+    let (total, page): (usize, Vec<Group>) = if let Some(raw_filter) = params.filter.as_deref() {
         let eq = parse_eq_filter(raw_filter)?;
-        match eq.attribute.as_str() {
+        let matched: Vec<Group> = match eq.attribute.as_str() {
+            // displayName is caseExact=false in RFC 7643 section 4.2, so `eq`
+            // must match case-insensitively - the same way the Users userName
+            // filter does via User::find_by_mail's lowercasing. Done in Rust
+            // because the three backends disagree about collation defaults;
+            // groups per organization are bounded in a way memberships are not.
             "displayname" => Group::find_by_organization(&token.org_uuid, &conn)
                 .await
                 .into_iter()
-                .filter(|g| g.name == eq.value)
+                .filter(|g| g.name.eq_ignore_ascii_case(&eq.value))
                 .collect(),
             "externalid" => {
                 Group::find_by_external_id_and_org(&eq.value, &token.org_uuid, &conn).await.into_iter().collect()
@@ -164,22 +375,34 @@ async fn list_groups(params: GroupListParams, token: ScimToken, conn: DbConn) ->
                     "Filterable attributes are displayName and externalId",
                 ));
             }
-        }
+        };
+        let total = matched.len();
+        (total, matched.into_iter().skip(start_index - 1).take(count).collect())
     } else {
-        Group::find_by_organization(&token.org_uuid, &conn).await
+        let total = usize::try_from(Group::count_by_org(&token.org_uuid, &conn).await).unwrap_or(0);
+        let offset = i64::try_from(start_index - 1).unwrap_or(i64::MAX);
+        let limit = i64::try_from(count).unwrap_or(0);
+        (total, Group::find_by_organization_paged(&token.org_uuid, limit, offset, &conn).await)
     };
 
-    // Entra requests excludedAttributes=members on list syncs; honoring it
-    // avoids loading every group's member set.
-    let include_members = !params.excluded_attributes.as_deref().is_some_and(|excluded| excluded.contains("members"));
-
-    let total = groups.len();
-    let (start_index, count) = crate::api::scim::page_bounds(params.start_index, params.count);
-
-    let mut resources = Vec::new();
-    for group in groups.into_iter().skip(start_index - 1).take(count) {
-        resources.push(to_scim_group(&group, &token, include_members, &conn).await);
+    // One query for the whole page's membership, not one per group.
+    let mut members_by_group: HashMap<GroupId, Vec<MembershipId>> = HashMap::new();
+    if include_members {
+        let group_ids: Vec<GroupId> = page.iter().map(|group| group.uuid.clone()).collect();
+        for group_user in GroupUser::find_by_groups(&group_ids, &token.org_uuid, &conn).await {
+            members_by_group.entry(group_user.groups_uuid).or_default().push(group_user.users_organizations_uuid);
+        }
     }
+
+    let resources: Vec<Value> = page
+        .iter()
+        .map(|group| {
+            // A group with no members must still serialize "members": [], so
+            // absent from the map is not the same as excluded by the client.
+            let members = include_members.then(|| members_by_group.get(&group.uuid).map_or(&[][..], Vec::as_slice));
+            scim_group_body(group, &token, members)
+        })
+        .collect();
 
     Ok(crate::api::scim::list_response(total, start_index, &resources))
 }
@@ -195,35 +418,36 @@ async fn get_group(group_id: GroupId, token: ScimToken, conn: DbConn) -> Result<
 
 #[post("/v2/<_>/Groups", data = "<data>")]
 async fn post_group(
-    data: ScimJson<ScimGroupRequest>,
+    data: Result<ScimJson<ScimGroupRequest>, ScimError>,
     token: ScimToken,
     conn: DbConn,
 ) -> Result<ScimResponse, ScimError> {
     check_groups_enabled()?;
-    let request = data.0;
+    let request = data?.0;
 
     let Some(display_name) = request.display_name.as_deref().filter(|n| !n.trim().is_empty()) else {
         return Err(ScimError::bad_request("invalidValue", "displayName is required"));
     };
+    crate::api::scim::check_attribute_len("displayName", display_name, crate::api::scim::SCIM_MAX_GROUP_NAME_LEN)?;
 
-    if let Some(external_id) = request.external_id.as_deref()
-        && Group::find_by_external_id_and_org(external_id, &token.org_uuid, &conn).await.is_some()
-    {
-        return Err(ScimError::conflict("uniqueness", "A group with this externalId already exists"));
+    if let Some(external_id) = request.external_id.as_deref() {
+        crate::api::scim::check_attribute_len("externalId", external_id, crate::api::scim::SCIM_MAX_EXTERNAL_ID_LEN)?;
+        if Group::find_by_external_id_and_org(external_id, &token.org_uuid, &conn).await.is_some() {
+            return Err(ScimError::conflict("uniqueness", "A group with this externalId already exists"));
+        }
     }
 
     // Resolve members before creating anything, so a bad member list cannot
     // leave a half-created group behind. On create, omitted members and an
     // empty list mean the same thing: a group with no members.
     let request_members = request.members.as_deref().unwrap_or_default();
-    let mut member_ids = Vec::with_capacity(request_members.len());
-    for member in request_members {
-        member_ids.push(resolve_member(&member.value, &token, &conn).await?);
-    }
+    check_member_count(request_members.len())?;
+    let values: Vec<String> = request_members.iter().map(|member| member.value.clone()).collect();
+    let member_ids = resolve_members(&values, &token, &conn).await?;
 
     let mut group = Group::new(token.org_uuid.clone(), display_name.to_owned(), false, request.external_id.clone());
     group.save(&conn).await.map_err(|_| ScimError::internal())?;
-    set_members(&group, member_ids, &token, &conn).await?;
+    set_members(&group, member_ids, &AddPolicy::NewGroup, &token, &conn).await?;
 
     log_group_event(EventType::GroupCreated, &group.uuid, &token, &conn).await;
 
@@ -239,7 +463,7 @@ async fn post_group(
 #[put("/v2/<_>/Groups/<group_id>", data = "<data>")]
 async fn put_group(
     group_id: GroupId,
-    data: ScimJson<ScimGroupRequest>,
+    data: Result<ScimJson<ScimGroupRequest>, ScimError>,
     token: ScimToken,
     conn: DbConn,
 ) -> Result<ScimResponse, ScimError> {
@@ -247,17 +471,15 @@ async fn put_group(
     let Some(mut group) = Group::find_by_uuid_and_org(&group_id, &token.org_uuid, &conn).await else {
         return Err(ScimError::not_found());
     };
-    let request = data.0;
+    let request = data?.0;
 
     // Resolve everything before writing anything, so a bad member list or a
     // conflicting externalId cannot leave a half-applied replacement behind.
     let member_ids = match request.members.as_deref() {
         Some(members) => {
-            let mut ids = Vec::with_capacity(members.len());
-            for member in members {
-                ids.push(resolve_member(&member.value, &token, &conn).await?);
-            }
-            Some(ids)
+            check_member_count(members.len())?;
+            let values: Vec<String> = members.iter().map(|member| member.value.clone()).collect();
+            Some(resolve_members(&values, &token, &conn).await?)
         }
         None => None,
     };
@@ -265,7 +487,17 @@ async fn put_group(
         check_external_id_available(&group, external_id, &token, &conn).await?;
     }
 
-    if let Some(display_name) = request.display_name.as_deref().filter(|n| !n.trim().is_empty()) {
+    // Present-but-blank is an error, not a silent no-op, for the same reason as
+    // the PATCH path: displayName is required (RFC 7643 section 4.2), and a 200
+    // that did not apply the write makes the client record it as applied and
+    // never retry, leaving the directory and the vault permanently disagreeing.
+    // Absent (None) still means "leave the name alone" - that is what makes a
+    // sparse PUT safe.
+    if let Some(display_name) = request.display_name.as_deref() {
+        if display_name.trim().is_empty() {
+            return Err(ScimError::bad_request("invalidValue", "displayName is required and cannot be cleared"));
+        }
+        crate::api::scim::check_attribute_len("displayName", display_name, crate::api::scim::SCIM_MAX_GROUP_NAME_LEN)?;
         group.name = display_name.to_owned();
     }
     if request.external_id.is_some() {
@@ -273,7 +505,7 @@ async fn put_group(
     }
     group.save(&conn).await.map_err(|_| ScimError::internal())?;
     if let Some(member_ids) = member_ids {
-        set_members(&group, member_ids, &token, &conn).await?;
+        set_members(&group, member_ids, &AddPolicy::Enforce, &token, &conn).await?;
     }
 
     log_group_event(EventType::GroupUpdated, &group.uuid, &token, &conn).await;
@@ -284,7 +516,7 @@ async fn put_group(
 #[patch("/v2/<_>/Groups/<group_id>", data = "<data>")]
 async fn patch_group(
     group_id: GroupId,
-    data: ScimJson<PatchOp>,
+    data: Result<ScimJson<PatchOp>, ScimError>,
     token: ScimToken,
     conn: DbConn,
 ) -> Result<ScimResponse, ScimError> {
@@ -293,16 +525,27 @@ async fn patch_group(
         return Err(ScimError::not_found());
     };
 
-    let patch = parse_group_patch(&data.0)?;
+    let patch = parse_group_patch(&data?.0)?;
+    check_member_count(patch.member_count())?;
 
-    if let Some(external_id) = patch.external_id.as_deref() {
+    let new_external_id = patch.external_id.as_deref().filter(|id| !id.is_empty());
+    if let Some(external_id) = new_external_id {
         check_external_id_available(&group, external_id, &token, &conn).await?;
     }
 
-    let new_name = patch.display_name.as_deref().filter(|n| !n.trim().is_empty());
+    // displayName is required on a Group (RFC 7643 section 4.2), so a PATCH
+    // trying to clear it is an error rather than a silently ignored no-op that
+    // still returns 200 - the client would record the change as applied and
+    // never retry, leaving the directory and the vault permanently disagreeing.
+    let new_name = patch.display_name.as_deref();
     if let Some(display_name) = new_name {
+        if display_name.trim().is_empty() {
+            return Err(ScimError::bad_request("invalidValue", "displayName is required and cannot be cleared"));
+        }
+        crate::api::scim::check_attribute_len("displayName", display_name, crate::api::scim::SCIM_MAX_GROUP_NAME_LEN)?;
         group.name = display_name.to_owned();
     }
+    // An empty externalId is a PATCH remove; set_external_id stores it as NULL.
     if let Some(external_id) = patch.external_id.clone() {
         group.set_external_id(Some(external_id));
     }
@@ -311,28 +554,11 @@ async fn patch_group(
         group.save(&conn).await.map_err(|_| ScimError::internal())?;
     }
 
-    if let Some(replacement) = patch.replace_members {
-        let mut member_ids = Vec::with_capacity(replacement.len());
-        for value in &replacement {
-            member_ids.push(resolve_member(value, &token, &conn).await?);
-        }
-        set_members(&group, member_ids, &token, &conn).await?;
-    } else {
-        // True diff semantics: adds insert (idempotently via replace_into in
-        // GroupUser::save), removes delete only the listed member links.
-        for value in &patch.add_members {
-            let member_id = resolve_member(value, &token, &conn).await?;
-            let mut group_user = GroupUser::new(group.uuid.clone(), member_id);
-            group_user.save(&conn).await.map_err(|_| ScimError::internal())?;
-        }
-        for value in &patch.remove_members {
-            // Removing a member who is not in the org (or already absent from
-            // the group) is a no-op, not an error: Entra retries removals.
-            let member_id: MembershipId = value.clone().into();
-            GroupUser::delete_by_group_and_member(&group.uuid, &member_id, &conn)
-                .await
-                .map_err(|_| ScimError::internal())?;
-        }
+    // In the order the client sent them, per RFC 7644 section 3.5.2. Applying
+    // them out of order (or dropping adds because a replace was also present)
+    // silently changes who has access.
+    for member_op in &patch.member_ops {
+        apply_member_op(&group, member_op, &token, &conn).await?;
     }
 
     log_group_event(EventType::GroupUpdated, &group.uuid, &token, &conn).await;

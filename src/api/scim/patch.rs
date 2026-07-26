@@ -43,6 +43,21 @@ pub struct UserPatch {
 // here would surface as a sync error on every rename in the directory.
 // user.name is global to the person across organizations; an org-scoped
 // provisioning channel must not rewrite it.
+// Accepting a write we do not apply and returning 200 means the client records
+// it as done and never retries, so the directory and the vault diverge
+// permanently with no signal on either side. The 200 is deliberate - a 400 on
+// `userName` would quarantine the user in Entra for an attribute this server
+// will never own - so the log line is the only place that divergence can
+// surface. Named at warn so it is greppable when someone asks why a rename in
+// the directory did not appear in the vault.
+fn warn_unsynced_attribute(path: &str) {
+    warn!(
+        target: "scim",
+        "SCIM accepted but did not apply a write to '{path}': this attribute is not synced. \
+         The directory and the vault now disagree on it. See docs/scim/reference.md"
+    );
+}
+
 fn is_ignored_user_attribute(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower == "displayname"
@@ -71,27 +86,38 @@ pub fn parse_user_patch(patch: &PatchOp) -> Result<UserPatch, ScimError> {
 
     for operation in &patch.operations {
         let op = operation.op.to_lowercase();
-        if op != "replace" && op != "add" {
-            return Err(ScimError::bad_request(
-                "invalidValue",
-                "Only add and replace operations are supported for Users",
-            ));
+        if op != "replace" && op != "add" && op != "remove" {
+            return Err(ScimError::bad_request("invalidValue", "Unsupported patch operation"));
         }
+        let is_remove = op == "remove";
 
+        // The op is checked per-attribute, not up front: `remove` is a legal
+        // RFC 7644 operation and Entra sends it whenever a mapped source
+        // attribute is cleared in the directory. Rejecting it before reaching
+        // the accept-and-ignore list would fail the sync on exactly the
+        // attributes that list exists to tolerate.
         match operation.path.as_deref() {
             Some(op_path) if op_path.eq_ignore_ascii_case("active") => {
+                if is_remove {
+                    // Ambiguous, and guessing wrong either strands a member or
+                    // silently drops a deprovision. Make the client be explicit.
+                    return Err(ScimError::bad_request("invalidValue", "active cannot be removed, set it to false"));
+                }
                 let value = operation.value.clone().unwrap_or(Value::Null);
                 result.active = Some(coerce_bool(value)?);
             }
             Some(op_path) if op_path.eq_ignore_ascii_case("externalid") => {
-                let Some(Value::String(external_id)) = operation.value.as_ref() else {
-                    return Err(ScimError::bad_request("invalidValue", "externalId must be a string"));
-                };
-                result.external_id = Some(external_id.clone());
+                result.external_id = Some(external_id_value(operation.value.as_ref(), is_remove)?);
             }
-            Some(op_path) if is_ignored_user_attribute(op_path) => {}
+            Some(op_path) if is_ignored_user_attribute(op_path) => {
+                warn_unsynced_attribute(op_path);
+            }
             Some(_) => {
                 return Err(ScimError::bad_request("invalidPath", "Unsupported patch path"));
+            }
+            None if is_remove => {
+                // RFC 7644 section 3.5.2.2: remove requires a path.
+                return Err(ScimError::bad_request("noTarget", "A remove operation must carry a path"));
             }
             None => {
                 // Path-less form: the value is an object of attribute => value.
@@ -105,12 +131,10 @@ pub fn parse_user_patch(patch: &PatchOp) -> Result<UserPatch, ScimError> {
                     if attribute.eq_ignore_ascii_case("active") {
                         result.active = Some(coerce_bool(value.clone())?);
                     } else if attribute.eq_ignore_ascii_case("externalid") {
-                        let Value::String(external_id) = value else {
-                            return Err(ScimError::bad_request("invalidValue", "externalId must be a string"));
-                        };
-                        result.external_id = Some(external_id.clone());
+                        result.external_id = Some(external_id_value(Some(value), false)?);
                     } else if is_ignored_user_attribute(attribute) {
                         // Accepted, not synced; see is_ignored_user_attribute.
+                        warn_unsynced_attribute(attribute);
                     } else {
                         return Err(ScimError::bad_request("invalidPath", "Unsupported patch attribute"));
                     }
@@ -120,6 +144,18 @@ pub fn parse_user_patch(patch: &PatchOp) -> Result<UserPatch, ScimError> {
     }
 
     Ok(result)
+}
+
+// An externalId to store. A remove clears it, which reaches the database as
+// NULL because Membership::set_external_id normalizes the empty string.
+fn external_id_value(value: Option<&Value>, is_remove: bool) -> Result<String, ScimError> {
+    if is_remove {
+        return Ok(String::new());
+    }
+    match value {
+        Some(Value::String(external_id)) => Ok(external_id.clone()),
+        _ => Err(ScimError::bad_request("invalidValue", "externalId must be a string")),
+    }
 }
 
 fn coerce_bool(value: Value) -> Result<bool, ScimError> {
@@ -201,6 +237,48 @@ mod tests {
     }
 
     #[test]
+    fn remove_on_ignored_attributes_is_a_noop_not_an_error() {
+        // Entra sends `remove` when a mapped source attribute is cleared in the
+        // directory. Rejecting it would fail the sync on exactly the attributes
+        // is_ignored_user_attribute exists to tolerate.
+        for path in ["displayName", "name.givenName", "title", "phoneNumbers", "roles"] {
+            let parsed = patch(json!({
+                "schemas": [PATCH_OP_URN],
+                "Operations": [
+                    {"op": "Remove", "path": path},
+                    {"op": "replace", "path": "active", "value": false},
+                ],
+            }))
+            .unwrap_or_else(|_| panic!("remove on {path} must be ignored, not rejected"));
+            assert_eq!(parsed.active, Some(false), "path {path}");
+            assert_eq!(parsed.external_id, None, "path {path}");
+        }
+    }
+
+    #[test]
+    fn remove_externalid_clears_it() {
+        // The empty string is how "clear" reaches update_external_id, which
+        // stores it as NULL via Membership::set_external_id.
+        let parsed = patch(json!({
+            "schemas": [PATCH_OP_URN],
+            "Operations": [{"op": "remove", "path": "externalId"}],
+        }))
+        .expect("remove externalId must parse");
+        assert_eq!(parsed.external_id.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn remove_without_a_path_is_no_target() {
+        // RFC 7644 section 3.5.2.2.
+        let err = patch(json!({
+            "schemas": [PATCH_OP_URN],
+            "Operations": [{"op": "remove", "value": {"displayName": "x"}}],
+        }))
+        .expect_err("remove without a path must be rejected");
+        assert_eq!(err.scim_type, Some("noTarget"));
+    }
+
+    #[test]
     fn rejects_bad_patches() {
         for (payload, expected_type) in [
             (
@@ -231,16 +309,42 @@ mod tests {
 // Group PATCH
 // ---------------------------------------------------------------------------
 
-// What a Group PATCH asked for, after normalization. Member values are
-// MembershipIds (the SCIM User id).
+// One membership mutation from a PatchOp, in the order the client sent it.
+// Member values are MembershipIds (the SCIM User id).
+#[derive(Debug, PartialEq)]
+pub enum MemberOp {
+    Add(Vec<String>),
+    Remove(Vec<String>),
+    // Full replacement of the member set.
+    Replace(Vec<String>),
+}
+
+impl MemberOp {
+    pub fn values(&self) -> &[String] {
+        match self {
+            Self::Add(values) | Self::Remove(values) | Self::Replace(values) => values,
+        }
+    }
+}
+
+// What a Group PATCH asked for, after normalization.
+//
+// member_ops is an ordered list, not three buckets: RFC 7644 section 3.5.2
+// requires operations to be applied in the order supplied. Bucketing loses
+// that, so [remove X, add X] and [add X, remove X] become indistinguishable -
+// and a replace in the same PatchOp as an add would silently discard the add.
 #[derive(Debug, Default, PartialEq)]
 pub struct GroupPatch {
     pub display_name: Option<String>,
     pub external_id: Option<String>,
-    pub add_members: Vec<String>,
-    pub remove_members: Vec<String>,
-    // Some(list) means full replacement of the member set.
-    pub replace_members: Option<Vec<String>>,
+    pub member_ops: Vec<MemberOp>,
+}
+
+impl GroupPatch {
+    // Total member values across every operation, for the inbound size cap.
+    pub fn member_count(&self) -> usize {
+        self.member_ops.iter().map(|op| op.values().len()).sum()
+    }
 }
 
 // Entra removes single members with a filter path instead of a value list:
@@ -248,7 +352,14 @@ pub struct GroupPatch {
 // (the value-array form is only sent by apps created with the
 // aadOptscim062020 feature flag). Both forms must work.
 fn parse_members_filter_path(path: &str) -> Option<String> {
-    let inner = path.strip_prefix("members[")?.strip_suffix(']')?;
+    // SCIM attribute names are case-insensitive (RFC 7643 section 2.1) and the
+    // caller's guard lowercases before testing this prefix, so stripping it
+    // case-sensitively here would reject "Members[value eq ...]".
+    const PREFIX: &str = "members[";
+    if !path.get(..PREFIX.len()).is_some_and(|head| head.eq_ignore_ascii_case(PREFIX)) {
+        return None;
+    }
+    let inner = path[PREFIX.len()..].strip_suffix(']')?;
     let (attribute, rest) = inner.split_once(char::is_whitespace)?;
     if !attribute.eq_ignore_ascii_case("value") {
         return None;
@@ -296,41 +407,33 @@ pub fn parse_group_patch(patch: &PatchOp) -> Result<GroupPatch, ScimError> {
     for operation in &patch.operations {
         let op = operation.op.to_lowercase();
         match operation.path.as_deref() {
-            Some(op_path) if op_path.eq_ignore_ascii_case("members") => match op.as_str() {
-                "add" => result.add_members.append(&mut member_values(operation.value.as_ref())?),
-                "remove" => result.remove_members.append(&mut member_values(operation.value.as_ref())?),
-                "replace" => {
-                    result
-                        .replace_members
-                        .get_or_insert_with(Vec::new)
-                        .append(&mut member_values(operation.value.as_ref())?);
-                }
-                _ => return Err(ScimError::bad_request("invalidValue", "Unsupported operation on members")),
-            },
+            Some(op_path) if op_path.eq_ignore_ascii_case("members") => {
+                result.member_ops.push(member_op(&op, member_values(operation.value.as_ref())?)?);
+            }
             Some(op_path) if op_path.to_lowercase().starts_with("members[") => {
                 let Some(member_id) = parse_members_filter_path(op_path) else {
                     return Err(ScimError::bad_request("invalidPath", "Unsupported members filter path"));
                 };
-                match op.as_str() {
-                    // Entra's single-member removal form.
-                    "remove" => result.remove_members.push(member_id),
-                    "add" | "replace" => result.add_members.push(member_id),
-                    _ => return Err(ScimError::bad_request("invalidValue", "Unsupported operation on members")),
-                }
+                // Entra's single-member form. A filtered replace targets that
+                // one member, so it means add, not "replace the whole set".
+                let op = if op == "replace" {
+                    "add"
+                } else {
+                    op.as_str()
+                };
+                result.member_ops.push(member_op(op, vec![member_id])?);
             }
             Some(op_path) if op_path.eq_ignore_ascii_case("displayname") => {
-                let Some(Value::String(name)) = operation.value.as_ref() else {
-                    return Err(ScimError::bad_request("invalidValue", "displayName must be a string"));
-                };
-                result.display_name = Some(name.clone());
+                result.display_name = Some(group_string_value(&op, operation.value.as_ref(), "displayName")?);
             }
             Some(op_path) if op_path.eq_ignore_ascii_case("externalid") => {
-                let Some(Value::String(external_id)) = operation.value.as_ref() else {
-                    return Err(ScimError::bad_request("invalidValue", "externalId must be a string"));
-                };
-                result.external_id = Some(external_id.clone());
+                result.external_id = Some(group_string_value(&op, operation.value.as_ref(), "externalId")?);
             }
             Some(_) => return Err(ScimError::bad_request("invalidPath", "Unsupported patch path for Groups")),
+            None if op == "remove" => {
+                // RFC 7644 section 3.5.2.2: remove requires a path.
+                return Err(ScimError::bad_request("noTarget", "A remove operation must carry a path"));
+            }
             None => {
                 let Some(Value::Object(map)) = operation.value.as_ref() else {
                     return Err(ScimError::bad_request(
@@ -340,29 +443,11 @@ pub fn parse_group_patch(patch: &PatchOp) -> Result<GroupPatch, ScimError> {
                 };
                 for (attribute, value) in map {
                     if attribute.eq_ignore_ascii_case("displayname") {
-                        let Value::String(name) = value else {
-                            return Err(ScimError::bad_request("invalidValue", "displayName must be a string"));
-                        };
-                        result.display_name = Some(name.clone());
+                        result.display_name = Some(group_string_value(&op, Some(value), "displayName")?);
                     } else if attribute.eq_ignore_ascii_case("externalid") {
-                        let Value::String(external_id) = value else {
-                            return Err(ScimError::bad_request("invalidValue", "externalId must be a string"));
-                        };
-                        result.external_id = Some(external_id.clone());
+                        result.external_id = Some(group_string_value(&op, Some(value), "externalId")?);
                     } else if attribute.eq_ignore_ascii_case("members") {
-                        match op.as_str() {
-                            "add" => result.add_members.append(&mut member_values(Some(value))?),
-                            "remove" => result.remove_members.append(&mut member_values(Some(value))?),
-                            "replace" => {
-                                result
-                                    .replace_members
-                                    .get_or_insert_with(Vec::new)
-                                    .append(&mut member_values(Some(value))?);
-                            }
-                            _ => {
-                                return Err(ScimError::bad_request("invalidValue", "Unsupported operation on members"));
-                            }
-                        }
+                        result.member_ops.push(member_op(&op, member_values(Some(value))?)?);
                     } else {
                         return Err(ScimError::bad_request("invalidPath", "Unsupported patch attribute for Groups"));
                     }
@@ -372,6 +457,29 @@ pub fn parse_group_patch(patch: &PatchOp) -> Result<GroupPatch, ScimError> {
     }
 
     Ok(result)
+}
+
+fn member_op(op: &str, values: Vec<String>) -> Result<MemberOp, ScimError> {
+    match op {
+        "add" => Ok(MemberOp::Add(values)),
+        "remove" => Ok(MemberOp::Remove(values)),
+        "replace" => Ok(MemberOp::Replace(values)),
+        _ => Err(ScimError::bad_request("invalidValue", "Unsupported operation on members")),
+    }
+}
+
+// A displayName/externalId value. The op is honoured rather than ignored: a
+// remove clears the attribute (empty string, which Group::set_external_id
+// stores as NULL) instead of setting it to whatever value tagged along.
+fn group_string_value(op: &str, value: Option<&Value>, attribute: &str) -> Result<String, ScimError> {
+    match op {
+        "remove" => Ok(String::new()),
+        "add" | "replace" => match value {
+            Some(Value::String(text)) => Ok(text.clone()),
+            _ => Err(ScimError::bad_request("invalidValue", &format!("{attribute} must be a string"))),
+        },
+        _ => Err(ScimError::bad_request("invalidValue", &format!("Unsupported operation on {attribute}"))),
+    }
 }
 
 #[cfg(test)]
@@ -393,8 +501,74 @@ mod group_tests {
             ],
         }))
         .expect("valid");
-        assert_eq!(parsed.add_members, vec!["member-1", "member-2"]);
-        assert_eq!(parsed.remove_members, vec!["member-3"]);
+        assert_eq!(
+            parsed.member_ops,
+            vec![
+                MemberOp::Add(vec!["member-1".to_owned(), "member-2".to_owned()]),
+                MemberOp::Remove(vec!["member-3".to_owned()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn member_ops_keep_the_order_they_arrived_in() {
+        // RFC 7644 section 3.5.2: operations apply in the order supplied.
+        // Bucketing by op would make these two PatchOps indistinguishable,
+        // and both would resolve to "removed".
+        let remove_then_add = patch(json!({
+            "schemas": [PATCH_OP_URN],
+            "Operations": [
+                {"op": "remove", "path": "members", "value": [{"value": "m-1"}]},
+                {"op": "add", "path": "members", "value": [{"value": "m-1"}]},
+            ],
+        }))
+        .expect("valid");
+        assert_eq!(
+            remove_then_add.member_ops,
+            vec![MemberOp::Remove(vec!["m-1".to_owned()]), MemberOp::Add(vec!["m-1".to_owned()])]
+        );
+
+        let add_then_remove = patch(json!({
+            "schemas": [PATCH_OP_URN],
+            "Operations": [
+                {"op": "add", "path": "members", "value": [{"value": "m-1"}]},
+                {"op": "remove", "path": "members", "value": [{"value": "m-1"}]},
+            ],
+        }))
+        .expect("valid");
+        assert_ne!(add_then_remove.member_ops, remove_then_add.member_ops, "order must be preserved, not bucketed");
+    }
+
+    #[test]
+    fn a_replace_does_not_swallow_other_member_ops() {
+        // The bucketed form applied the replace and silently discarded the add,
+        // returning 200 while the member never joined.
+        let parsed = patch(json!({
+            "schemas": [PATCH_OP_URN],
+            "Operations": [
+                {"op": "replace", "path": "members", "value": [{"value": "m-1"}]},
+                {"op": "add", "path": "members", "value": [{"value": "m-2"}]},
+            ],
+        }))
+        .expect("valid");
+        assert_eq!(
+            parsed.member_ops,
+            vec![MemberOp::Replace(vec!["m-1".to_owned()]), MemberOp::Add(vec!["m-2".to_owned()])]
+        );
+    }
+
+    #[test]
+    fn group_remove_clears_display_name_and_external_id() {
+        // Previously the op was computed and then ignored on these branches, so
+        // a remove carrying a value SET the attribute instead of clearing it.
+        let parsed = patch(json!({
+            "schemas": [PATCH_OP_URN],
+            "Operations": [
+                {"op": "remove", "path": "externalId", "value": "stale-value"},
+            ],
+        }))
+        .expect("valid");
+        assert_eq!(parsed.external_id.as_deref(), Some(""), "remove must clear, not set");
     }
 
     #[test]
@@ -404,7 +578,22 @@ mod group_tests {
             "Operations": [{"op": "Remove", "path": "members[value eq \"member-9\"]"}],
         }))
         .expect("valid");
-        assert_eq!(parsed.remove_members, vec!["member-9"]);
+        assert_eq!(parsed.member_ops, vec![MemberOp::Remove(vec!["member-9".to_owned()])]);
+    }
+
+    #[test]
+    fn filter_path_attribute_name_is_case_insensitive() {
+        // RFC 7643 section 2.1: attribute names are case-insensitive. The
+        // dispatch guard lowercases the path, so the parser must too or the
+        // request is accepted into the branch and then rejected as invalidPath.
+        for path in ["Members[value eq \"m-1\"]", "MEMBERS[Value EQ \"m-1\"]"] {
+            let parsed = patch(json!({
+                "schemas": [PATCH_OP_URN],
+                "Operations": [{"op": "Remove", "path": path}],
+            }))
+            .unwrap_or_else(|_| panic!("path {path} must parse"));
+            assert_eq!(parsed.member_ops, vec![MemberOp::Remove(vec!["m-1".to_owned()])], "path {path}");
+        }
     }
 
     #[test]
@@ -417,7 +606,7 @@ mod group_tests {
             ],
         }))
         .expect("valid");
-        assert_eq!(parsed.replace_members.as_deref(), Some(&["only-member".to_owned()][..]));
+        assert_eq!(parsed.member_ops, vec![MemberOp::Replace(vec!["only-member".to_owned()])]);
         assert_eq!(parsed.display_name.as_deref(), Some("New Group Name"));
     }
 
@@ -442,5 +631,77 @@ mod group_tests {
                 Ok(p) => panic!("group patch {payload} unexpectedly parsed to {p:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod review_regression_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn user_patch(payload: Value) -> Result<UserPatch, ScimError> {
+        parse_user_patch(&serde_json::from_value(payload).expect("valid PatchOp"))
+    }
+
+    fn group_patch(payload: Value) -> Result<GroupPatch, ScimError> {
+        parse_group_patch(&serde_json::from_value(payload).expect("valid PatchOp"))
+    }
+
+    // Entra's single-member filter form with `replace` targets THAT member, so
+    // it means add. If this ever regresses to MemberOp::Replace it would wipe
+    // every other member of the group while returning 200.
+    #[test]
+    fn a_filtered_replace_adds_one_member_rather_than_replacing_the_set() {
+        for op in ["replace", "Replace", "REPLACE"] {
+            let parsed = group_patch(json!({
+                "schemas": [PATCH_OP_URN],
+                "Operations": [{"op": op, "path": "members[value eq \"m-1\"]"}],
+            }))
+            .unwrap_or_else(|_| panic!("op {op} must parse"));
+            assert_eq!(
+                parsed.member_ops,
+                vec![MemberOp::Add(vec!["m-1".to_owned()])],
+                "a filtered {op} targets one member, so it must not replace the whole set"
+            );
+        }
+    }
+
+    // The enterprise extension is the branch Entra exercises most: department,
+    // manager and employeeNumber are default mappings in its provisioning
+    // template. Rejecting them would fail the sync on every user.
+    #[test]
+    fn enterprise_extension_attributes_are_accepted_and_ignored() {
+        const ENTERPRISE: &str = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User";
+        for attribute in ["department", "manager", "employeeNumber", "costCenter", "organization"] {
+            let path = format!("{ENTERPRISE}:{attribute}");
+            let parsed = user_patch(json!({
+                "schemas": [PATCH_OP_URN],
+                "Operations": [
+                    {"op": "replace", "path": path, "value": "anything"},
+                    {"op": "replace", "path": "active", "value": false},
+                ],
+            }))
+            .unwrap_or_else(|_| panic!("{path} must be ignored, not rejected"));
+            assert_eq!(parsed.active, Some(false), "path {path}");
+            assert_eq!(parsed.external_id, None, "path {path}");
+        }
+    }
+
+    // The path-less form is a separate branch from the path form, and nothing
+    // covered an ignored attribute arriving through it.
+    #[test]
+    fn ignored_attributes_are_also_tolerated_in_the_path_less_form() {
+        let parsed = user_patch(json!({
+            "schemas": [PATCH_OP_URN],
+            "Operations": [{"op": "replace", "value": {
+                "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department": "Engineering",
+                "displayName": "Ignored Name",
+                "preferredLanguage": "en-AU",
+                "active": false,
+            }}],
+        }))
+        .expect("a path-less patch of ignored attributes plus active must parse");
+        assert_eq!(parsed.active, Some(false));
+        assert_eq!(parsed.external_id, None);
     }
 }

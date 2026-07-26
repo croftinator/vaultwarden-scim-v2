@@ -561,6 +561,8 @@ make_config! {
         /// Auth Request cleanup schedule |> Cron schedule of the job that cleans old auth requests from the auth request.
         /// Defaults to every minute. Set blank to disable this job.
         auth_request_purge_schedule:   String, false,  def,    "30 * * * * *".to_owned();
+        /// Rate limiter prune schedule |> Cron schedule for dropping fully replenished rate-limiter buckets, which are otherwise never evicted. Defaults to hourly at 15 minutes past.
+        ratelimit_prune_schedule:      String, false,  def,    "0 15 * * * *".to_owned();
         /// Duo Auth context cleanup schedule |> Cron schedule of the job that cleans expired Duo contexts from the database. Does nothing if Duo MFA is disabled or set to use the legacy iframe prompt.
         /// Defaults to once every minute. Set blank to disable this job.
         duo_context_purge_schedule:   String, false,  def,    "30 * * * * *".to_owned();
@@ -1043,6 +1045,16 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         println!("[WARNING] SCIM provisioning changes will not appear in the organization event log.");
     }
 
+    // Both feed NonZeroU32/Quota::with_period, which panic inside a LazyLock on
+    // zero. That poisons the lock, so every later SCIM request re-panics and the
+    // endpoint stays dead until restart. Fail at config load instead.
+    if cfg.scim_ratelimit_seconds == 0 {
+        err!("`SCIM_RATELIMIT_SECONDS` must be greater than 0");
+    }
+    if cfg.scim_ratelimit_max_burst == 0 {
+        err!("`SCIM_RATELIMIT_MAX_BURST` must be greater than 0");
+    }
+
     if cfg.push_enabled && (cfg.push_installation_id == String::new() || cfg.push_installation_key == String::new()) {
         err!(
             "Misconfigured Push Notification service\n\
@@ -1275,6 +1287,10 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
 
     if !cfg.event_cleanup_schedule.is_empty() && cfg.event_cleanup_schedule.parse::<Schedule>().is_err() {
         err!("`EVENT_CLEANUP_SCHEDULE` is not a valid cron expression")
+    }
+
+    if !cfg.ratelimit_prune_schedule.is_empty() && cfg.ratelimit_prune_schedule.parse::<Schedule>().is_err() {
+        err!("`RATELIMIT_PRUNE_SCHEDULE` is not a valid cron expression")
     }
 
     if !cfg.auth_request_purge_schedule.is_empty() && cfg.auth_request_purge_schedule.parse::<Schedule>().is_err() {

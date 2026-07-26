@@ -19,7 +19,6 @@ use rocket::{
 };
 
 use crate::{
-    CONFIG,
     auth::ClientIp,
     db::{
         DbConn,
@@ -67,7 +66,7 @@ impl<'r> FromRequest<'r> for ScimToken {
             return Outcome::Error((Status::TooManyRequests, "Too many requests"));
         }
 
-        if !CONFIG.scim_enabled() {
+        if !crate::api::scim::scim_enabled() {
             err_handler!("SCIM is disabled")
         }
 
@@ -106,6 +105,12 @@ impl<'r> FromRequest<'r> for ScimToken {
         if !scim_key.check_valid_secret(secret) {
             err_handler!("Invalid SCIM token secret", format!("IP: {}. Organization: {org_uuid}", ip.ip))
         }
+
+        // Only after the secret verifies, so an attacker cannot drive this write
+        // with wrong credentials. Rate-limited internally to one write per hour
+        // per organization, so a full sync does not turn every request into an
+        // UPDATE - see ScimApiKey::touch_last_used.
+        scim_key.touch_last_used(&conn).await;
 
         Outcome::Success(ScimToken {
             org_uuid,

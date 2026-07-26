@@ -659,7 +659,21 @@ pub async fn send_protected_action_token(address: &str, token: &str) -> EmptyRes
     send_email(address, &subject, body_html, body_text).await
 }
 
+// Intercept before any transport is constructed, so a test build cannot reach a
+// real SMTP host even if one is configured in the environment.
+#[cfg_attr(test, expect(clippy::unused_async, reason = "the cfg(test) arm returns without awaiting"))]
 async fn send_with_selected_transport(email: Message) -> EmptyResult {
+    #[cfg(test)]
+    return test_sink::intercept(&email);
+
+    #[cfg(not(test))]
+    send_via_configured_transport(email).await
+}
+
+// The real transports. Still compiled under cfg(test) - so the lettre imports
+// stay used and this cannot rot - but never called; see the sink above.
+#[cfg_attr(test, allow(dead_code))]
+async fn send_via_configured_transport(email: Message) -> EmptyResult {
     if CONFIG.use_sendmail() {
         match sendmail_transport().send(email).await {
             Ok(()) => Ok(()),
@@ -739,4 +753,92 @@ async fn send_email(address: &str, subject: &str, body_html: String, body_text: 
         .multipart(body)?;
 
     send_with_selected_transport(email).await
+}
+
+// Test-only mail sink.
+//
+// Every outbound message funnels through send_with_selected_transport, so
+// intercepting here captures all of them and guarantees no test build can open
+// a real SMTP connection. Tests need this to assert the things that are
+// otherwise invisible: that an invite WAS sent, that a second one was NOT, and
+// what the server does when the transport fails.
+#[cfg(test)]
+pub mod test_sink {
+    use std::sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    /// One captured message: `(to, subject, body)`.
+    ///
+    /// The body is the full formatted message with
+    /// quoted-printable transport encoding undone, so a test can search it for
+    /// a URL without tripping over soft line breaks.
+    pub type Captured = (String, String, String);
+
+    static OUTBOX: OnceLock<Mutex<Vec<Captured>>> = OnceLock::new();
+    static FAIL: AtomicBool = AtomicBool::new(false);
+
+    fn outbox() -> &'static Mutex<Vec<Captured>> {
+        OUTBOX.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Captures a message instead of sending it, or fails if the simulated
+    /// outage is on.
+    pub(super) fn intercept(email: &lettre::message::Message) -> crate::api::EmptyResult {
+        if FAIL.load(Ordering::SeqCst) {
+            err!("SMTP error: simulated transport failure");
+        }
+        let headers = email.headers();
+        let to = headers.get_raw("To").unwrap_or_default();
+        let subject = headers.get_raw("Subject").unwrap_or_default();
+        outbox().lock().unwrap().push((to.to_owned(), subject.to_owned(), decoded_body(email)));
+        Ok(())
+    }
+
+    /// lettre encodes long bodies as quoted-printable, which wraps lines with
+    /// `=\r\n` and escapes `=` as `=3D`. A URL therefore does not appear
+    /// literally in the raw message. Undoing just those two transformations is
+    /// enough to make the body searchable, and avoids taking a MIME-parsing
+    /// dependency for what tests actually need.
+    fn decoded_body(email: &lettre::message::Message) -> String {
+        let raw = String::from_utf8_lossy(&email.formatted()).into_owned();
+        raw.replace("=\r\n", "").replace("=\n", "").replace("=3D", "=")
+    }
+
+    /// Clears the outbox and re-enables delivery. Call at the start of any test
+    /// that asserts on mail.
+    pub fn reset() {
+        outbox().lock().unwrap().clear();
+        FAIL.store(false, Ordering::SeqCst);
+    }
+
+    /// Restores delivery when dropped.
+    ///
+    /// `FAIL` is process-global, and a test that toggles it by hand leaks the
+    /// outage to every later test if any assertion in between panics. Mirrors
+    /// `scim::test_config::Override` for the same reason.
+    pub struct FailGuard;
+
+    impl Drop for FailGuard {
+        fn drop(&mut self) {
+            FAIL.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Fails every send until the returned guard is dropped.
+    #[must_use]
+    pub fn fail_sends_guard() -> FailGuard {
+        FAIL.store(true, Ordering::SeqCst);
+        FailGuard
+    }
+
+    pub fn captured() -> Vec<Captured> {
+        outbox().lock().unwrap().clone()
+    }
+
+    /// Messages sent to `address`, in order.
+    pub fn to(address: &str) -> Vec<Captured> {
+        captured().into_iter().filter(|(rcpt, _, _)| rcpt.eq_ignore_ascii_case(address)).collect()
+    }
 }

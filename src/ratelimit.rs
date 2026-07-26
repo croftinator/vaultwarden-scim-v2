@@ -68,3 +68,30 @@ pub fn check_limit_scim(ip: &IpAddr) -> Result<(), Error> {
         }
     }
 }
+
+/// Drops rate-limiter buckets that have fully replenished.
+///
+/// The keyed state store never evicts on its own, so every distinct key ever
+/// seen keeps an entry for the process lifetime. The key is the client IP, and
+/// the set of distinct client IPs is unbounded: a proxy that forwards real
+/// client addresses supplies one entry per internet peer. Upstream #7472 closed
+/// the sharper version of this, where `IP_HEADER` was honoured from any caller
+/// and so the key could be chosen freely, but it only narrowed the source, it
+/// did not bound the count. All four limiters are checked before
+/// authentication, so the growth is reachable by unauthenticated traffic; SCIM
+/// widens that surface, which is why this now runs on a schedule.
+/// `retain_recent` alone only half-solves this. governor's keyed DashMap store
+/// implements it as a `retain`, which removes entries but does not release the
+/// map's bucket capacity, so a single burst of spoofed IPs would leave the
+/// allocation inflated for the process lifetime even after every entry expired.
+/// `shrink_to_fit` is the separate call that actually returns the memory.
+pub fn prune_limiters() {
+    LIMITER_LOGIN.retain_recent();
+    LIMITER_LOGIN.shrink_to_fit();
+    LIMITER_ADMIN.retain_recent();
+    LIMITER_ADMIN.shrink_to_fit();
+    LIMITER_SCIM.retain_recent();
+    LIMITER_SCIM.shrink_to_fit();
+    LIMITER_UNAUTHENTICATED.retain_recent();
+    LIMITER_UNAUTHENTICATED.shrink_to_fit();
+}

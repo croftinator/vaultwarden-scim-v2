@@ -297,7 +297,33 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for EtagC
 
 // Log all the routes from the main paths list, and the attachments endpoint
 // Effectively ignores, any static file route, and the alive endpoint
-const LOGGED_ROUTES: [&str; 7] = ["/api", "/admin", "/identity", "/icons", "/attachments", "/events", "/notifications"];
+const LOGGED_ROUTES: [&str; 8] =
+    ["/api", "/admin", "/identity", "/icons", "/attachments", "/events", "/notifications", "/scim"];
+
+// The query string as it should appear in the request log.
+//
+// SCIM list requests carry directory identity in the query itself
+// (`?filter=userName eq "person@example.com"`), so under /scim only the
+// parameter NAMES survive - which is what is actually useful when reading a
+// sync log, without writing every provisioned user's address into it.
+//
+// Everything else keeps the previous first-30-characters behaviour, but cut on
+// a character boundary: slicing a byte range out of a multi-byte query panics,
+// and this fairing runs before any request guard.
+fn log_query(uri_subpath: &str, query: &str) -> String {
+    if uri_subpath.starts_with("/scim") {
+        return query
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((name, _)) => format!("{name}=<redacted>"),
+                None => pair.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+    }
+    let end = query.char_indices().map(|(i, c)| i + c.len_utf8()).take_while(|&i| i <= 30).last().unwrap_or(0);
+    query[..end].to_owned()
+}
 
 // Boolean is extra debug, when true, we ignore the whitelist above and also print the mounts
 pub struct BetterLogging(pub bool);
@@ -345,7 +371,7 @@ impl Fairing for BetterLogging {
         let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
         if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             match uri.query() {
-                Some(q) => info!(target: "request", "{method} {uri_path_str}?{}", &q[..q.len().min(30)]),
+                Some(q) => info!(target: "request", "{method} {uri_path_str}?{}", log_query(uri_subpath, q.as_str())),
                 None => info!(target: "request", "{method} {uri_path_str}"),
             }
         }

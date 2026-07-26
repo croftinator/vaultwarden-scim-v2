@@ -739,6 +739,20 @@ fn schedule_jobs(pool: db::DbPool) {
                 }));
             }
 
+            // Drop fully replenished rate-limiter buckets. The keyed stores
+            // never evict on their own, and they are keyed on a client IP that
+            // is caller-supplied when IP_HEADER is honoured.
+            if !CONFIG.ratelimit_prune_schedule().is_empty() {
+                // spawn_blocking, not inline: DashMap::retain takes a write
+                // lock on every shard while it iterates, and every other job
+                // in this block hands its work to the runtime too. Running it
+                // on the scheduler thread would stall the tick loop - and so
+                // every job registered after it - for the length of the sweep.
+                sched.add(Job::new(CONFIG.ratelimit_prune_schedule().parse().unwrap(), || {
+                    runtime.spawn_blocking(ratelimit::prune_limiters);
+                }));
+            }
+
             // Purge sso auth from incomplete flow (default to daily at 00h20).
             if !CONFIG.purge_incomplete_sso_auth().is_empty() {
                 sched.add(Job::new(CONFIG.purge_incomplete_sso_auth().parse().unwrap(), || {
