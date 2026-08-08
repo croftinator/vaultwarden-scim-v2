@@ -659,12 +659,35 @@ async fn patch_group(
 // Deleting a group only removes an access mapping: it carries no E2EE state
 // (unlike memberships, where delete would destroy the wrapped org key), so a
 // real delete is safe and matches RFC semantics.
+//
+// It is still gated by the same ownership rule as additions. SCIM resolves a
+// group by uuid, so without this a token holder could enumerate every group in
+// the organization (GET /Groups returns them all) and delete the
+// administrator-curated ones, dropping their collections_groups rows and every
+// access grant with them. That is recoverable - no E2EE state is destroyed, the
+// admin re-creates the group and re-grants - which is why this is a lower bar
+// than the membership paths, not why it should be unguarded.
+//
+// The asymmetry with removals is deliberate and matches
+// reject_unmanaged_group_add: removing a MEMBER from an unmanaged group is
+// still allowed, because that reduces access and is the deprovisioning path.
+// Deleting the group itself is not deprovisioning - it destroys an
+// administrator's configuration - so it is refused for exactly the groups
+// additions are refused for.
 #[delete("/v2/<_>/Groups/<group_id>")]
 async fn delete_group(group_id: GroupId, token: ScimToken, conn: DbConn) -> Result<ScimResponse, ScimError> {
     check_groups_enabled()?;
     let Some(group) = Group::find_by_uuid_and_org(&group_id, &token.org_uuid, &conn).await else {
         return Err(ScimError::not_found());
     };
+    if !scim_may_add_members(&group, &token, &conn).await {
+        return Err(ScimError::bad_request(
+            "mutability",
+            "This group grants collection access and is not managed by SCIM (no externalId, or it \
+             grants access to all collections); it cannot be deleted through SCIM. Delete it in the \
+             web vault",
+        ));
+    }
     let group_uuid = group.uuid.clone();
     group.delete(&token.org_uuid, &conn).await.map_err(|_| ScimError::internal())?;
     // Log only after the delete succeeds, so the audit log never claims a

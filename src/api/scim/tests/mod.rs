@@ -27,7 +27,8 @@ use crate::{
         DbConn, DbPool,
         models::{
             Collection, CollectionGroup, Event, EventType, Group, GroupId, GroupUser, Membership, MembershipId,
-            MembershipStatus, MembershipType, Organization, OrganizationId, ScimApiKey, User,
+            MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationId, ScimApiKey,
+            User,
         },
     },
 };
@@ -5568,4 +5569,296 @@ async fn an_over_long_display_name_is_refused_with_400_not_500() {
     let (auth, ct, body) = scim_body(&token, &composed);
     let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
     assert_eq!(response.status(), Status::BadRequest, "a composed name over the cap must also be refused");
+}
+
+// ---------------------------------------------------------------------------
+// Coverage added by the 2026-08-08 follow-up pass: the Entra-facing branches
+// TODOS.md recorded as untested, plus the new unmanaged-group delete guard.
+// ---------------------------------------------------------------------------
+
+/// A restore refused by an organization policy is a 400, and changes nothing.
+///
+/// `restore_member` runs `OrgPolicy::check_user_allowed` on the RESTORED status
+/// and returns before `member.save()`, so the row must stay revoked. This branch
+/// had no coverage at all: a regression that let a policy-blocked member through
+/// would silently readmit someone the organization's own policy excludes, and a
+/// regression in the other direction would send Entra a status it retries
+/// forever.
+#[rocket::async_test]
+async fn a_policy_blocked_restore_is_refused_and_leaves_the_member_revoked() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-policy-restore-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    // Confirmed so that the restored status is > Invited, which is what
+    // check_user_allowed gates on; a plain User so atype < Admin.
+    let member_id = seed_member(&conn, &org, "policy.blocked@example.com", 2, MembershipType::User).await;
+
+    // Revoke first, so the PATCH below is a real restore.
+    let mut member = Membership::find_by_uuid_and_org(&member_id, &org, &conn).await.expect("member");
+    member.revoke();
+    member.save(&conn).await.expect("revoking");
+
+    // The organization requires 2FA and this member has none, so a restore is
+    // exactly what the policy forbids.
+    OrgPolicy::new(org.clone(), OrgPolicyType::TwoFactorAuthentication, true, "null".to_owned())
+        .save(&conn)
+        .await
+        .expect("saving policy");
+
+    let payload = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "active", "value": true}],
+    });
+    let (auth, ct, body) = scim_body(&token, &payload);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "a policy-blocked restore must be a 400");
+    assert_eq!(parse_json(&body_of(response).await)["scimType"], json!("invalidValue"));
+
+    let after = Membership::find_by_uuid_and_org(&member_id, &org, &conn).await.expect("member");
+    assert!(after.status <= MembershipStatus::Revoked as i32, "the member must still be revoked");
+
+    // The control: with the policy disabled the same request succeeds, so the
+    // refusal above cannot be explained by restore being broken outright.
+    let mut policy =
+        OrgPolicy::find_by_org_and_type(&org, OrgPolicyType::TwoFactorAuthentication, &conn).await.expect("policy");
+    policy.enabled = false;
+    policy.save(&conn).await.expect("disabling policy");
+
+    let payload = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "active", "value": true}],
+    });
+    let (auth, ct, body) = scim_body(&token, &payload);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Ok, "the same restore must succeed once the policy is off");
+    let after = Membership::find_by_uuid_and_org(&member_id, &org, &conn).await.expect("member");
+    assert!(after.status > MembershipStatus::Revoked as i32, "the control restore must have applied");
+}
+
+/// externalId filters must FIND the resource they name, on both endpoints.
+///
+/// Only the cross-org negative was pinned (which passes just as happily if the
+/// filter matches nothing at all). Entra correlates on externalId, so a
+/// regression that stopped matching would make every sync cycle believe the
+/// member does not exist yet and re-POST it - duplicate provisioning, seen from
+/// the tenant as a loop of 409s.
+#[rocket::async_test]
+async fn external_id_filters_find_the_resource_they_name() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-extid-filter-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    // A member carrying an externalId, created the way Entra creates one.
+    let create = json!({
+        "schemas": [scim::discovery::USER_SCHEMA_URN],
+        "userName": "extid.match@example.com",
+        "externalId": "entra-extid-match",
+        "active": true,
+    });
+    let (auth, ct, body) = scim_body(&token, &create);
+    let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+    let member_id = parse_json(&body_of(response).await)["id"].as_str().expect("id").to_owned();
+
+    let filter = url_escape("externalId eq \"entra-extid-match\"");
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response =
+        client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    let listed = parse_json(&body_of(response).await);
+    assert_eq!(listed["totalResults"], json!(1), "the externalId filter must match the member");
+    assert_eq!(listed["Resources"][0]["id"], json!(member_id), "and must return the right one");
+
+    // A value that exists nowhere still returns an empty 200, not a 404 - this
+    // is the shape Entra's own probe depends on.
+    let filter = url_escape("externalId eq \"entra-extid-absent\"");
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response =
+        client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(parse_json(&body_of(response).await)["totalResults"], json!(0));
+
+    // The Groups arm had no positive coverage at all.
+    let create = json!({
+        "schemas": [scim::discovery::GROUP_SCHEMA_URN],
+        "displayName": "ExtId Filter Group",
+        "externalId": "entra-grp-extid-match",
+    });
+    let (auth, ct, body) = scim_body(&token, &create);
+    let response = client.post(format!("/scim/v2/{org}/Groups")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+    let group_id = parse_json(&body_of(response).await)["id"].as_str().expect("id").to_owned();
+
+    let filter = url_escape("externalId eq \"entra-grp-extid-match\"");
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response =
+        client.get(format!("/scim/v2/{org}/Groups?filter={filter}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    let listed = parse_json(&body_of(response).await);
+    assert_eq!(listed["totalResults"], json!(1), "the Groups externalId filter must match");
+    assert_eq!(listed["Resources"][0]["id"], json!(group_id), "and must return the right group");
+}
+
+/// A second POST /Groups carrying an externalId already in use is a 409.
+///
+/// The concurrent test asserts only `created >= 1` with 201-or-409, which is
+/// correct for a race but means deleting post_group's uniqueness check entirely
+/// would keep every existing test green. This pins the sequential case, where
+/// there is no race and 409 is the only acceptable answer.
+#[rocket::async_test]
+async fn a_sequential_duplicate_group_external_id_is_a_409() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-dup-grp-extid-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    let create = json!({
+        "schemas": [scim::discovery::GROUP_SCHEMA_URN],
+        "displayName": "First Group",
+        "externalId": "entra-dup-grp",
+    });
+    let (auth, ct, body) = scim_body(&token, &create);
+    let response = client.post(format!("/scim/v2/{org}/Groups")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+
+    // Different displayName, same externalId: the correlation key is what must
+    // collide, not the name.
+    let duplicate = json!({
+        "schemas": [scim::discovery::GROUP_SCHEMA_URN],
+        "displayName": "Second Group",
+        "externalId": "entra-dup-grp",
+    });
+    let (auth, ct, body) = scim_body(&token, &duplicate);
+    let response = client.post(format!("/scim/v2/{org}/Groups")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Conflict, "a duplicate group externalId must be a 409");
+    assert_eq!(parse_json(&body_of(response).await)["scimType"], json!("uniqueness"));
+
+    let carrying =
+        Group::find_by_organization(&org, &conn).await.into_iter().filter(|g| g.external_id.is_some()).count();
+    assert_eq!(carrying, 1, "exactly one group may carry the externalId");
+}
+
+/// An SMTP outage during RESTORE must not fail the restore.
+///
+/// `restore_member` has its own mail branch, independent of the POST path that
+/// `smtp_outage_keeps_the_membership_and_does_not_fail_the_request` covers. A
+/// regression propagating the mail error here would fail every
+/// restore-after-outage cycle, which is the reprovision half of the highest
+/// value thing this feature does.
+#[rocket::async_test]
+async fn an_smtp_outage_during_restore_still_restores_the_member() {
+    let _guard = TEST_LOCK.lock().await;
+    crate::mail::test_sink::reset();
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-smtp-restore-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    // Invited, so the restore lands back on Invited and takes the re-invite mail
+    // branch - the one under test.
+    let member_id = seed_member(&conn, &org, "restore.outage@example.com", 0, MembershipType::User).await;
+    let mut member = Membership::find_by_uuid_and_org(&member_id, &org, &conn).await.expect("member");
+    member.revoke();
+    member.save(&conn).await.expect("revoking");
+
+    // RAII guard, matching the POST-path test: a panic in the assertions below
+    // must not leave the global fail flag set for every later test.
+    let smtp_outage = crate::mail::test_sink::fail_sends_guard();
+
+    let payload = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "active", "value": true}],
+    });
+    let (auth, ct, body) = scim_body(&token, &payload);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Ok, "an SMTP outage must not fail the restore");
+    assert_eq!(parse_json(&body_of(response).await)["active"], json!(true));
+
+    let after = Membership::find_by_uuid_and_org(&member_id, &org, &conn).await.expect("member");
+    assert_eq!(after.status, MembershipStatus::Invited as i32, "the restore must have been committed");
+
+    // Once SMTP recovers the next restore mails normally, and the failed one is
+    // not silently replayed.
+    drop(smtp_outage);
+    let mut member = Membership::find_by_uuid_and_org(&member_id, &org, &conn).await.expect("member");
+    member.revoke();
+    member.save(&conn).await.expect("re-revoking");
+
+    let payload = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "active", "value": true}],
+    });
+    let (auth, ct, body) = scim_body(&token, &payload);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(
+        crate::mail::test_sink::to("restore.outage@example.com").len(),
+        1,
+        "delivery must resume, and the outage-era invite must not be replayed"
+    );
+}
+
+/// SCIM must not delete an admin-owned group that grants collection access.
+///
+/// delete_group resolves by uuid like every other Group path, so without a guard
+/// a token holder could enumerate every group in the organization and delete the
+/// administrator-curated ones, dropping their collection grants. Recoverable, so
+/// a lower bar than the membership paths - but the same ownership rule as
+/// additions.
+#[rocket::async_test]
+async fn an_unmanaged_group_cannot_be_deleted_through_scim() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-grp-delete-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    // Web-vault shaped: no externalId, and it grants a collection.
+    let mut admin_group = Group::new(org.clone(), "Admin Curated".to_owned(), false, None);
+    admin_group.save(&conn).await.expect("saving admin group");
+    let group_id = admin_group.uuid.clone();
+
+    let secret = Collection::new(org.clone(), "Payroll".to_owned(), None);
+    secret.save(&conn).await.expect("saving collection");
+    CollectionGroup::new(secret.uuid.clone(), group_id.clone(), false, false, false)
+        .save(&org, &conn)
+        .await
+        .expect("granting collection access");
+
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response =
+        client.delete(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "deleting an unmanaged access-granting group must be refused");
+    assert_eq!(parse_json(&body_of(response).await)["scimType"], json!("mutability"));
+    assert!(
+        Group::find_by_uuid_and_org(&group_id, &org, &conn).await.is_some(),
+        "the group must still exist"
+    );
+
+    // The control: a group SCIM owns is still deletable, so the refusal above is
+    // not just group deletion being broken.
+    let create = json!({
+        "schemas": [scim::discovery::GROUP_SCHEMA_URN],
+        "displayName": "Entra Owned",
+        "externalId": "entra-deletable-1",
+    });
+    let (auth, ct, body) = scim_body(&token, &create);
+    let response = client.post(format!("/scim/v2/{org}/Groups")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+    let owned_id = parse_json(&body_of(response).await)["id"].as_str().expect("id").to_owned();
+
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response =
+        client.delete(format!("/scim/v2/{org}/Groups/{owned_id}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(response.status(), Status::NoContent, "a SCIM-managed group must still be deletable");
 }

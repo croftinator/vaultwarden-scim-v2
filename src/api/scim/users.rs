@@ -595,15 +595,52 @@ async fn precheck_active_change(
         Some(true) if !membership_active(member) => {
             reject_privileged_grant(member)?;
         }
-        Some(false)
-            if membership_active(member)
-                && member.atype == MembershipType::Owner
-                && Membership::count_active_by_org_and_type(&token.org_uuid, MembershipType::Owner, conn).await
-                    <= 1 =>
-        {
-            return Err(ScimError::bad_request("mutability", "Cannot revoke the last owner of the organization"));
+        Some(false) if membership_active(member) => {
+            reject_last_owner_revoke(member, token, conn).await?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+// Never leave an organization without an owner.
+//
+// Reported as 400 rather than 409: RFC 7644 section 3.12 defines the scimType
+// keywords for 400, and the only status/keyword pairing it sanctions outside
+// that is 409 + uniqueness.
+//
+// Counted over ACTIVE owners in any status, not confirmed owners only.
+// Confirmed-only was wrong in both directions. It let SCIM revoke an
+// organization's sole Owner whenever that Owner was still Invited or Accepted
+// (count_confirmed returns 0, so the guard never fired), and since
+// `reject_privileged_grant` refuses to let SCIM restore a privileged membership,
+// the organization was left with no owner and no SCIM path back. Counting active
+// owners also keeps the case the confirmed-only test got right: with one
+// confirmed Owner and one invited Owner the invited one can still be
+// deprovisioned, because two are active.
+//
+// Upstream `revoke_member_impl` tests only `atype` plus the confirmed count,
+// which refuses that legitimate revoke; the difference is deliberate, and the
+// reason SCIM does not simply reuse the upstream condition.
+//
+// KNOWN LIMITATION, tracked in TODOS.md: this is a check-then-act, and the
+// count and the write are separate statements. Two concurrent revokes of two
+// DIFFERENT Owners can each observe a count of 2 and both proceed, leaving the
+// organization with none. Closing it needs either SERIALIZABLE isolation, a lock
+// on a row both requests contend on, or a maintained counter column - and this
+// codebase uses no transactions or row locking anywhere, so the fix is an
+// architectural decision rather than a local one. A single conditional UPDATE
+// does NOT close it: the two requests target different rows, so their row locks
+// never conflict and both snapshots still read the pre-revoke count.
+async fn reject_last_owner_revoke(
+    member: &Membership,
+    token: &ScimToken,
+    conn: &DbConn,
+) -> Result<(), ScimError> {
+    if member.atype == MembershipType::Owner
+        && Membership::count_active_by_org_and_type(&token.org_uuid, MembershipType::Owner, conn).await <= 1
+    {
+        return Err(ScimError::bad_request("mutability", "Cannot revoke the last owner of the organization"));
     }
     Ok(())
 }
@@ -614,28 +651,11 @@ async fn revoke_member(member: &mut Membership, token: &ScimToken, conn: &DbConn
         return Ok(());
     }
 
-    // Never leave an organization without an owner. Reported as 400 rather than
-    // 409: RFC 7644 section 3.12 defines the scimType keywords for 400, and the
-    // only status/keyword pairing it sanctions outside that is 409 + uniqueness.
-    //
-    // Counted over ACTIVE owners in any status, not confirmed owners only.
-    // Confirmed-only was wrong in both directions. It let SCIM revoke an
-    // organization's sole Owner whenever that Owner was still Invited or
-    // Accepted (count_confirmed returns 0, so the guard never fired), and since
-    // `reject_privileged_grant` refuses to let SCIM restore a privileged
-    // membership, the organization was left with no owner and no SCIM path
-    // back. Counting active owners also keeps the case the confirmed-only test
-    // got right: with one confirmed Owner and one invited Owner the invited one
-    // can still be deprovisioned, because two are active.
-    //
-    // Upstream `revoke_member_impl` tests only `atype` plus the confirmed count,
-    // which refuses that legitimate revoke; the difference is deliberate, and
-    // the reason SCIM does not simply reuse the upstream condition.
-    if member.atype == MembershipType::Owner
-        && Membership::count_active_by_org_and_type(&token.org_uuid, MembershipType::Owner, conn).await <= 1
-    {
-        return Err(ScimError::bad_request("mutability", "Cannot revoke the last owner of the organization"));
-    }
+    // The same guard the PUT/PATCH precheck runs, kept here because delete_user
+    // reaches this function without going through that precheck. One helper
+    // rather than two copies: the condition and its 400 body were duplicated
+    // verbatim, so a change to either could silently apply to one path only.
+    reject_last_owner_revoke(member, token, conn).await?;
 
     member.revoke();
     member.save(conn).await.map_err(|_| ScimError::internal())?;
