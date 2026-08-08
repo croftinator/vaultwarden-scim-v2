@@ -117,15 +117,26 @@ malformed-body 400 and oversized-body 413 envelopes by
 missing/invalid/empty userName 400s by the same test plus
 `every_emitted_scim_type_reaches_the_wire_with_its_rfc_status`.
 
-**Still open:** policy-blocked restore 400 (the `OrgPolicy::check_user_allowed`
-branch in `restore_member` has no coverage at all - grep for `OrgPolicy` in the
-suite returns nothing), the POSITIVE externalId HTTP filter match on both /Users
-and /Groups (only the cross-org negative is pinned, and Entra correlates on
-externalId, so a regression here means duplicate provisioning), POST /Groups
-blank-name 400, and a SEQUENTIAL dup-externalId 409 on POST /Groups
-(`concurrent_group_create_cannot_duplicate_an_external_id` asserts only
-`created >= 1` with 201-or-409, so deleting the uniqueness check would keep
-every current test green).
+**Closed later the same day (follow-up pass).** Four of the five below now have
+tests: the policy-blocked restore 400
+(`a_policy_blocked_restore_is_refused_and_leaves_the_member_revoked`, which also
+asserts the row stays revoked, plus a policy-disabled control so the refusal
+cannot be explained by restore being broken); the POSITIVE externalId filter
+match on both endpoints (`external_id_filters_find_the_resource_they_name`); the
+sequential dup-externalId 409 on POST /Groups
+(`a_sequential_duplicate_group_external_id_is_a_409`); and the SMTP-failure-
+during-restore path (`an_smtp_outage_during_restore_still_restores_the_member`).
+
+**Still open:** POST /Groups blank-name 400 - the guard exists
+(`display_name.filter(|n| !n.trim().is_empty())`) but only its PUT and PATCH
+equivalents are pinned, so a POST with `""`, `"   "` or the attribute omitted is
+untested.
+
+Lower-value gaps also surfaced and deliberately left: `?attributes=` and
+`excludedAttributes` tolerance on /Users (Microsoft's hosted SCIM Validator
+sends these, and they currently work only because Rocket's FromForm derive is
+lenient), the 405 catcher envelope, the `emails.value` filter alias, and
+`excludedAttributes` on a single-group GET.
 
 **Why:** These are the branches where a regression would surface to Entra as a
 wrong status code or envelope, currently proven only by adjacent coverage.
