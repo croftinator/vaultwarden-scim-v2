@@ -1,0 +1,174 @@
+name: Deploy to Azure
+
+# Manual-only by design. An automatic deploy on push would redeploy a password
+# manager without anyone deciding to, and the SCIM endpoint is reachable by an
+# external IdP the moment it is live.
+#
+# Authentication is OIDC federated credentials - no long-lived cloud secret is
+# stored in GitHub. Configure the federated credential on an app registration
+# and grant it Contributor on the target resource group.
+#
+# Every deployment-specific value comes from repository variables and secrets;
+# nothing identifying is committed. See deploy/azure/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, test, staging, prod]
+        default: prod
+      whatIf:
+        description: Preview changes only (what-if), do not deploy
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write   # required for OIDC federated login
+  contents: read
+
+concurrency:
+  # One deployment at a time per environment. Two concurrent ARM deployments
+  # against the same resource group interleave unpredictably.
+  group: deploy-azure-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      # --- Repository variables (Settings > Secrets and variables > Actions) ---
+      VW_NAME_PREFIX: ${{ vars.VW_NAME_PREFIX }}
+      VW_ENVIRONMENT: ${{ inputs.environment }}
+      VW_LOCATION: ${{ vars.VW_LOCATION }}
+      VW_CONTAINER_IMAGE: ${{ vars.VW_CONTAINER_IMAGE }}
+      VW_DOMAIN: ${{ vars.VW_DOMAIN }}
+      VW_DEPLOY_POSTGRES: ${{ vars.VW_DEPLOY_POSTGRES }}
+      VW_POSTGRES_ADMIN_LOGIN: ${{ vars.VW_POSTGRES_ADMIN_LOGIN }}
+      VW_POSTGRES_SKU: ${{ vars.VW_POSTGRES_SKU }}
+      VW_POSTGRES_TIER: ${{ vars.VW_POSTGRES_TIER }}
+      VW_POSTGRES_STORAGE_GB: ${{ vars.VW_POSTGRES_STORAGE_GB }}
+      VW_POSTGRES_BACKUP_DAYS: ${{ vars.VW_POSTGRES_BACKUP_DAYS }}
+      VW_SCIM_ENABLED: ${{ vars.VW_SCIM_ENABLED }}
+      VW_ORG_EVENTS_ENABLED: ${{ vars.VW_ORG_EVENTS_ENABLED }}
+      VW_ORG_GROUPS_ENABLED: ${{ vars.VW_ORG_GROUPS_ENABLED }}
+      VW_SCIM_RATELIMIT_SECONDS: ${{ vars.VW_SCIM_RATELIMIT_SECONDS }}
+      VW_SCIM_RATELIMIT_MAX_BURST: ${{ vars.VW_SCIM_RATELIMIT_MAX_BURST }}
+      VW_SIGNUPS_ALLOWED: ${{ vars.VW_SIGNUPS_ALLOWED }}
+      VW_CPU: ${{ vars.VW_CPU }}
+      VW_MEMORY: ${{ vars.VW_MEMORY }}
+      VW_MIN_REPLICAS: ${{ vars.VW_MIN_REPLICAS }}
+      VW_MAX_REPLICAS: ${{ vars.VW_MAX_REPLICAS }}
+      VW_SMTP_HOST: ${{ vars.VW_SMTP_HOST }}
+      VW_SMTP_PORT: ${{ vars.VW_SMTP_PORT }}
+      VW_SMTP_SECURITY: ${{ vars.VW_SMTP_SECURITY }}
+      VW_SMTP_USERNAME: ${{ vars.VW_SMTP_USERNAME }}
+      VW_SMTP_FROM: ${{ vars.VW_SMTP_FROM }}
+      VW_LOG_RETENTION_DAYS: ${{ vars.VW_LOG_RETENTION_DAYS }}
+      # --- Repository secrets ---
+      VW_ADMIN_TOKEN: ${{ secrets.VW_ADMIN_TOKEN }}
+      VW_POSTGRES_ADMIN_PASSWORD: ${{ secrets.VW_POSTGRES_ADMIN_PASSWORD }}
+      VW_SMTP_PASSWORD: ${{ secrets.VW_SMTP_PASSWORD }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Verify required configuration
+        # Fail here with a readable message rather than 10 minutes later with an
+        # ARM error about a missing password.
+        run: |
+          missing=()
+          [ -n "${AZURE_CLIENT_ID}" ]       || missing+=("secret AZURE_CLIENT_ID")
+          [ -n "${AZURE_TENANT_ID}" ]       || missing+=("secret AZURE_TENANT_ID")
+          [ -n "${AZURE_SUBSCRIPTION_ID}" ] || missing+=("secret AZURE_SUBSCRIPTION_ID")
+          [ -n "${AZURE_RESOURCE_GROUP}" ]  || missing+=("variable AZURE_RESOURCE_GROUP")
+          [ -n "${VW_LOCATION}" ]           || missing+=("variable VW_LOCATION")
+          if [ "${VW_DEPLOY_POSTGRES:-true}" = "true" ] && [ -z "${VW_POSTGRES_ADMIN_PASSWORD}" ]; then
+            missing+=("secret VW_POSTGRES_ADMIN_PASSWORD (required when VW_DEPLOY_POSTGRES is true)")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing required configuration:\n'
+            printf '  - %s\n' "${missing[@]}"
+            printf '\nSee deploy/azure/README.md for the full list.\n'
+            exit 1
+          fi
+          echo "Configuration present."
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Lint templates
+        run: az bicep build --file deploy/azure/main.bicep --stdout > /dev/null
+
+      - name: Ensure resource group
+        run: |
+          az group create \
+            --name "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --location "${VW_LOCATION}" \
+            --output none
+          echo "Resource group ready: ${{ vars.AZURE_RESOURCE_GROUP }}"
+
+      - name: Preview changes (what-if)
+        run: |
+          az deployment group what-if \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file deploy/azure/main.bicep \
+            --parameters deploy/azure/main.bicepparam
+
+      - name: Deploy
+        if: ${{ !inputs.whatIf }}
+        id: deploy
+        run: |
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "vaultwarden-$(date -u +%Y%m%d-%H%M%S)" \
+            --template-file deploy/azure/main.bicep \
+            --parameters deploy/azure/main.bicepparam \
+            --query properties.outputs \
+            --output json > outputs.json
+          echo "appUrl=$(jq -r '.appUrl.value' outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "scimHint=$(jq -r '.scimTenantUrlHint.value' outputs.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: ${{ !inputs.whatIf && steps.deploy.outcome == 'success' }}
+        run: |
+          {
+            echo "## Vaultwarden deployed"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| App URL | ${{ steps.deploy.outputs.appUrl }} |"
+            echo "| SCIM base | \`${{ steps.deploy.outputs.scimHint }}\` |"
+            echo
+            echo "### Still to do by hand"
+            echo
+            echo "Bicep cannot do these - they need a running server:"
+            echo
+            echo "1. Create the organization and a **break-glass Owner that does not exist in Entra**."
+            echo "2. Mint the SCIM token (\`POST /api/organizations/<org>/scim/api-key\`); it is shown once."
+            echo "3. Paste the SCIM base URL and token into the Entra enterprise application, then run **Test Connection**."
+            echo "4. If using a custom domain, bind it and confirm \`DOMAIN\` matches - invite links and SCIM Location headers are built from it."
+            echo
+            echo "See \`docs/scim/setup.md\` and \`deploy/azure/README.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: What-if summary
+        if: ${{ inputs.whatIf }}
+        run: |
+          {
+            echo "## Preview only"
+            echo
+            echo "No changes were applied. Re-run with **whatIf** unchecked to deploy."
+          } >> "$GITHUB_STEP_SUMMARY"
