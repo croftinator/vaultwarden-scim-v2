@@ -67,6 +67,16 @@ cycles, and nested-group behaviour genuinely require a tenant.
 
 ### Mail-enabled invite failure path, end to end
 
+**CLOSED for POST 2026-08-08 (review pass).** The POST half is pinned by
+`smtp_outage_keeps_the_membership_and_does_not_fail_the_request` (mail enabled,
+`fail_sends_guard`, 201 asserted, membership and account survive, no silent
+replay after recovery). **Still open: the RESTORE half.** `restore_member` has
+its own independent mail branch (re-inviting a member restored to Invited) whose
+failure must likewise return 200 with the membership already restored; a
+regression propagating that error would break every restore-after-outage cycle
+and no test would catch it. Same `fail_sends_guard` mechanism, so this is now a
+small addition rather than new scaffolding.
+
 **What:** An integration test that runs `post_user` with mail enabled and a
 failing SMTP target, asserting that the membership SURVIVES, the response is
 201, and the failure is logged.
@@ -100,9 +110,22 @@ path-less object form for ignored attributes
 (`ignored_attributes_are_also_tolerated_in_the_path_less_form`); and the
 oversized-member-list refusal on all three write paths.
 
-**Still open:** malformed-body 400 / oversized-body 413 envelopes, POST /Users
-missing/invalid email 400s, policy-blocked restore 400, externalId HTTP filters,
-POST /Groups blank-name 400 and dup-externalId 409.
+**Correction 2026-08-08 (review pass):** three items previously listed here as
+open are in fact covered, and were re-verified against the suite:
+malformed-body 400 and oversized-body 413 envelopes by
+`malformed_and_oversized_bodies_stay_in_the_scim_envelope`; POST /Users
+missing/invalid/empty userName 400s by the same test plus
+`every_emitted_scim_type_reaches_the_wire_with_its_rfc_status`.
+
+**Still open:** policy-blocked restore 400 (the `OrgPolicy::check_user_allowed`
+branch in `restore_member` has no coverage at all - grep for `OrgPolicy` in the
+suite returns nothing), the POSITIVE externalId HTTP filter match on both /Users
+and /Groups (only the cross-org negative is pinned, and Entra correlates on
+externalId, so a regression here means duplicate provisioning), POST /Groups
+blank-name 400, and a SEQUENTIAL dup-externalId 409 on POST /Groups
+(`concurrent_group_create_cannot_duplicate_an_external_id` asserts only
+`created >= 1` with 201-or-409, so deleting the uniqueness check would keep
+every current test green).
 
 **Why:** These are the branches where a regression would surface to Entra as a
 wrong status code or envelope, currently proven only by adjacent coverage.
@@ -432,6 +455,74 @@ supported, but this value isn't checked anywhere (yet)`.
 **Effort:** S
 **Priority:** P1
 **Depends on:** A built web vault
+
+### Residual items from the 2026-08-08 review + CSO pass
+
+Three defects from this pass are **fixed and pinned** (see commit
+"close the group-adoption escalation and two write-path defects"): the group
+externalId adoption escalation, the non-atomic Group PATCH that granted access
+without logging it, and the uncapped displayName. What follows is what the same
+pass surfaced and deliberately did **not** change.
+
+**1. `delete_group` has no ownership guard.** A token holder can enumerate every
+group in the org (`GET /Groups` returns all of them) and DELETE any of them,
+including admin-curated groups that grant collection access, wiping their
+`collections_groups` mappings. Unlike memberships this carries no E2EE state and
+is recoverable by re-creating the group and re-granting, so it is destructive but
+not unrecoverable - which is why the feature's revoke-never-delete posture does
+not already cover it. The open question is a policy one: should DELETE refuse an
+unmanaged access-granting group the way additions now do, or is delete-is-
+recoverable acceptable? Refusing it has an Entra cost (a failing delete retries
+every cycle and can quarantine the app). **Effort:** S. **Priority:** P2.
+
+**2. Last-owner guard is check-then-act.** `precheck_active_change` and
+`revoke_member` both count active Owners and refuse at `<= 1`, outside any
+transaction. Two concurrent revokes targeting two different Owners can each
+observe a count of 2 and both proceed, leaving the org with zero active Owners -
+a state SCIM itself cannot repair, because `reject_privileged_grant` refuses to
+restore a privileged membership and a revoked Owner has no session. Entra
+normally serialises writes, so this needs parallel sync workers to trigger. Fix
+is a conditional UPDATE that revokes only when a subquery still counts more than
+one active Owner, checking affected rows. The duplicated guard should collapse
+into one helper at the same time (it is currently copy-pasted, and the count runs
+twice per owner-revoke request). **Effort:** M. **Priority:** P2.
+
+**3. externalId uniqueness still has no unique index.** Now confirmed by two
+independent passes: all six new composite indexes are plain `CREATE INDEX`, so
+every uniqueness check remains application-level check-then-set. Concurrent
+writes can commit duplicate correlation keys, after which
+`find_by_external_id_and_org` resolves via `.first()` and a later sync binds to
+an arbitrary one - the IdP can then update or deprovision the wrong member.
+postgresql and sqlite can take a straight `CREATE UNIQUE INDEX` (NULLs stay
+duplicable on both). MySQL is the awkward one: its index is a 150-char prefix, so
+a UNIQUE prefix index would falsely reject distinct values sharing a prefix.
+GUID-shaped externalIds are unaffected, but the divergence needs a decision
+rather than a silent shrug. **Effort:** M. **Priority:** P2.
+
+**4. `scim_status` has no step-up re-auth.** It returns SCIM key metadata
+(configured, enabled, createdAt, revisionDate, lastUsedAt) behind an
+`AdminHeaders` session alone, while its siblings `generate_scim_key` and
+`delete_scim_key` both require `PasswordOrOtpData::validate`. No token material
+is exposed, so this is an inconsistent guard rather than a leak - but it is the
+kind of asymmetry a later change turns into one. Either require the step-up or
+document why read-only metadata is exempt. **Effort:** S. **Priority:** P3.
+
+**5. Credential audit events are indistinguishable.** Mint, rotate, delete and
+the enable/disable kill switch all log `EventType::OrganizationUpdated`, so the
+org event log cannot tell a credential mint from any other org configuration
+change. Actor identity, device type and IP are recorded correctly, so this is a
+granularity gap, not a missing-audit gap - but at a SOC2 bar an auditor
+reconstructing "who could provision, and when" has to correlate timestamps
+against the `scim_api_key` row instead of reading the event stream. Distinct
+event types would close it. **Effort:** S. **Priority:** P2.
+
+**6. Group PATCH remains non-atomic for its own attributes.** The member-op half
+is now pre-resolved, but displayName and externalId still commit via
+`group.save` before the member loop runs. A body mixing a rename with a member op
+that fails inside `apply_member_op` (rather than in the precheck) leaves the
+rename persisted. The precheck makes this much harder to reach; closing it fully
+needs either a transaction or per-op event logging. **Effort:** M.
+**Priority:** P3.
 
 ## Enterprise feature upgrades
 
