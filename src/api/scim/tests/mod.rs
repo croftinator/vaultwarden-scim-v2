@@ -5314,3 +5314,258 @@ async fn an_unmanaged_group_accepts_removals_but_refuses_additions() {
         "the addition must have applied to the owned group"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Coverage added by the 2026-08-08 /review + /cso pass.
+// ---------------------------------------------------------------------------
+
+/// Setting an externalId must not be usable to ADOPT an admin-owned group.
+///
+/// `scim_may_add_members` treats `external_id.is_some()` as proof that SCIM owns
+/// a group, so the first assignment of an externalId is an ownership transfer.
+/// Guarding only the member-add left a two-request escalation: stamp an
+/// externalId on a web-vault group that grants a sensitive collection, then add
+/// a member you control and reach plaintext collection access nobody granted.
+///
+/// Both halves are pinned here. The single-request form proves a reordering fix
+/// is not enough on its own; the two-request form is the one a naive fix misses.
+#[rocket::async_test]
+async fn a_scim_token_cannot_adopt_an_admin_owned_group_by_setting_its_external_id() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-adoption-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    let intruder = seed_member(&conn, &org, "adopt.intruder@example.com", 2, MembershipType::User).await;
+
+    // Exactly the shape the guard protects: created in the web vault (no
+    // externalId) and granting a collection.
+    let mut admin_group = Group::new(org.clone(), "Payroll Access".to_owned(), false, None);
+    admin_group.save(&conn).await.expect("saving admin group");
+    let group_id = admin_group.uuid.clone();
+
+    let secret = Collection::new(org.clone(), "Payroll".to_owned(), None);
+    secret.save(&conn).await.expect("saving collection");
+    CollectionGroup::new(secret.uuid.clone(), group_id.clone(), false, false, false)
+        .save(&org, &conn)
+        .await
+        .expect("granting the group access to the collection");
+
+    let members_now = |gid: GroupId, org: OrganizationId| {
+        let conn = &conn;
+        async move { GroupUser::find_by_group(&gid, &org, conn).await.len() }
+    };
+    let external_id_now = |gid: GroupId, org: OrganizationId| {
+        let conn = &conn;
+        async move { Group::find_by_uuid_and_org(&gid, &org, conn).await.expect("group").external_id }
+    };
+
+    // Request 1 of the two-request chain: adopt the group on its own. This is
+    // the primitive, and it must be refused by itself.
+    let adopt = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "externalId", "value": "entra-adopted"}],
+    });
+    let (auth, ct, body) = scim_body(&token, &adopt);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "adopting an access-granting group must be refused");
+    assert_eq!(parse_json(&body_of(response).await)["scimType"], json!("mutability"));
+    assert!(external_id_now(group_id.clone(), org.clone()).await.is_none(), "the externalId must not have been set");
+
+    // The PUT form of the same adoption.
+    let put = json!({
+        "schemas": [scim::discovery::GROUP_SCHEMA_URN],
+        "displayName": "Payroll Access",
+        "externalId": "entra-adopted",
+    });
+    let (auth, ct, body) = scim_body(&token, &put);
+    let response =
+        client.put(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "PUT must refuse the adoption too");
+    assert!(external_id_now(group_id.clone(), org.clone()).await.is_none(), "PUT must not have set the externalId");
+
+    // The single-request form: adopt and add in one body. Refused, and nothing
+    // may have been committed by the earlier half of the same request.
+    let combined = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [
+            {"op": "replace", "path": "externalId", "value": "entra-adopted"},
+            {"op": "add", "path": "members", "value": [{"value": intruder.to_string()}]},
+        ],
+    });
+    let (auth, ct, body) = scim_body(&token, &combined);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "adopt-and-add in one request must be refused");
+    assert!(external_id_now(group_id.clone(), org.clone()).await.is_none(), "no externalId may have been committed");
+    assert_eq!(members_now(group_id.clone(), org.clone()).await, 0, "no member may have been added");
+
+    // The control: correlating a group that grants NOTHING is still allowed. A
+    // group with no collection grants confers nothing, so adopting it escalates
+    // nothing - and refusing it would break non-Entra clients for no gain.
+    let mut harmless = Group::new(org.clone(), "No Grants".to_owned(), false, None);
+    harmless.save(&conn).await.expect("saving harmless group");
+    let harmless_id = harmless.uuid.clone();
+
+    let adopt = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "externalId", "value": "entra-harmless"}],
+    });
+    let (auth, ct, body) = scim_body(&token, &adopt);
+    let response = client
+        .patch(format!("/scim/v2/{org}/Groups/{harmless_id}"))
+        .header(auth)
+        .header(ct)
+        .body(body)
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok, "a group that grants nothing must still be correlatable");
+    assert_eq!(
+        external_id_now(harmless_id, org.clone()).await,
+        Some("entra-harmless".to_owned()),
+        "the harmless correlation must have applied"
+    );
+}
+
+/// A PATCH whose later operation fails must not leave an earlier one committed.
+///
+/// PATCH applies member ops in sequence with no transaction, and the single
+/// `GroupUpdated` event is logged only after the whole loop succeeds. An early
+/// add that committed a real collection-access grant, followed by a failing op,
+/// therefore returned 4xx with the access granted AND no audit record at all -
+/// access up, audit trail silent. Every op is now resolved before the first
+/// write, so the request fails while the group is still untouched.
+#[rocket::async_test]
+async fn a_failing_patch_operation_leaves_no_committed_member_change() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-patch-atomic-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    let intruder = seed_member(&conn, &org, "atomic.intruder@example.com", 2, MembershipType::User).await;
+
+    // A group SCIM legitimately owns, so the add itself would be permitted -
+    // isolating atomicity from the ownership guard.
+    let mut group = Group::new(org.clone(), "Entra Owned".to_owned(), false, Some("entra-atomic-1".to_owned()));
+    group.save(&conn).await.expect("saving group");
+    let group_id = group.uuid.clone();
+
+    let before = chrono::Utc::now().naive_utc().checked_sub_signed(chrono::Duration::hours(1)).expect("start");
+
+    // Op 1 would add a real member; op 2 names a member id that does not exist.
+    // Op 1 must not survive op 2's failure.
+    let patch = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [
+            {"op": "add", "path": "members", "value": [{"value": intruder.to_string()}]},
+            {"op": "replace", "path": "members", "value": [{"value": "00000000-dead-beef-0000-000000000000"}]},
+        ],
+    });
+    let (auth, ct, body) = scim_body(&token, &patch);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "an unresolvable member must fail the request");
+
+    assert!(
+        GroupUser::find_by_group(&group_id, &org, &conn).await.is_empty(),
+        "the earlier operation must not have committed a member (it would be an unlogged access grant)"
+    );
+
+    // And the audit log must not claim an update that did not happen.
+    let events = Event::find_by_organization_uuid(
+        &org,
+        &before,
+        &chrono::Utc::now().naive_utc().checked_add_signed(chrono::Duration::hours(1)).expect("end"),
+        &conn,
+    )
+    .await;
+    assert!(
+        !events.iter().any(|e| e.event_type == EventType::GroupUpdated as i32),
+        "a fully refused PATCH must not record a GroupUpdated event"
+    );
+
+    // The control: the same add on its own applies and IS logged, so the
+    // assertions above cannot be explained by group writes being broken.
+    let patch = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "add", "path": "members", "value": [{"value": intruder.to_string()}]}],
+    });
+    let (auth, ct, body) = scim_body(&token, &patch);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Ok, "the same add alone must succeed");
+    assert_eq!(GroupUser::find_by_group(&group_id, &org, &conn).await.len(), 1, "the control add must have applied");
+
+    let events = Event::find_by_organization_uuid(
+        &org,
+        &before,
+        &chrono::Utc::now().naive_utc().checked_add_signed(chrono::Duration::hours(1)).expect("end"),
+        &conn,
+    )
+    .await;
+    assert!(
+        events.iter().any(|e| e.event_type == EventType::GroupUpdated as i32),
+        "the successful PATCH must record a GroupUpdated event"
+    );
+}
+
+/// An over-long displayName is a 400, not the 500 that quarantines the tenant.
+///
+/// `users.name` is TEXT on mysql and the SCIM body limit is 512KiB, so a
+/// several-hundred-KB display name passed validation, failed the insert in
+/// strict mode, and surfaced as a 500 - the one status Entra retries forever
+/// until it quarantines the application, taking deprovisioning down with it.
+/// userName and externalId were already capped; displayName was not.
+#[rocket::async_test]
+async fn an_over_long_display_name_is_refused_with_400_not_500() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-longname-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    let too_long = "n".repeat(scim::SCIM_MAX_DISPLAY_NAME_LEN + 1);
+    let create = json!({
+        "schemas": [scim::discovery::USER_SCHEMA_URN],
+        "userName": "longname@example.com",
+        "displayName": too_long,
+        "active": true,
+    });
+    let (auth, ct, body) = scim_body(&token, &create);
+    let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "an over-long displayName must be a clean 400");
+    assert_eq!(parse_json(&body_of(response).await)["scimType"], json!("invalidValue"));
+    assert!(
+        User::find_by_mail("longname@example.com", &conn).await.is_none(),
+        "no shell account may be left behind by the refused request"
+    );
+
+    // The boundary is inclusive: exactly at the cap is accepted. Without this
+    // the assertion above is equally explained by an off-by-one refusing
+    // everything.
+    let at_cap = "n".repeat(scim::SCIM_MAX_DISPLAY_NAME_LEN);
+    let create = json!({
+        "schemas": [scim::discovery::USER_SCHEMA_URN],
+        "userName": "atcap@example.com",
+        "displayName": at_cap,
+        "active": true,
+    });
+    let (auth, ct, body) = scim_body(&token, &create);
+    let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created, "a displayName exactly at the cap must be accepted");
+
+    // The composed form (givenName + familyName) reaches the same column and is
+    // capped by the same check.
+    let composed = json!({
+        "schemas": [scim::discovery::USER_SCHEMA_URN],
+        "userName": "composed@example.com",
+        "name": {"givenName": "g".repeat(scim::SCIM_MAX_DISPLAY_NAME_LEN), "familyName": "f".repeat(20)},
+        "active": true,
+    });
+    let (auth, ct, body) = scim_body(&token, &composed);
+    let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "a composed name over the cap must also be refused");
+}

@@ -237,6 +237,43 @@ async fn reject_unmanaged_group_add(group: &Group, token: &ScimToken, conn: &DbC
     ))
 }
 
+// Refuses SETTING an externalId onto an admin-owned, access-granting group.
+//
+// This is the mirror of `reject_privileged_grant` on the user side, and it
+// closes a privilege escalation that `reject_unmanaged_group_add` alone does
+// not. `scim_may_add_members` treats `external_id.is_some()` as proof that SCIM
+// owns a group, so the FIRST assignment of an externalId is an ownership
+// transfer: a token holder could stamp an externalId on a web-vault group that
+// grants a sensitive collection and then add a member they control, reaching
+// plaintext collection access nobody granted. Because the externalId write is
+// itself the primitive, guarding only the member-add (or reordering writes
+// within one handler) leaves a two-request sequence open - the write must be
+// guarded directly, on every path that performs it.
+//
+// Evaluated against the group as loaded from the database, BEFORE any externalId
+// mutation. Only a first assignment adopts: a group that already carries an
+// externalId is already SCIM-correlated, and clearing one (empty value) is the
+// opposite of a grant and never reaches here. The protected set is exactly the
+// one `scim_may_add_members` refuses - `access_all` or collection-granting.
+async fn reject_privileged_group_adoption(
+    group: &Group,
+    new_external_id: &str,
+    token: &ScimToken,
+    conn: &DbConn,
+) -> Result<(), ScimError> {
+    if new_external_id.is_empty() || group.external_id.is_some() {
+        return Ok(());
+    }
+    if group.access_all || !CollectionGroup::find_by_group(&group.uuid, &token.org_uuid, conn).await.is_empty() {
+        return Err(ScimError::bad_request(
+            "mutability",
+            "This group grants collection access and is not managed by SCIM; its externalId \
+             cannot be set through SCIM. Correlate it in the web vault instead",
+        ));
+    }
+    Ok(())
+}
+
 // Replaces the group's member set with exactly member_ids, as a diff rather
 // than delete-all-then-reinsert. There is no transaction available here, so a
 // wipe-and-rebuild leaves the group empty (and its collection access dead) if
@@ -289,6 +326,47 @@ async fn set_members(
 // globally to bump its sync revision, so an unscoped id would let this org
 // touch a member of another one. A value that is not a member of this org was
 // already a no-op, and stays one - Entra retries removals.
+// Runs the SIDE-EFFECT-FREE failures every member op in a PATCH would hit,
+// before the first one writes anything.
+//
+// PATCH applies its ops in sequence and each `GroupUser::save` commits on its
+// own, with no transaction around the loop. Without this, an early add could
+// commit - granting real collection access - and a later op could then fail,
+// returning 4xx while that access stayed. Worse, the handler returns through
+// `?` before `log_group_event`, so the committed grant was never written to the
+// organization event log: access granted, audit trail silent.
+//
+// Resolving every op's values here means an unresolvable member id or an
+// unmanaged-group addition is refused while the group is still untouched. This
+// is the same "resolve before writing" discipline `put_group` and
+// `precheck_active_change` already apply.
+async fn precheck_member_ops(
+    group: &Group,
+    member_ops: &[MemberOp],
+    token: &ScimToken,
+    conn: &DbConn,
+) -> Result<(), ScimError> {
+    for member_op in member_ops {
+        match member_op {
+            // Both resolve strictly: an unknown value is a 400 either way.
+            MemberOp::Replace(values) => {
+                resolve_members(values, token, conn).await?;
+            }
+            MemberOp::Add(values) => {
+                if !values.is_empty() {
+                    reject_unmanaged_group_add(group, token, conn).await?;
+                }
+                resolve_members(values, token, conn).await?;
+            }
+            // Removes are deliberately tolerant of unknown values (Entra retries
+            // removals, and "already gone" is the steady state), so there is no
+            // failure here to hoist.
+            MemberOp::Remove(_) => {}
+        }
+    }
+    Ok(())
+}
+
 async fn apply_member_op(
     group: &Group,
     member_op: &MemberOp,
@@ -485,6 +563,10 @@ async fn put_group(
     };
     if let Some(external_id) = request.external_id.as_deref() {
         check_external_id_available(&group, external_id, &token, &conn).await?;
+        // Guard the externalId WRITE, not just the member-add: setting an
+        // externalId is the group-adoption primitive. Evaluated on the
+        // DB-loaded group, before any mutation below.
+        reject_privileged_group_adoption(&group, external_id, &token, &conn).await?;
     }
 
     // Present-but-blank is an error, not a silent no-op, for the same reason as
@@ -531,6 +613,9 @@ async fn patch_group(
     let new_external_id = patch.external_id.as_deref().filter(|id| !id.is_empty());
     if let Some(external_id) = new_external_id {
         check_external_id_available(&group, external_id, &token, &conn).await?;
+        // See put_group: the externalId write is the adoption primitive, so it
+        // is guarded here on the DB-loaded group, before any mutation.
+        reject_privileged_group_adoption(&group, external_id, &token, &conn).await?;
     }
 
     // displayName is required on a Group (RFC 7643 section 4.2), so a PATCH
@@ -549,6 +634,11 @@ async fn patch_group(
     if let Some(external_id) = patch.external_id.clone() {
         group.set_external_id(Some(external_id));
     }
+    // Every member op's resolvable-and-permitted check runs before the first
+    // write of this request, so a later op cannot fail after an earlier one has
+    // already committed an access grant that the audit log never records.
+    precheck_member_ops(&group, &patch.member_ops, &token, &conn).await?;
+
     // One save covers both owned attributes; skip the write for member-only patches.
     if new_name.is_some() || patch.external_id.is_some() {
         group.save(&conn).await.map_err(|_| ScimError::internal())?;

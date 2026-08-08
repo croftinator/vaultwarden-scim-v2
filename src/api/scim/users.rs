@@ -212,6 +212,15 @@ async fn post_user(
     // on postgresql, and returns a 500 that Entra retries forever.
     crate::api::scim::check_attribute_len("userName", email, crate::api::scim::SCIM_MAX_EMAIL_LEN)?;
 
+    // Same VARCHAR/TEXT-limit reasoning as userName above: the composed
+    // displayName lands in `users.name`, which mysql strict mode rejects when it
+    // overflows, so cap it here rather than let it surface as an Entra-retried
+    // 500. Resolved once and reused when the shell account is created below.
+    let display_name = request.display_name();
+    if let Some(name) = display_name.as_deref() {
+        crate::api::scim::check_attribute_len("displayName", name, crate::api::scim::SCIM_MAX_DISPLAY_NAME_LEN)?;
+    }
+
     // Uniqueness: by externalId and by email, both scoped to the org.
     if let Some(external_id) = request.external_id.as_deref() {
         crate::api::scim::check_attribute_len("externalId", external_id, crate::api::scim::SCIM_MAX_EXTERNAL_ID_LEN)?;
@@ -267,7 +276,7 @@ async fn post_user(
             return Err(ScimError::bad_request("invalidValue", "Email domain is not eligible for invitations"));
         }
 
-        let mut new_user = User::new(email, request.display_name());
+        let mut new_user = User::new(email, display_name);
         // `users.email` is NOT NULL UNIQUE and `User::save` upserts on the uuid,
         // not the email, so two concurrent POSTs for the same new address both
         // pass the find_by_mail check above and the loser's insert fails here.

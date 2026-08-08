@@ -104,6 +104,14 @@ pub(crate) const SCIM_MAX_GROUP_NAME_LEN: usize = 100;
 // ~320-character total, so it is not a substitute for this.
 pub(crate) const SCIM_MAX_EMAIL_LEN: usize = 255;
 
+// `users.name` is TEXT on mysql (a 65,535-byte cap) and the SCIM body limit is
+// 512KiB, so a displayName of a few hundred KB - composed here from
+// name.formatted or givenName+familyName - passes JSON validation, fails the
+// insert in mysql strict mode, and returns the same Entra-quarantining 500 the
+// userName and externalId caps above exist to prevent. 255 matches the web
+// vault's own name field and is ample for any real directory display name.
+pub(crate) const SCIM_MAX_DISPLAY_NAME_LEN: usize = 255;
+
 // Rejects an over-long attribute before it reaches a column that will decide
 // the outcome differently on each backend: stored intact on sqlite, truncated
 // or rejected on mysql depending on strict mode, and a failed insert on
