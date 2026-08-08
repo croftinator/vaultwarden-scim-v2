@@ -157,6 +157,28 @@ fn check_member_count(count: usize) -> Result<(), ScimError> {
     Ok(())
 }
 
+// Saves a group whose externalId this request may have set, turning a lost
+// uniqueness race into the same 409 the sequential case returns.
+//
+// The check-then-write in `check_external_id_available` is no longer the only
+// enforcement: a UNIQUE index now backs it (2026-08-08-000002), which is the
+// point - the check alone was one two concurrent requests could both pass. The
+// loser now fails at the write instead, and a bare internal() would make that a
+// 500, the one status Entra retries until it quarantines the application.
+async fn save_group_with_external_id(group: &mut Group, token: &ScimToken, conn: &DbConn) -> Result<(), ScimError> {
+    if group.save(conn).await.is_err() {
+        if let Some(external_id) = group.external_id.as_deref()
+            && Group::find_by_external_id_and_org(external_id, &token.org_uuid, conn)
+                .await
+                .is_some_and(|existing| existing.uuid != group.uuid)
+        {
+            return Err(ScimError::conflict("uniqueness", "A group with this externalId already exists"));
+        }
+        return Err(ScimError::internal());
+    }
+    Ok(())
+}
+
 // The externalId is the correlation key: enforce uniqueness within the org on
 // every write path, mirroring the Users endpoints. Re-asserting the group's
 // own current externalId is allowed (Entra repeats it on PUT).
@@ -524,7 +546,7 @@ async fn post_group(
     let member_ids = resolve_members(&values, &token, &conn).await?;
 
     let mut group = Group::new(token.org_uuid.clone(), display_name.to_owned(), false, request.external_id.clone());
-    group.save(&conn).await.map_err(|_| ScimError::internal())?;
+    save_group_with_external_id(&mut group, &token, &conn).await?;
     set_members(&group, member_ids, &AddPolicy::NewGroup, &token, &conn).await?;
 
     log_group_event(EventType::GroupCreated, &group.uuid, &token, &conn).await;
@@ -585,7 +607,7 @@ async fn put_group(
     if request.external_id.is_some() {
         group.set_external_id(request.external_id.clone());
     }
-    group.save(&conn).await.map_err(|_| ScimError::internal())?;
+    save_group_with_external_id(&mut group, &token, &conn).await?;
     if let Some(member_ids) = member_ids {
         set_members(&group, member_ids, &AddPolicy::Enforce, &token, &conn).await?;
     }
@@ -641,7 +663,7 @@ async fn patch_group(
 
     // One save covers both owned attributes; skip the write for member-only patches.
     if new_name.is_some() || patch.external_id.is_some() {
-        group.save(&conn).await.map_err(|_| ScimError::internal())?;
+        save_group_with_external_id(&mut group, &token, &conn).await?;
     }
 
     // In the order the client sent them, per RFC 7644 section 3.5.2. Applying

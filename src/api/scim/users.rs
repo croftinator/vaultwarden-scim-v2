@@ -543,7 +543,21 @@ async fn update_external_id(
         }
     }
     member.set_external_id(Some(external_id.to_owned()));
-    member.save(conn).await.map_err(|_| ScimError::internal())?;
+    // The check above is no longer the only enforcement: a UNIQUE index now
+    // backs it (2026-08-08-000001), which is the point - the check alone was a
+    // check-then-write that two concurrent requests could both pass. That makes
+    // the losing request fail HERE instead, and a bare internal() would turn it
+    // into a 500 - the one status Entra retries forever until it quarantines the
+    // application. Re-read to tell the two causes apart and answer the race with
+    // the same 409 the sequential case gets.
+    if member.save(conn).await.is_err() {
+        if Membership::find_by_external_id_and_org(external_id, &token.org_uuid, conn).await.is_some_and(
+            |existing| existing.uuid != member.uuid,
+        ) {
+            return Err(ScimError::conflict("uniqueness", "A member with this externalId already exists"));
+        }
+        return Err(ScimError::internal());
+    }
     log_scim_event(EventType::OrganizationUserUpdated, member, token, conn).await;
     Ok(())
 }
