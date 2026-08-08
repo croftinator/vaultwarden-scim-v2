@@ -127,7 +127,16 @@ sequential dup-externalId 409 on POST /Groups
 (`a_sequential_duplicate_group_external_id_is_a_409`); and the SMTP-failure-
 during-restore path (`an_smtp_outage_during_restore_still_restores_the_member`).
 
-**Still open:** POST /Groups blank-name 400 - the guard exists
+**Closed 2026-08-08 (final pass).** POST /Groups blank-name 400
+(`post_groups_refuses_a_blank_or_missing_display_name`, covering empty,
+whitespace-only and absent, verified to fail without the guard); query-parameter
+tolerance including the single-group GET form
+(`unimplemented_query_parameters_are_tolerated`); the `emails.value` alias
+(`the_emails_value_filter_alias_resolves`); and the 405 envelope
+(`a_method_not_allowed_stays_in_the_scim_envelope`). Nothing from the original
+coverage list remains open.
+
+**Superseded note:** POST /Groups blank-name 400 - the guard exists
 (`display_name.filter(|n| !n.trim().is_empty())`) but only its PUT and PATCH
 equivalents are pinned, so a POST with `""`, `"   "` or the attribute omitted is
 untested.
@@ -553,8 +562,18 @@ a UNIQUE prefix index would falsely reject distinct values sharing a prefix.
 GUID-shaped externalIds are unaffected, but the divergence needs a decision
 rather than a silent shrug. **Effort:** M. **Priority:** P2.
 
-**4. `scim_status` has no step-up re-auth. STILL OPEN - not as small as it
-looked.** `scim_status` is a GET with no body, so requiring
+**4. `scim_status` has no step-up re-auth. CLOSED 2026-08-08, differently than
+proposed.** Resolved by tightening the ROLE gate (AdminHeaders -> OwnerHeaders)
+rather than adding the step-up. A step-up needs a request body, so it would have
+forced this GET to become a POST - a breaking change to the endpoint's shape,
+for a read - while closing the same gap. The endpoint reports credential state,
+lastUsedAt and the directory-linked Owner count, and an Admin is exactly the
+role that cannot mint, revoke or disable the credential that data describes.
+Pinned by the existing Owner/Admin matrix test, extended to cover status;
+verified load-bearing (an Admin read it with a 200 before the change). Original
+note follows.
+
+ `scim_status` is a GET with no body, so requiring
 `PasswordOrOtpData::validate` means changing it to a POST: a breaking change to
 the endpoint's HTTP shape, plus its docs and tests. Worth doing, but it is an API
 decision rather than the one-line guard tightening this item originally
