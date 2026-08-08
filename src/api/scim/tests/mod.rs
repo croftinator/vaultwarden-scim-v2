@@ -4079,12 +4079,24 @@ async fn only_an_owner_can_mint_or_revoke_the_scim_credential() {
         let (ct, body) = password_body(&json!({"masterPasswordHash": ADMIN_PASSWORD}));
         let response = manage
             .delete(format!("/api/organizations/{org}/scim/api-key"))
-            .header(session)
+            .header(session.clone())
             .header(ct)
             .body(body)
             .dispatch()
             .await;
         assert_ne!(response.status(), Status::Ok, "membership type {label} must not revoke the credential");
+
+        // Reading the status is Owner-gated too. It reports the credential's
+        // state and lastUsedAt, and it reports how many Owners are
+        // directory-linked - a map of the organization's recovery path - to a
+        // role that cannot mint, revoke or disable the credential it describes.
+        let response =
+            manage.get(format!("/api/organizations/{org}/scim/status")).header(session).dispatch().await;
+        assert_ne!(
+            response.status(),
+            Status::Ok,
+            "membership type {label} must not read SCIM credential status or break-glass posture"
+        );
     }
 
     assert!(ScimApiKey::find_by_org(&org, &conn).await.is_none(), "a refused mint must not leave a key behind");
@@ -5861,4 +5873,140 @@ async fn an_unmanaged_group_cannot_be_deleted_through_scim() {
     let response =
         client.delete(format!("/scim/v2/{org}/Groups/{owned_id}")).header(auth).header(ct).dispatch().await;
     assert_eq!(response.status(), Status::NoContent, "a SCIM-managed group must still be deletable");
+}
+
+/// POST /Groups must refuse a missing, empty or whitespace-only displayName.
+///
+/// displayName is required (RFC 7643 section 4.2) and the guard exists, but only
+/// its PUT and PATCH equivalents were pinned - every POST in the suite supplied
+/// a good name, so deleting the check would have kept the suite green.
+#[rocket::async_test]
+async fn post_groups_refuses_a_blank_or_missing_display_name() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-blank-grpname-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    for body in [
+        json!({"schemas": [scim::discovery::GROUP_SCHEMA_URN], "displayName": ""}),
+        json!({"schemas": [scim::discovery::GROUP_SCHEMA_URN], "displayName": "   "}),
+        json!({"schemas": [scim::discovery::GROUP_SCHEMA_URN], "externalId": "no-name-at-all"}),
+    ] {
+        let (auth, ct, raw) = scim_body(&token, &body);
+        let response = client.post(format!("/scim/v2/{org}/Groups")).header(auth).header(ct).body(raw).dispatch().await;
+        assert_eq!(response.status(), Status::BadRequest, "a blank or missing displayName must be a 400: {body}");
+        assert_eq!(parse_json(&body_of(response).await)["scimType"], json!("invalidValue"));
+    }
+    assert!(Group::find_by_organization(&org, &conn).await.is_empty(), "no group may have been created");
+
+    // Control: a real name still creates, so the refusals above are the guard
+    // firing rather than group creation being broken.
+    let good = json!({"schemas": [scim::discovery::GROUP_SCHEMA_URN], "displayName": "Real Name"});
+    let (auth, ct, raw) = scim_body(&token, &good);
+    let response = client.post(format!("/scim/v2/{org}/Groups")).header(auth).header(ct).body(raw).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+}
+
+/// Query parameters this server does not implement must be tolerated, not 4xx'd.
+///
+/// `ListParams` declares only filter/startIndex/count, so `attributes`,
+/// `excludedAttributes` and `sortBy` survive purely because Rocket's FromForm
+/// derive ignores unknown fields. Microsoft's hosted SCIM Validator - the
+/// recommended rung before committing to a tenant - sends `attributes` on its
+/// probes, so if that leniency ever changed every such request would 422 and
+/// nothing in the suite would notice.
+#[rocket::async_test]
+async fn unimplemented_query_parameters_are_tolerated() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-queryparam-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+    seed_member(&conn, &org, "queryparam@example.com", 2, MembershipType::User).await;
+
+    for query in [
+        "attributes=userName",
+        "excludedAttributes=emails",
+        "sortBy=userName&sortOrder=ascending",
+        "attributes=userName,externalId&count=10",
+    ] {
+        let (auth, ct, _) = scim_body(&token, &json!({}));
+        let response = client.get(format!("/scim/v2/{org}/Users?{query}")).header(auth).header(ct).dispatch().await;
+        assert_eq!(response.status(), Status::Ok, "unimplemented parameters must not fail the request: {query}");
+        // Still a truthful ListResponse, not an empty shell that happens to be 200.
+        assert_eq!(parse_json(&body_of(response).await)["totalResults"], json!(1), "for: {query}");
+    }
+
+    // Entra sends excludedAttributes on single-group fetches too, not only lists.
+    let create = json!({"schemas": [scim::discovery::GROUP_SCHEMA_URN], "displayName": "Param Group"});
+    let (auth, ct, raw) = scim_body(&token, &create);
+    let response = client.post(format!("/scim/v2/{org}/Groups")).header(auth).header(ct).body(raw).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+    let group_id = parse_json(&body_of(response).await)["id"].as_str().expect("id").to_owned();
+
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response = client
+        .get(format!("/scim/v2/{org}/Groups/{group_id}?excludedAttributes=members"))
+        .header(auth)
+        .header(ct)
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok, "a single-group GET must tolerate excludedAttributes");
+}
+
+/// The `emails.value` filter alias must actually resolve.
+///
+/// `list_users` matches `"username" | "emails.value"`, but every filter test used
+/// userName or externalId, so the alias string itself was never exercised - a
+/// typo or a deletion would have been silent.
+#[rocket::async_test]
+async fn the_emails_value_filter_alias_resolves() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-emailsvalue-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+    let member = seed_member(&conn, &org, "alias.target@example.com", 2, MembershipType::User).await;
+
+    let filter = url_escape("emails.value eq \"alias.target@example.com\"");
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response = client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    let listed = parse_json(&body_of(response).await);
+    assert_eq!(listed["totalResults"], json!(1), "the emails.value alias must match the same member userName does");
+    assert_eq!(listed["Resources"][0]["id"], json!(member.to_string()));
+}
+
+/// A method the route does not define must still come back as SCIM, not HTML.
+///
+/// The default catcher exists so a SCIM client never receives Rocket's HTML
+/// error page, which it cannot parse. Only the 404 case was pinned; the catcher's
+/// own comment names 405 as the other reachable one.
+#[rocket::async_test]
+async fn a_method_not_allowed_stays_in_the_scim_envelope() {
+    let _guard = TEST_LOCK.lock().await;
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-405-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+    let member = seed_member(&conn, &org, "method@example.com", 2, MembershipType::User).await;
+
+    // POST to a member resource: the path exists, this method does not.
+    let (auth, ct, raw) = scim_body(&token, &json!({"schemas": [scim::discovery::USER_SCHEMA_URN]}));
+    let response =
+        client.post(format!("/scim/v2/{org}/Users/{member}")).header(auth).header(ct).body(raw).dispatch().await;
+    let status = response.status();
+    let body = body_of(response).await;
+    assert!(!status.class().is_success(), "an undefined method must not succeed, got {status}");
+    assert!(
+        !body.to_ascii_lowercase().contains("<!doctype") && !body.to_ascii_lowercase().contains("<html"),
+        "a SCIM client must never receive an HTML error page, got: {}",
+        &body.chars().take(120).collect::<String>()
+    );
+    assert_eq!(
+        parse_json(&body)["schemas"][0],
+        json!(SCIM_ERROR_URN),
+        "the response must carry the SCIM Error schema URN"
+    );
 }

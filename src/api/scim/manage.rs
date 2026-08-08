@@ -19,12 +19,26 @@
 // `reject_privileged_grant` then blocks SCIM from putting the Owner back.
 // The credential may only be created by the role authorised to use it.
 //
+// `scim_status` is Owner-gated for the same reason, though it only reads. It
+// was the one endpoint here left on AdminHeaders, which was an inconsistency
+// rather than a decision: it reports the credential's configured/enabled state
+// and its lastUsedAt, and it reports how many of the organization's Owners are
+// directory-linked - the break-glass posture. That last field is a map of where
+// to attack the organization's recovery path, and an Admin is exactly the role
+// that cannot mint, revoke or disable the credential it describes.
+//
+// Read access was tightened rather than made to require a password/OTP step-up
+// like its mutating siblings. A step-up needs a request body, so it would have
+// forced this GET to become a POST - a breaking change to the endpoint's shape,
+// for a read. Matching the role gate closes the same privilege gap without
+// changing the contract.
+//
 use rocket::{Route, serde::json::Json};
 
 use crate::{
     CONFIG,
     api::{EmptyResult, JsonResult, PasswordOrOtpData, core::log_event},
-    auth::{AdminHeaders, OwnerHeaders},
+    auth::OwnerHeaders,
     crypto,
     db::{
         DbConn,
@@ -199,7 +213,7 @@ async fn count_directory_linked_owners(org_id: &OrganizationId, conn: &DbConn) -
 }
 
 #[get("/organizations/<org_id>/scim/status")]
-async fn scim_status(org_id: OrganizationId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+async fn scim_status(org_id: OrganizationId, headers: OwnerHeaders, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
