@@ -458,13 +458,30 @@ supported, but this value isn't checked anywhere (yet)`.
 
 ### Residual items from the 2026-08-08 review + CSO pass
 
+**Update, same day (follow-up pass).** Items 1, 2 and 3 below are now CLOSED;
+the text is kept because the reasoning still explains the shape of each fix.
+Item 1 (delete_group ownership) shipped with a regression test verified to fail
+without the guard. Item 2 (last-owner race) is only PARTLY closed - the
+duplicated guard is now one helper, but the check-then-act race is NOT fixed;
+see the revised note under that item. Item 3 (externalId UNIQUE index) shipped
+as six migrations validated on all three backends, including a dedup step proven
+against a database seeded with duplicates. Items 4 and 5 remain open and both
+turned out to be larger than "small" - see the revised notes.
+
 Three defects from this pass are **fixed and pinned** (see commit
 "close the group-adoption escalation and two write-path defects"): the group
 externalId adoption escalation, the non-atomic Group PATCH that granted access
 without logging it, and the uncapped displayName. What follows is what the same
 pass surfaced and deliberately did **not** change.
 
-**1. `delete_group` has no ownership guard.** A token holder can enumerate every
+**1. `delete_group` has no ownership guard. CLOSED 2026-08-08.** Resolved the
+strict way: SCIM now refuses to delete a group that grants collection access and
+carries no externalId (or carries access_all), the same set additions are
+refused for. The Entra cost noted below is real but bounded - a failing delete
+retries, but only for groups SCIM never managed, which Entra has no reason to
+delete. Original note follows.
+
+ A token holder can enumerate every
 group in the org (`GET /Groups` returns all of them) and DELETE any of them,
 including admin-curated groups that grant collection access, wiping their
 `collections_groups` mappings. Unlike memberships this carries no E2EE state and
@@ -475,7 +492,21 @@ unmanaged access-granting group the way additions now do, or is delete-is-
 recoverable acceptable? Refusing it has an Entra cost (a failing delete retries
 every cycle and can quarantine the app). **Effort:** S. **Priority:** P2.
 
-**2. Last-owner guard is check-then-act.** `precheck_active_change` and
+**2. Last-owner guard is check-then-act. PARTLY CLOSED 2026-08-08 - the race
+is STILL OPEN.** The duplicated guard is now a single helper called from both
+paths, which removes the drift risk and one redundant count query per
+owner-revoke. The race itself is not fixed, and the investigation changed what
+the fix has to be: a single conditional UPDATE does NOT close it, because the
+two concurrent requests target DIFFERENT rows, so their row locks never conflict
+and both snapshots still read the pre-revoke count. Closing it needs
+SERIALIZABLE isolation, a lock on a row both requests contend on, or a
+maintained counter column on organizations - and this codebase uses no
+transactions and no row locking anywhere, so it is an architectural decision
+rather than a local fix. A counter column would also have to be maintained by
+every non-SCIM path that changes owner status, or it drifts and starts refusing
+legitimate revokes. Original note follows.
+
+ `precheck_active_change` and
 `revoke_member` both count active Owners and refuse at `<= 1`, outside any
 transaction. Two concurrent revokes targeting two different Owners can each
 observe a count of 2 and both proceed, leaving the org with zero active Owners -
@@ -487,7 +518,19 @@ one active Owner, checking affected rows. The duplicated guard should collapse
 into one helper at the same time (it is currently copy-pasted, and the count runs
 twice per owner-revoke request). **Effort:** M. **Priority:** P2.
 
-**3. externalId uniqueness still has no unique index.** Now confirmed by two
+**3. externalId uniqueness still has no unique index. CLOSED 2026-08-08.** Six
+migrations (two tables x three dialects) now back the invariant with a real
+UNIQUE index. Two things the original note did not anticipate: a pre-existing
+duplicate would make CREATE UNIQUE INDEX fail, and migrations run before Rocket
+listens, so that is a server that will not start - each up.sql therefore
+deduplicates first, keeping the oldest row's correlation. And with the index in
+place the losing request fails at the WRITE, where a bare internal() would have
+returned the 500 that quarantines an Entra tenant; the write paths now answer a
+lost race with the same 409 the sequential case returns. MySQL enforces over a
+150-character prefix, which the migration documents rather than hides. Original
+note follows.
+
+ Now confirmed by two
 independent passes: all six new composite indexes are plain `CREATE INDEX`, so
 every uniqueness check remains application-level check-then-set. Concurrent
 writes can commit duplicate correlation keys, after which
@@ -499,7 +542,14 @@ a UNIQUE prefix index would falsely reject distinct values sharing a prefix.
 GUID-shaped externalIds are unaffected, but the divergence needs a decision
 rather than a silent shrug. **Effort:** M. **Priority:** P2.
 
-**4. `scim_status` has no step-up re-auth.** It returns SCIM key metadata
+**4. `scim_status` has no step-up re-auth. STILL OPEN - not as small as it
+looked.** `scim_status` is a GET with no body, so requiring
+`PasswordOrOtpData::validate` means changing it to a POST: a breaking change to
+the endpoint's HTTP shape, plus its docs and tests. Worth doing, but it is an API
+decision rather than the one-line guard tightening this item originally
+described. Original note follows.
+
+ It returns SCIM key metadata
 (configured, enabled, createdAt, revisionDate, lastUsedAt) behind an
 `AdminHeaders` session alone, while its siblings `generate_scim_key` and
 `delete_scim_key` both require `PasswordOrOtpData::validate`. No token material
@@ -507,7 +557,18 @@ is exposed, so this is an inconsistent guard rather than a leak - but it is the
 kind of asymmetry a later change turns into one. Either require the step-up or
 document why read-only metadata is exempt. **Effort:** S. **Priority:** P3.
 
-**5. Credential audit events are indistinguishable.** Mint, rotate, delete and
+**5. Credential audit events are indistinguishable. STILL OPEN - blocked on a
+protocol decision.** The only mechanism for distinguishing these is the
+EventType enum, whose values are Bitwarden wire-protocol constants that real
+Bitwarden clients switch on. The Event model carries no free-text detail field.
+So closing this means either minting new EventType values inside Bitwarden's
+numbering space (risking collision with a future upstream definition) or outside
+it (clients render an unknown type). Neither is obviously right, and picking one
+unilaterally in a review pass would put non-standard values on a wire protocol
+this fork otherwise implements faithfully. Needs an explicit call. Original note
+follows.
+
+ Mint, rotate, delete and
 the enable/disable kill switch all log `EventType::OrganizationUpdated`, so the
 org event log cannot tell a credential mint from any other org configuration
 change. Actor identity, device type and IP are recorded correctly, so this is a
