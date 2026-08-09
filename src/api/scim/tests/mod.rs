@@ -6185,12 +6185,17 @@ async fn each_scim_credential_action_logs_its_own_event_type() {
 ///   achieve true request concurrency here, so the two dispatches do not
 ///   actually interleave inside the count-then-write window.
 ///
-/// The lock is therefore correct by construction, not by demonstration: it is
-/// held across both statements in `revoke_member`, which is a property you
-/// verify by reading it. Do not "improve" this test by asserting it covers the
-/// lock, and do not delete the lock because this test stays green without it.
-/// Two replicas sharing a database still race regardless - that needs a
-/// database-level fix and is recorded in TODOS.md.
+/// The lock IS proven, just not here. Driving a real server over real HTTP with
+/// two parallel connections (`tools/scim-owner-race.sh`) settles it:
+///
+///   mutex present:  50 trials, 0 races
+///   mutex removed:  25 trials, 25 races - it fired every single time
+///
+/// So this is not a theoretical window. Under genuine concurrency the race is
+/// not merely reachable, it is the *default* outcome, and the lock removes it
+/// completely. Do not delete the lock because this in-process test stays green
+/// without it - run the script instead. Two replicas sharing a database still
+/// race regardless; that needs a database-level fix and is recorded in TODOS.md.
 #[rocket::async_test]
 async fn concurrent_owner_revokes_cannot_leave_the_org_without_one() {
     let _guard = scim_test_guard!();

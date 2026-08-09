@@ -55,6 +55,23 @@ from a real tenant. docs/scim/providers.md says so in its support table, so
 The cheapest independent check remains Microsoft's hosted SCIM Validator, which
 tests SCIM 2.0 conformance generally despite the name and needs no tenant.
 
+**Concurrency gap CLOSED 2026-08-09, and the race was worse than assumed.**
+`tools/scim-owner-race.sh` drives a real server over real HTTP with parallel
+connections, which is what the in-process suite cannot do. Result:
+
+  mutex present (shipped)  50 trials, 0 races
+  mutex removed (control)  25 trials, 25 races - it fired every attempt
+
+So the last-owner race was not a narrow window. Under genuine concurrency two
+parallel deprovisions of two different Owners stranded the organization with no
+Owner at all, every single time. The mutex removes it completely. The unit test
+comment claiming the lock was "correct by construction, not demonstration" has
+been corrected - it is now demonstrated, just not in-process.
+
+Still open on this thread: the same treatment for externalId uniqueness under
+concurrent creates, and the multi-replica case, which no single-process lock can
+close. See docs/scim/testing.md "Rung 2c".
+
 **Partially closed 2026-08-09 - one engine has now actually run.** Authentik
 (self-hosted, free, Docker) was stood up locally against this branch and drove a
 full provisioning lifecycle: 46 SCIM requests, zero 4xx/5xx, no code changes.

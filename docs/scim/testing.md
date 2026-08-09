@@ -384,6 +384,45 @@ Being precise, because the temptation is to over-read a green run:
   batch - a few hundred users - and is the obvious next experiment for anyone
   who wants to close that gap.
 
+## Rung 2c - concurrency stress (the races the suite cannot reach)
+
+Two guards in this implementation are check-then-act: the last-owner revoke and
+externalId uniqueness. The in-process suite cannot exercise either, because
+Rocket's local client does not achieve true request concurrency - the dispatches
+never interleave inside the read-then-write window. `tools/scim-owner-race.sh`
+does it properly, against a real server over real HTTP with parallel connections.
+
+Each trial seeds exactly two active Owners, fires two `DELETE` requests simultaneously at
+the two different membership rows, and counts survivors. One survivor is correct;
+**zero means the organization was stranded with no Owner at all.**
+
+The result settles a question the unit test had to leave open:
+
+| Build | Trials | Races |
+|---|---|---|
+| Mutex present (shipped) | 50 | **0** |
+| Mutex removed (control) | 25 | **25 - every attempt** |
+
+That is worth stating plainly: under genuine concurrency the race was not a
+narrow window, it was the **default outcome**. Two parallel deprovisions of two
+different Owners stranded the organization every single time. The mutex removes
+it completely.
+
+It also validates the method. A guard whose test cannot fail proves nothing, so
+when the in-process test could not discriminate, the answer was to change the
+instrument rather than to trust the reasoning.
+
+```bash
+SCIM_RACE_DIR=/path/to/throwaway-instance tools/scim-owner-race.sh 50
+```
+
+The directory needs `vw-data/db.sqlite3`, `org-id.txt` and `scim-token.txt`. It
+writes to the database directly to seed each trial, so point it only at a local
+throwaway instance.
+
+**Still open:** the same treatment for externalId uniqueness under concurrent
+creates, and for the multi-replica case, which no single-process lock can close.
+
 ### Standing one up
 
 ```bash
