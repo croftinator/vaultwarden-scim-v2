@@ -429,7 +429,9 @@ export LIBRARY_PATH=/opt/homebrew/opt/libpq/lib:${LIBRARY_PATH:-}
 export PKG_CONFIG_PATH=/opt/homebrew/opt/libpq/lib/pkgconfig:${PKG_CONFIG_PATH:-}
 cargo build --profile ci --no-default-features --features postgresql
 
-PG='postgresql://vaultwarden:vwscim@127.0.0.1:15433/vaultwarden'
+# Same default the compose file uses, so override PG_PASS in both or neither.
+PG_PASS="${PG_PASS:-vwscim}"
+PG="postgresql://vaultwarden:${PG_PASS}@127.0.0.1:15433/vaultwarden"
 # Honour CARGO_TARGET_DIR if it is set - a shared target directory is a common
 # local setting, and the binary is then not under ./target at all.
 VW="${CARGO_TARGET_DIR:-target}/ci/vaultwarden"
