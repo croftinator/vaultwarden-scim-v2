@@ -50,8 +50,9 @@ use crate::{
     db::{
         DbConn, DbPool,
         models::{
-            Collection, CollectionGroup, Event, EventType, Group, GroupId, GroupUser, Membership, MembershipId,
-            MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationId, ScimApiKey, User,
+            Collection, CollectionGroup, Event, EventType, Group, GroupId, GroupUser, Invitation, Membership,
+            MembershipId, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationId,
+            ScimApiKey, User,
         },
     },
 };
@@ -1849,23 +1850,145 @@ async fn concurrent_group_create_cannot_duplicate_an_external_id() {
         .into_iter()
         .filter(|g| g.external_id.as_deref() == Some("entra-race-grp-1"))
         .count();
-    // What the code actually guarantees, and no more. Group externalId
-    // uniqueness is check-then-set (post_group reads, then writes) with NO
-    // backing constraint - the (org_uuid, external_id) index added on
-    // 2026-07-26 is deliberately non-UNIQUE - so under real concurrency two
-    // creates CAN both win. Asserting created == 1 pinned an invariant TODOS.md
-    // records as open, which meant the test would flake, and while it stayed
-    // green it read as proof the gap was closed.
+    // Exactly one create wins now, and that is a database guarantee rather than
+    // a hopeful one: 2026-07-26-000002 made (organizations_uuid, external_id)
+    // UNIQUE, and `save_group_with_external_id` answers the violation with 409.
     //
-    // Strengthen this to created == 1 in the same change that adds UNIQUE to
-    // that index and maps the violation to 409, not before. See TODOS.md,
-    // "Harden SCIM write edges surfaced by adversarial review", gap (1).
-    assert!(created >= 1, "at least one create must win, got {created}");
+    // This assertion was deliberately weak (`created >= 1`) while the index was
+    // non-UNIQUE, with a note to strengthen it in the same change that added the
+    // constraint. Two things had to land before it could be strengthened: the
+    // index itself, and `Group::save_strict` - because `save` is a REPLACE on
+    // sqlite and mysql, which resolves the conflict by DELETING the other group
+    // and reporting success, so a UNIQUE index alone would have left `created`
+    // at 5 and this row count at 1.
+    assert_eq!(created, 1, "exactly one concurrent create may win, got {created}");
     assert!(
         responses.iter().all(|r| r.status() == Status::Created || r.status() == Status::Conflict),
         "every response must be 201 or 409, never a 5xx: {responses:?}"
     );
-    assert_eq!(with_ext, created, "every winning create must be the one that stored the correlation key");
+    assert_eq!(with_ext, 1, "the winning create must be the only holder of the correlation key");
+}
+
+// The constraint itself, driven through the models rather than the handlers.
+//
+// Everything else that returns 409 for a duplicate externalId is satisfied by
+// the application-level check-then-write in front of the write. This test
+// bypasses that check entirely, so it fails if the migration is dropped, if a
+// backend's index is wrong, or if a SCIM write goes back to `save`.
+//
+// It also pins the consequence that makes this a data-safety test rather than a
+// tidiness one: `save` uses `replace_into` on sqlite and mysql, and REPLACE
+// resolves a conflict on ANY unique index by DELETING the conflicting row. On a
+// membership that row holds `akey`, the member's wrapped copy of the
+// organization key, which under E2EE nobody can reconstruct. So the assertion is
+// not merely "the second write fails" but "the first member is still there,
+// with their key".
+#[rocket::async_test]
+async fn the_unique_index_refuses_a_duplicate_external_id_without_destroying_the_holder() {
+    let _guard = scim_test_guard!();
+    let (_client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-unique-index-org").await;
+
+    let holder = seed_user(&conn, "index.holder@example.com", true).await;
+    let mut first = Membership::new(holder.uuid.clone(), org.clone(), None);
+    first.status = MembershipStatus::Confirmed as i32;
+    first.akey = String::from("WRAPPED-ORG-KEY");
+    first.set_external_id(Some(String::from("entra-index-1")));
+    first.save_strict(&conn).await.expect("the first correlation must store");
+    let first_uuid = first.uuid.clone();
+
+    let rival = seed_user(&conn, "index.rival@example.com", true).await;
+    let mut second = Membership::new(rival.uuid, org.clone(), None);
+    second.set_external_id(Some(String::from("entra-index-1")));
+    let outcome = second.save_strict(&conn).await;
+
+    assert!(outcome.is_err(), "2026-07-26-000001 must make a duplicate correlation key impossible");
+    assert!(
+        scim::is_unique_violation(&outcome.unwrap_err()),
+        "the failure must be recognisable as a uniqueness violation, or the handlers answer it with a 500"
+    );
+
+    // The part a UNIQUE index alone does not give you.
+    let survivor = Membership::find_by_uuid_and_org(&first_uuid, &org, &conn)
+        .await
+        .expect("the original membership must survive a rejected duplicate");
+    assert_eq!(survivor.akey, "WRAPPED-ORG-KEY", "a refused write must never take the holder's wrapped org key");
+    assert_eq!(survivor.external_id.as_deref(), Some("entra-index-1"));
+
+    // NULLs stay duplicable: most memberships were never correlated at all.
+    let uncorrelated = seed_user(&conn, "index.none@example.com", true).await;
+    Membership::new(uncorrelated.uuid, org.clone(), None)
+        .save_strict(&conn)
+        .await
+        .expect("a NULL external_id must not collide");
+
+    // Same constraint, same hazard, on the Groups side (2026-07-26-000002).
+    let mut group_one = Group::new(org.clone(), String::from("First"), false, Some(String::from("entra-grp-index")));
+    group_one.save_strict(&conn).await.expect("the first group must store");
+    let mut group_two = Group::new(org.clone(), String::from("Second"), false, Some(String::from("entra-grp-index")));
+    assert!(group_two.save_strict(&conn).await.is_err(), "2026-07-26-000002 must refuse a duplicate group externalId");
+    assert!(
+        Group::find_by_uuid_and_org(&group_one.uuid, &org, &conn).await.is_some(),
+        "a refused group write must never delete the group that held the externalId"
+    );
+}
+
+// The handlers' side of the same invariant, driven at the choke point.
+//
+// The concurrent-create test above cannot discriminate here: Rocket's local
+// client never achieves true request concurrency, so the application-level
+// pre-check catches every duplicate before the write and the destructive path is
+// never entered. Reverting the handlers to `save` leaves it green.
+//
+// These two functions are the only places SCIM writes a membership or a group,
+// so driving them directly with a conflict already in the database is the
+// deterministic way to pin "SCIM answers a uniqueness violation with 409 and
+// destroys nothing". Both fail if either helper goes back to `save`.
+#[rocket::async_test]
+async fn the_scim_write_helpers_answer_a_conflict_with_409_and_destroy_nothing() {
+    let _guard = scim_test_guard!();
+    let (_client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-choke-point-org").await;
+
+    let holder = seed_user(&conn, "choke.holder@example.com", true).await;
+    let mut held = Membership::new(holder.uuid, org.clone(), None);
+    held.status = MembershipStatus::Confirmed as i32;
+    held.akey = String::from("WRAPPED-ORG-KEY");
+    held.set_external_id(Some(String::from("entra-choke-1")));
+    held.save_strict(&conn).await.expect("seeding the holder");
+    let held_uuid = held.uuid.clone();
+
+    // A second member reaching for the same correlation key, as a lost race
+    // would - the pre-check passed when it ran, and the value was taken since.
+    let rival = seed_user(&conn, "choke.rival@example.com", true).await;
+    let mut contender = Membership::new(rival.uuid, org.clone(), None);
+    contender.set_external_id(Some(String::from("entra-choke-1")));
+    let err = scim::users::save_member(&contender, &conn).await.expect_err("the losing write must be refused");
+    assert_eq!(err.status, Status::Conflict, "a lost uniqueness race must be 409, never 500");
+    assert_eq!(err.scim_type, Some("uniqueness"));
+
+    let survivor = Membership::find_by_uuid_and_org(&held_uuid, &org, &conn)
+        .await
+        .expect("the holder's membership must survive the refused write");
+    assert_eq!(survivor.akey, "WRAPPED-ORG-KEY", "the holder's wrapped org key must be untouched");
+
+    // Groups: same shape, and the survivor keeps its collection access.
+    let mut owned = Group::new(org.clone(), String::from("Owned"), false, Some(String::from("entra-choke-grp")));
+    owned.save_strict(&conn).await.expect("seeding the group");
+    let owned_uuid = owned.uuid.clone();
+
+    let mut clash = Group::new(org.clone(), String::from("Clash"), false, Some(String::from("entra-choke-grp")));
+    let err = scim::groups::save_group_with_external_id(&mut clash, &conn)
+        .await
+        .expect_err("the losing group write must be refused");
+    assert_eq!(err.status, Status::Conflict, "a lost group uniqueness race must be 409, never 500");
+    assert_eq!(err.scim_type, Some("uniqueness"));
+    assert!(
+        Group::find_by_uuid_and_org(&owned_uuid, &org, &conn).await.is_some(),
+        "the group that held the externalId must survive the refused write"
+    );
 }
 
 // F9: Entra re-sends steady state constantly. A replayed request must be a
@@ -2081,7 +2204,7 @@ async fn mail_disabled_writes_an_invitation_row_for_unregistered_accounts() {
     let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
     assert_eq!(response.status(), Status::Created);
     assert!(
-        crate::db::models::Invitation::find_by_mail("fresh.shell@example.com", &conn).await.is_some(),
+        Invitation::find_by_mail("fresh.shell@example.com", &conn).await.is_some(),
         "without an Invitation row the account can never register"
     );
 
@@ -2093,7 +2216,7 @@ async fn mail_disabled_writes_an_invitation_row_for_unregistered_accounts() {
     // account starts in exactly the unregistered-and-uninvitable state.
     seed_user(&conn, "existing.shell@example.com", false).await;
     assert!(
-        crate::db::models::Invitation::find_by_mail("existing.shell@example.com", &conn).await.is_none(),
+        Invitation::find_by_mail("existing.shell@example.com", &conn).await.is_none(),
         "precondition: no invitation row yet"
     );
 
@@ -2105,7 +2228,7 @@ async fn mail_disabled_writes_an_invitation_row_for_unregistered_accounts() {
     let response = client.post(format!("/scim/v2/{org_b}/Users")).header(auth).header(ct).body(body).dispatch().await;
     assert_eq!(response.status(), Status::Created);
     assert!(
-        crate::db::models::Invitation::find_by_mail("existing.shell@example.com", &conn).await.is_some(),
+        Invitation::find_by_mail("existing.shell@example.com", &conn).await.is_some(),
         "an existing but unregistered account also needs an Invitation row"
     );
 
@@ -5942,6 +6065,67 @@ async fn an_unmanaged_group_cannot_be_deleted_through_scim() {
     let (auth, ct, _) = scim_body(&token, &json!({}));
     let response = client.delete(format!("/scim/v2/{org}/Groups/{owned_id}")).header(auth).header(ct).dispatch().await;
     assert_eq!(response.status(), Status::NoContent, "a SCIM-managed group must still be deletable");
+
+    // The OTHER arm of scim_may_add_members, which the subject above does not
+    // reach: access_all refuses even WITH an externalId. SCIM never sets
+    // access_all, so a group carrying it was given blanket collection access by
+    // a human - the most dangerous possible target for a delete. Removing the
+    // `if group.access_all` arm left the first subject still refused (via the
+    // collection-grant arm) and this one silently deletable.
+    let mut broad = Group::new(org.clone(), "Everything".to_owned(), true, Some("entra-broad-del-1".to_owned()));
+    broad.save(&conn).await.expect("saving access_all group");
+    let broad_id = broad.uuid.clone();
+
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response = client.delete(format!("/scim/v2/{org}/Groups/{broad_id}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(
+        response.status(),
+        Status::BadRequest,
+        "an access_all group must refuse deletion even with an externalId"
+    );
+    assert_eq!(parse_json(&body_of(response).await)["scimType"], json!("mutability"));
+    assert!(Group::find_by_uuid_and_org(&broad_id, &org, &conn).await.is_some(), "the access_all group must survive");
+}
+
+// The rollback branch that takes back an Invitation this request created.
+//
+// Reachable in production (post_user passes true when it wrote an Invitation for
+// a pre-existing, unregistered account and the membership save then failed), but
+// every existing call site in this suite passes `invitation_created = false`, so
+// deleting the branch kept the suite green. An Invitation row is a standing
+// override of `is_signup_allowed` for that address, so leaking one on every
+// failed provision is a registration bypass that accumulates.
+#[rocket::async_test]
+async fn a_rolled_back_provision_reclaims_only_the_invitation_it_wrote() {
+    let _guard = scim_test_guard!();
+    let (_client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-rollback-invite-org").await;
+
+    // A pre-existing account that never registered, for which THIS request wrote
+    // an Invitation. user_created is false: rollback must not delete the person.
+    let user = seed_user(&conn, "rollback.invited@example.com", false).await;
+    Invitation::new(&user.email).save(&conn).await.expect("seeding the invitation");
+    // An invitation an admin issued by hand, for a different address. The
+    // negative control: rollback must not touch it.
+    Invitation::new("admin.issued@example.com").save(&conn).await.expect("seeding the admin invitation");
+
+    let member = Membership::new(user.uuid.clone(), org.clone(), None);
+    let user_id = user.uuid.clone();
+    scim::users::rollback_provisioning(user, member, false, true, &conn).await;
+
+    assert!(
+        !Invitation::take("rollback.invited@example.com", &conn).await,
+        "an Invitation this request wrote must not survive the rollback as a signup bypass"
+    );
+    assert!(
+        Invitation::take("admin.issued@example.com", &conn).await,
+        "an invitation this request did not create must never be silently revoked"
+    );
+    assert!(
+        User::find_by_uuid(&user_id, &conn).await.is_some(),
+        "a pre-existing account must survive a rollback that did not create it"
+    );
 }
 
 /// POST /Groups must refuse a missing, empty or whitespace-only displayName.
@@ -6071,7 +6255,7 @@ async fn a_method_not_allowed_stays_in_the_scim_envelope() {
     assert!(
         !body.to_ascii_lowercase().contains("<!doctype") && !body.to_ascii_lowercase().contains("<html"),
         "a SCIM client must never receive an HTML error page, got: {}",
-        &body.chars().take(120).collect::<String>()
+        body.chars().take(120).collect::<String>()
     );
     assert_eq!(
         parse_json(&body)["schemas"][0],
@@ -6402,9 +6586,9 @@ async fn a_strict_spec_correct_provisioning_cycle_works_end_to_end() {
     let create = json!({
         "schemas": [scim::discovery::USER_SCHEMA_URN],
         "userName": "strict.user@example.com",
-        "name": {"givenName": "Aws", "familyName": "User"},
+        "name": {"givenName": "Strict", "familyName": "User"},
         "emails": [{"value": "strict.user@example.com", "type": "work", "primary": true}],
-        "displayName": "Aws User",
+        "displayName": "Strict User",
         "active": true,
         "externalId": "strict-ext-1",
     });
@@ -6413,7 +6597,7 @@ async fn a_strict_spec_correct_provisioning_cycle_works_end_to_end() {
     assert_eq!(response.status(), Status::Created);
     let member_id = parse_json(&body_of(response).await)["id"].as_str().expect("id").to_owned();
 
-    // The only two filters AWS emits.
+    // The only two filters this server implements.
     let filter = url_escape("userName eq \"strict.user@example.com\"");
     let (auth, ct, _) = scim_body(&token, &json!({}));
     let response = client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;

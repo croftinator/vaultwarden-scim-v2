@@ -145,9 +145,6 @@ async fn resolve_members(values: &[String], token: &ScimToken, conn: &DbConn) ->
     Ok(requested)
 }
 
-// Every member value costs a database round trip, so an uncapped list turns one
-// legal request into tens of thousands of sequential queries holding a pooled
-// connection. Reject oversized sets before any of that work happens.
 // The operation count is bounded separately from the value count, because an
 // operation carrying an empty value list contributes nothing to the latter. See
 // SCIM_MAX_GROUP_MEMBER_OPS.
@@ -161,6 +158,9 @@ fn check_member_op_count(ops: usize) -> Result<(), ScimError> {
     Ok(())
 }
 
+// Every member value costs a database round trip, so an uncapped list turns one
+// legal request into tens of thousands of sequential queries holding a pooled
+// connection. Reject oversized sets before any of that work happens.
 fn check_member_count(count: usize) -> Result<(), ScimError> {
     if count > SCIM_MAX_GROUP_MEMBERS {
         // invalidValue, not tooMany. RFC 7644 section 3.12 defines tooMany
@@ -179,7 +179,7 @@ fn check_member_count(count: usize) -> Result<(), ScimError> {
 // uniqueness race into the same 409 the sequential case returns.
 //
 // The check-then-write in `check_external_id_available` is no longer the only
-// enforcement: a UNIQUE index now backs it (2026-08-08-000002), which is the
+// enforcement: a UNIQUE index now backs it (2026-07-26-000002), which is the
 // point - the check alone was one two concurrent requests could both pass. The
 // loser now fails at the write instead, and a bare internal() would make that a
 // 500, the one status Entra retries until it quarantines the application.

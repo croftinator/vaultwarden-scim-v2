@@ -296,15 +296,75 @@ For the second case only, two things make it destructive:
 2. **Existing SCIM tokens are invalidated.** The table holds the token digests,
    so dropping it revokes every organization's SCIM credential.
 
-Five companion migrations follow it, all purely additive:
+Five companion migrations follow it:
 
-| Version | What it adds |
+| Version | What it does |
 |---|---|
-| `...000001_add_users_organizations_external_id_index` | `(org_uuid, external_id)` on `users_organizations` |
-| `...000002_add_groups_external_id_index` | `(organizations_uuid, external_id)` on `groups` |
-| `...000003_add_scim_api_key_last_used` | `scim_api_key.last_used_at`, nullable |
-| `...000004_add_users_organizations_paging_index` | `(org_uuid, uuid)` on `users_organizations` |
-| `...000005_add_groups_paging_index` | `(organizations_uuid, uuid)` on `groups` |
+| `2026-07-26-000001_unique_users_organizations_external_id` | Clears duplicate `external_id` values on `users_organizations`, then makes `(org_uuid, external_id)` UNIQUE |
+| `2026-07-26-000002_unique_groups_external_id` | The same for `groups` |
+| `2026-07-26-000003_add_scim_api_key_last_used` | `scim_api_key.last_used_at`, nullable. Additive |
+| `2026-07-26-000004_add_users_organizations_paging_index` | `(org_uuid, uuid)` on `users_organizations`. Additive |
+| `2026-07-26-000005_add_groups_paging_index` | `(organizations_uuid, uuid)` on `groups`. Additive |
+
+### The two that are NOT additive - read this before upgrading
+
+> [!WARNING]
+> `000001` and `000002` make `external_id` UNIQUE per organization, and **each
+> one clears data to get there**. They are the only migrations on this branch
+> that destroy anything, and they run before the process serves, so there is no
+> opportunity to intervene once it starts.
+
+**What gets cleared.** Where two rows in one organization claim the same
+directory object, one keeps its correlation key and the rest are set to NULL.
+Nothing else is touched: no membership, no `akey`, no group, no access. A
+cleared correlation is re-established by the next sync for whichever row the
+directory still sends.
+
+This is not hypothetical on an upgrade. Upstream's own Directory Connector
+import writes `external_id` with no uniqueness handling at all, so an existing
+deployment can already be holding duplicates.
+
+**Which row survives is arbitrary.** The keeper is `MIN(uuid)`, and uuids are
+random v4 values with no time component, so it is *not* "the oldest". There is
+no better option on `users_organizations`, which carries no creation timestamp.
+
+**Three dialect differences worth knowing before you upgrade:**
+
+- **MySQL** enforces uniqueness over the first **150 characters** only (the
+  column is TEXT and MySQL cannot index it without a prefix). Two externalIds
+  differing only after character 150 collide there and not elsewhere.
+- **MySQL** also compares case-insensitively under its default `utf8mb4`
+  collation, so `ABC` and `abc` are one key there and two on SQLite and
+  PostgreSQL. One of a case-differing pair will have its correlation cleared.
+- **PostgreSQL** additionally clears any `external_id` longer than 2000 bytes.
+  A plain btree entry caps at roughly 2704 bytes, and a single over-long row
+  would make the index creation fail outright - which is a server that will not
+  start. SCIM never writes one that long (the cap is 300 characters); the
+  Directory Connector import applies no length check at all.
+
+**Check first, and take a backup.** This tells you whether your install is
+affected at all - most are not:
+
+```sql
+-- Any row returned means a correlation key will be cleared.
+SELECT org_uuid, external_id, COUNT(*)
+FROM users_organizations
+WHERE external_id IS NOT NULL
+GROUP BY org_uuid, external_id HAVING COUNT(*) > 1;
+
+-- MySQL only: the index enforces a 150-character prefix, so check that too.
+SELECT org_uuid, LEFT(external_id, 150), COUNT(*)
+FROM users_organizations
+WHERE external_id IS NOT NULL
+GROUP BY org_uuid, LEFT(external_id, 150) HAVING COUNT(*) > 1;
+```
+
+Run the same two against `groups` with `organizations_uuid` in place of
+`org_uuid`.
+
+**Rolling back does not restore what was cleared.** The `down.sql` files drop
+the indexes, which is all a rollback can honestly do - the cleared values are
+gone, and the next sync re-establishes them.
 
 **Each index gets its own migration, one `CREATE INDEX` per file.** That is not
 tidiness, it is the only retryable shape on MySQL. MySQL DDL is not

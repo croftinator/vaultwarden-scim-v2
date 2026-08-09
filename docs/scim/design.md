@@ -107,7 +107,7 @@ one-hour organization api-key JWT that `/api/public` uses).
   the dummy compare is hygiene, not a timing-proof guarantee.
 - An active `scim_api_key` row is also the per-org enable switch; the global
   `SCIM_ENABLED` config is the master gate. Both must hold.
-- Generation and rotation require an interactive org admin session plus
+- Generation and rotation require an interactive **Owner** session plus
   master-password or OTP re-authentication. Rotation replaces the row, so
   the previous token dies instantly. The plaintext is returned exactly once
   and never logged.
@@ -162,7 +162,7 @@ flowchart TB
         direction TB
         gsc[ScimToken guard<br/>per-org machine credential]
         hsc[SCIM handlers<br/>every query scoped to token org]
-        gadm[AdminHeaders guard<br/>interactive session + password/OTP]
+        gadm[OwnerHeaders guard<br/>interactive Owner session + password/OTP]
         hadm[Token management<br/>/api/organizations/id/scim]
         db[(Database<br/>akey stored as an opaque blob)]
     end
@@ -403,8 +403,12 @@ sequenceDiagram
 ```
 
 Fixed by requiring `OwnerHeaders` to mint or delete the token. Reading
-`/scim/status` still takes `AdminHeaders`, because reading key metadata and
-Owner counts grants nothing an org admin cannot already see.
+`/scim/status` requires it too, and that was tightened rather than left alone:
+the endpoint reports the credential's state, its `lastUsedAt`, and how many of
+the organization's Owners are directory-linked - a map of the recovery path -
+and an Admin is exactly the role that cannot mint, revoke or disable the
+credential it describes. The role gate closes the same gap a password/OTP
+step-up would, without forcing a GET to become a POST.
 
 The general rule to keep: **the role that may create a credential must be at
 least as privileged as the most privileged thing that credential can do.**
@@ -514,8 +518,76 @@ flowchart LR
 
 The `/scim` mount carries its own catchers so every error, including ones
 Rocket generates before a handler runs, is a SCIM `Error` envelope. Token
-management deliberately lives under `/api` with `AdminHeaders`: the SCIM
+management deliberately lives under `/api` with `OwnerHeaders`: the SCIM
 surface itself can never mint or rotate its own credential.
+
+### Why SCIM writes never use `save`
+
+Every SCIM membership and group write goes through `Membership::save_strict` /
+`Group::save_strict`, never the `save` the rest of the codebase uses. This is the
+single most important implementation constraint in the feature, and it is not
+obvious from either function's name.
+
+`save` uses `diesel::replace_into` on sqlite and mysql. SQL `REPLACE` resolves a
+conflict on **any** unique index by DELETING the conflicting row and then
+inserting. For the `uuid` primary key that is harmless - the row being replaced
+is the row being saved. For `(org_uuid, external_id)`, added as UNIQUE in
+`2026-07-26-000001`, it is not: the conflicting row belongs to a *different*
+member, and deleting it destroys their `akey` - their wrapped copy of the
+organization key. Under end-to-end encryption nobody can reconstruct that, the
+server least of all.
+
+So the UNIQUE index did not turn a duplicate correlation key into a failure. It
+turned it into silent, unrecoverable data loss that reported success:
+
+```mermaid
+flowchart TD
+    A["PATCH /Users/&lt;id&gt;<br/>externalId = 'ext-A'"] --> B{"check_external_id_available<br/>full-value lookup"}
+    B -->|"already taken"| R409["409 uniqueness"]
+    B -->|"looks free"| C["write the membership"]
+
+    C --> D{"which save?"}
+
+    D -->|"save<br/>(replace_into)"| H["REPLACE INTO users_organizations"]
+    H --> I["the OTHER member's row is DELETED<br/>their akey is gone"]
+    I --> J["returns Ok"]
+    J --> K["200 OK<br/>recovery never runs"]
+
+    D -->|"save_strict<br/>(UPDATE then INSERT)"| E["the database raises<br/>UniqueViolation"]
+    E --> F["is_unique_violation(err)"]
+    F --> G["409 uniqueness<br/>both members intact"]
+
+    style I fill:#b3261e,color:#ffffff,stroke:#b3261e
+    style K fill:#b3261e,color:#ffffff,stroke:#b3261e
+    style G fill:#1b6b45,color:#ffffff,stroke:#1b6b45
+    style R409 fill:#1b6b45,color:#ffffff,stroke:#1b6b45
+```
+
+Two paths reach the conflict, and the second needs no concurrency at all:
+
+1. **Two concurrent writes**, on any backend. Both pass the application-level
+   check, and the loser's write lands on a value that is now taken.
+2. **A mysql prefix collision, entirely sequential.** That index covers
+   `external_id(150)` while `SCIM_MAX_EXTERNAL_ID_LEN` is 300 and
+   `find_by_external_id_and_org` compares the whole value. Two externalIds
+   sharing their first 150 characters are distinct to the application and
+   identical to the index.
+
+`is_unique_violation` inspects the error rather than re-reading the row for the
+same reason: an exact-match re-read cannot see case 2, so it would report "no
+conflict found" and fall through to a 500 - the one status a provisioning engine
+retries until it quarantines the whole application.
+
+PostgreSQL was never affected. Its `save` uses
+`insert_into(..).on_conflict(uuid).do_update()`, whose conflict target is the
+primary key alone, so a violation on any other index propagates as a real error.
+That asymmetry is exactly why this was worth a diagram: the bug was invisible on
+the backend most likely to be used for testing a large deployment, and present on
+the default one.
+
+**The general rule this leaves behind: never add a UNIQUE index to a table whose
+write path is `replace_into`.** There, an index is not a constraint. It is a
+delete trigger.
 
 ## Semantics that differ from a naive SCIM reading
 

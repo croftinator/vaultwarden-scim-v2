@@ -63,7 +63,8 @@ The first question about any provider is which direction its SCIM runs.
 ### Live tenant validation, all providers
 
 **Scope widened 2026-08-09.** The suite now covers the documented provisioning
-cycle for Okta, AWS IAM Identity Center and Google Workspace alongside Entra
+cycle for Okta and Google Workspace alongside Entra, plus a strict spec-correct
+client
 (`the_okta_provisioning_cycle_works_end_to_end` and siblings), all written from
 published vendor documentation rather than observed traffic. The item below
 therefore applies to each of them, not only Entra: no provider has been synced
@@ -115,13 +116,13 @@ parallelise, so the check-then-act races were not stressed. Details and a
 reproduction recipe are in docs/scim/testing.md under "Rung 2b".
 
 **Made cheaper 2026-08-09.** `tools/scim-replay.sh` now takes
-`--profile entra|okta|aws|google`, swapping the create payload and deactivation
+`--profile entra|okta|strict|google`, swapping the create payload and deactivation
 form for that engine's documented shape, so one deployment can be validated
 against all four in about a minute. docs/scim/providers.md now also lists what
-each tenant actually costs to obtain - Okta is a free developer account, AWS IAM
-Identity Center is free with any AWS account, and the Microsoft SCIM Validator
-needs no tenant at all. Only Google Workspace and Entra P1/P2 need paid plans or
-trials. The remaining work is running them, which needs credentials this project
+each tenant actually costs to obtain - Okta is a free developer account and the
+Microsoft SCIM Validator needs no tenant at all. Only Google Workspace and Entra
+P1/P2 need paid plans or trials. AWS IAM Identity Center is not on the list: it
+cannot drive this endpoint, so no tenant of it would help. The remaining work is running them, which needs credentials this project
 does not have.
 
 ### Live Entra ID tenant validation
@@ -269,8 +270,8 @@ join per group.
   because MySQL DDL is not transactional and a failure partway through left the
   database unmigratable. **Split again on 2026-07-26 (second review pass)** to
   ONE `CREATE INDEX` per migration
-  (`...000001_add_users_organizations_external_id_index`,
-  `...000002_add_groups_external_id_index`), because separating the indexes from
+  (`...000001_unique_users_organizations_external_id`,
+  `...000002_unique_groups_external_id`), because separating the indexes from
   the *table* did not separate them from *each other*: two non-idempotent
   statements still shared one non-transactional migration, so a failure on the
   second left the first committed and unrecorded and every retry died on
@@ -649,17 +650,44 @@ one active Owner, checking affected rows. The duplicated guard should collapse
 into one helper at the same time (it is currently copy-pasted, and the count runs
 twice per owner-revoke request). **Effort:** M. **Priority:** P2.
 
-**3. externalId uniqueness still has no unique index. CLOSED 2026-08-08.** Six
-migrations (two tables x three dialects) now back the invariant with a real
-UNIQUE index. Two things the original note did not anticipate: a pre-existing
-duplicate would make CREATE UNIQUE INDEX fail, and migrations run before Rocket
-listens, so that is a server that will not start - each up.sql therefore
-deduplicates first, keeping the oldest row's correlation. And with the index in
-place the losing request fails at the WRITE, where a bare internal() would have
-returned the 500 that quarantines an Entra tenant; the write paths now answer a
-lost race with the same 409 the sequential case returns. MySQL enforces over a
-150-character prefix, which the migration documents rather than hides. Original
-note follows.
+**3. externalId uniqueness. Closed 2026-08-08, REOPENED and properly closed
+2026-08-09 - the first closure was wrong in a way that made things worse.**
+
+The six migrations landed and the invariant looked backed. It was not. Both
+`Membership::save` and `Group::save` use `diesel::replace_into` on sqlite and
+mysql, and `REPLACE` resolves a conflict on ANY unique index by DELETING the
+conflicting row and returning success. So adding the UNIQUE index did not make a
+duplicate *fail* - it made a duplicate destroy a different member, taking the
+`akey` that wraps their copy of the organization key, which under E2EE nobody
+can reconstruct. Verified by experiment against the shipped index, not by
+reading. The "the write paths now answer a lost race with the same 409" claim in
+the original closure was therefore false on two of the three backends: the
+recovery code never ran, because `save()` returned `Ok`.
+
+Reachable two ways, and the second needs no concurrency at all: two concurrent
+writes on any backend, and on mysql a pair of externalIds sharing a 150-character
+prefix, because the index covers a prefix and the application compares the whole
+300-character value.
+
+**Closed properly by `Membership::save_strict` / `Group::save_strict`** (an
+explicit UPDATE-then-INSERT, so the database raises the violation) plus
+`is_unique_violation`, which asks the error rather than re-reading the row - a
+re-read cannot see the mysql prefix case and answered a genuine duplicate with a
+500. Pinned by `the_unique_index_refuses_a_duplicate_external_id_without_destroying_the_holder`
+and `the_scim_write_helpers_answer_a_conflict_with_409_and_destroy_nothing`, the
+second of which fails if either handler goes back to `save`.
+
+**The lesson worth keeping: never add a UNIQUE index to a table whose write path
+is `replace_into`.** The index does not become a constraint there, it becomes a
+delete trigger.
+
+Two smaller corrections to the original note. The dedup keeps an ARBITRARY row,
+not the oldest - `MIN(uuid)` over random v4 uuids has no relation to age, and
+`users_organizations` has no timestamp to order by. And the postgresql migration
+now also clears values over 2000 bytes, because that column is unbounded TEXT
+there, upstream's `ldap_import` applies no length check, and a single over-long
+pre-existing row would make `CREATE UNIQUE INDEX` fail - which, before Rocket
+listens, is a server that never starts. Original note follows.
 
  Now confirmed by two
 independent passes: all six new composite indexes are plain `CREATE INDEX`, so
@@ -725,6 +753,52 @@ that fails inside `apply_member_op` (rather than in the precheck) leaves the
 rename persisted. The precheck makes this much harder to reach; closing it fully
 needs either a transaction or per-op event logging. **Effort:** M.
 **Priority:** P3.
+
+### Residual items from the 2026-08-09 review pass
+
+The pass that found the `replace_into` data-loss path (item 3 above) also closed
+a long list of smaller things. What it deliberately did NOT close:
+
+1. **`externalId` uniqueness is case-dependent on the dialect.** MySQL's default
+   `utf8mb4` collation is case- and accent-insensitive, so `ABC` and `abc` are
+   one key there and two on sqlite and postgresql - at migration time MySQL
+   silently clears one of the pair, and at runtime
+   `find_by_external_id_and_org` can resolve a differently-cased externalId to,
+   and deprovision, a different member than the other backends would. Entra
+   sends lowercase GUIDs so it is unreachable there; some LDAP DN sources mint
+   case-varying values. Closing it means either normalising case in the
+   application before every lookup and write, or adding `COLLATE utf8mb4_bin` to
+   the MySQL index and the lookups. Both are a semantic decision, not a fix.
+   Documented in `docs/scim/upgrading.md`. **Effort:** M. **Priority:** P3.
+
+2. **The MySQL 150-character prefix still means uniqueness is enforced over less
+   than the full value.** A pair of externalIds differing only after character
+   150 now returns a correct 409 rather than a 500, so the failure mode is
+   sound - but it is a *false* 409 on that backend and a successful write on the
+   other two. Lowering `SCIM_MAX_EXTERNAL_ID_LEN` to 150 would make all three
+   agree at the cost of refusing values the RFC permits. **Effort:** S.
+   **Priority:** P3.
+
+3. **The `scim-race-control` build feature is a test-only escape hatch that
+   ships in `Cargo.toml`.** It compiles out the last-owner mutex so
+   `tools/scim-owner-race.sh` can measure the race, and CI requires the harness
+   to fail against it. Nothing prevents someone enabling it in a release build
+   except the comment saying not to. A `compile_error!` guarded on
+   `debug_assertions` would, at the cost of making the CI control binary a debug
+   build. **Effort:** S. **Priority:** P3.
+
+4. **`tools/scim-authentik-e2e.sh` pins `AUTHENTIK_TAG=2025.8`.** Chosen without
+   being able to verify the tag resolves; if the weekly job fails at pull time
+   that is the line to change. The failure is loud, which is the point - the
+   previous arrangement fetched an unpinned compose file at run time and could
+   not fail, it just tested a different Authentik each week. **Effort:** S.
+   **Priority:** P3.
+
+5. **Group PATCH is still non-atomic for its own attributes.** Unchanged by this
+   pass and recorded above; the guard-ordering fix removed the wrong-answer case
+   but not the partial-write case.
+
+**Effort:** S each. **Priority:** P3.
 
 ## Enterprise feature upgrades
 

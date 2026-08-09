@@ -16,7 +16,8 @@ long for one line, it links to the document that holds it.
 - **SCIM v2 provisioning server** (RFC 7643 / RFC 7644) at
   `/scim/v2/<org_id>`: Users and Groups full lifecycle, discovery endpoints,
   per-organization static bearer token, pre-auth rate limiting, SCIM error
-  envelopes. Microsoft Entra ID is the tested provider.
+  envelopes. Provider-agnostic: Entra ID, Okta and Google Workspace have their
+  documented cycles covered by tests, and Authentik is driven end to end in CI.
   See [docs/scim/](docs/scim/README.md).
 - **Token management** under `/api/organizations/<org_id>/scim/…`: mint, delete,
   enable/disable, and a status endpoint reporting configuration, last use, and a
@@ -28,16 +29,70 @@ long for one line, it links to the document that holds it.
 - **Reversible kill switch** (`PUT …/scim/api-key/enabled`): stops provisioning
   immediately while keeping the digest, so resuming does not require pasting a
   new token into the IdP.
-- **Composite indexes** on `users_organizations(org_uuid, external_id)` and
-  `groups(organizations_uuid, external_id)`. A departure from upstream's
+- **UNIQUE indexes** on `users_organizations(org_uuid, external_id)` and
+  `groups(organizations_uuid, external_id)`, one migration each. A departure from upstream's
   index-free convention, taken because `users_organizations` is global across all
   organizations, so an unindexed correlation-key lookup scanned every membership
-  on the server once per provisioned user.
+  on the server once per provisioned user - and because the correlation key is an
+  invariant the database should keep, not one application code re-checks on every
+  write. **These migrations clear data: see Fixed, and read
+  [docs/scim/upgrading.md](docs/scim/upgrading.md) before upgrading.**
+  Collapsed from six migrations to two while the branch is still unreleased -
+  the earlier arrangement created a non-unique index, added a UNIQUE one on the
+  identical key, then dropped the first. After merge such a change would have to
+  arrive as a new migration; see CLAUDE.md.
+- **Four distinct audit event types** for the SCIM credential lifecycle -
+  `ScimCredentialCreated` (9100), `Revoked` (9101), `Enabled` (9102),
+  `Disabled` (9103). Previously all four actions logged as
+  `OrganizationUpdated`, so the org event stream could not tell a credential mint
+  from any other configuration change. Numbered far outside Bitwarden's
+  1000-1999 block on purpose: a number inside it could be reassigned by a future
+  upstream release, which would silently relabel historical audit records rather
+  than merely leaving them unknown. Clients that map event types by number render
+  these as unknown, which is cosmetic and does not affect an events export.
+- **Ownership guard on group deletion.** SCIM refuses to delete a group that
+  grants collection access and carries no `externalId` (or grants access to all
+  collections) - the same set additions are refused for. Without it a token
+  holder could enumerate every group in the organization and delete
+  administrator-curated ones, dropping their access grants.
+- **Serialised owner revocation.** A process-global mutex holds the last-owner
+  count and the write together, closing a race where two concurrent
+  deprovisions of two different Owners each observed a count of two and both
+  proceeded, leaving the organization with no Owner and no SCIM path back.
+  Single-process only; the multi-replica case needs a database-level fix and is
+  recorded in `TODOS.md`.
+- **Rate-limiter pruning** on a schedule (`RATELIMIT_PRUNE_SCHEDULE`), because
+  all four limiters key on client IP and are checked before authentication, so
+  the keyed map grows without bound on unauthenticated traffic.
+- New configuration: `SCIM_ENABLED`, `SCIM_RATELIMIT_SECONDS`,
+  `SCIM_RATELIMIT_MAX_BURST`, `RATELIMIT_PRUNE_SCHEDULE`.
+- **CI**: `scim-tests.yml` (the suite on sqlite, MySQL and PostgreSQL, plus a
+  job that renders every mermaid diagram) and `provisioning-e2e.yml` (the
+  last-owner concurrency race, and a full Authentik lifecycle against a real
+  provisioning engine).
 - Operator documentation: deployment, setup, client rollout, operations,
   reference, upgrading, testing, and design with diagrams.
 - Verification tooling: `tools/scim-test-backends.sh` (all three backends),
   `tools/scim-test-config-matrix.sh`, `tools/scim-replay.sh`,
-  `tools/check-mermaid.sh`.
+  `tools/check-mermaid.sh`, `tools/scim-owner-race.sh` (concurrency stress for
+  the last-owner guard), `tools/scim-authentik-e2e.sh` and
+  `tools/ci-seed-vaultwarden.sh` (the real-engine lifecycle).
+
+### Changed
+
+- **AWS IAM Identity Center is no longer listed as a supported provisioning
+  source, and never could have been.** It is a SCIM *server*, not a client: it
+  receives provisioning from an upstream IdP and does not push to third-party
+  endpoints. The in-process test written for it now describes what it actually
+  covers - a strict, spec-correct client - and `tools/scim-replay.sh --profile
+  aws` became `--profile strict`. A user-visible retraction, recorded because
+  the mistake is easy to repeat: AWS publishes a thorough SCIM guide describing
+  the direction it does not support here.
+- **`GET /scim/status` now requires the Owner role**, not merely an org admin.
+  It reports credential state, `lastUsedAt`, and how many Owners are
+  directory-linked - a map of the recovery path - and an Admin is exactly the
+  role that cannot mint, revoke or disable the credential it describes.
+- **SCIM writes no longer go through `replace_into`.** See Fixed.
 
 ### Security
 
@@ -86,6 +141,59 @@ because the defect is the thing worth not reintroducing.
   `mktemp` with a cleanup trap.
 
 ### Fixed
+
+- **A duplicate `externalId` deleted the member who held it, and its wrapped
+  organization key with it.** `Membership::save` and `Group::save` use
+  `replace_into` on SQLite and MySQL, and `REPLACE` resolves a conflict on *any*
+  unique index by DELETING the conflicting row and returning success. So the new
+  UNIQUE indexes did not make a duplicate *fail*, they made it destroy a
+  different member - taking the `akey` that wraps their copy of the organization
+  key, which under end-to-end encryption nobody can reconstruct. Reachable
+  through two concurrent writes on any backend, and on MySQL with no concurrency
+  at all, because that index covers a 150-character prefix while the application
+  compares the whole 300-character value. SCIM writes now use `save_strict`
+  (`UPDATE`-then-`INSERT`), so the database raises the violation and the handlers
+  answer it with a 409.
+- **Upstream's Directory Connector import inherited the new constraint.**
+  `ldap_import` reassigns an `external_id` between rows whenever a directory
+  email changes, which the UNIQUE index turned into an aborted sync (PostgreSQL)
+  or a silent row deletion (SQLite/MySQL). It now releases the key from the
+  previous holder first, which is the same repair the migration performs on
+  pre-existing duplicates.
+- **The migrations that add those indexes clear data.** Where two rows in one
+  organization claim the same directory object, one keeps its correlation key
+  and the rest are set to NULL - nothing else is touched, and the next sync
+  re-establishes them. Which row survives is arbitrary (`MIN` of a random v4
+  uuid), MySQL additionally collapses values differing only after 150 characters
+  or only in case, and PostgreSQL clears anything over 2000 bytes because a
+  longer value would make the index creation fail and the server refuse to
+  start. `docs/scim/upgrading.md` carries a pre-flight query.
+- **An unbounded PATCH could drive ~11,900 sequential queries.** The member cap
+  counted member *values*, and an operation with an empty value list counts
+  zero - so thousands of them fit inside the body limit while each still reached
+  a three-table join. Member *operations* are now capped separately.
+- **The concurrency harness could not fail.** `tools/scim-owner-race.sh` had no
+  `exit` statement, so the CI job guarding the last-owner invariant was green
+  whether the race fired 0 or 40 times out of 40. It now asserts, records the
+  HTTP status of every request (a 429 from the rate limiter was previously
+  indistinguishable from the guard refusing), and CI additionally runs it
+  against a binary built with the mutex compiled out and requires it to fail.
+- **The Authentik end-to-end run asserted nothing about the E2EE invariant.**
+  Its `akey IS NOT NULL` check was true for every row that existed, on a
+  non-nullable column, for members that never held a wrapped key. It now seeds a
+  Confirmed membership with a sentinel key and asserts that exact value, and the
+  exact revoked status offset, survive the revoke/restore round trip.
+- **Discovery advertised an attribute the handlers never return.** The User
+  schema declared `name` as returned by default; it is honoured on create but
+  never emitted. Now `returned: never`, which is what a schema-driven
+  conformance checker compares against.
+- **A PATCH that cleared an `externalId` and added members in one body refused
+  its own member-add**, because the ownership guard ran against the in-memory
+  group the same request had just made look unmanaged. Guards now run against
+  the group as the database has it. Clearing an `externalId` on a group SCIM
+  does not own is also refused now - it was the one unguarded direction, and it
+  stranded administrator-curated groups outside SCIM permanently.
+- **Failed audit-log writes are logged** rather than discarded silently.
 
 - **A migration had been edited in place after it was applied.** `diesel` records
   only a version with no checksum, so an edited migration never re-runs: any

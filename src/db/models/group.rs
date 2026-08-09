@@ -196,7 +196,7 @@ impl Group {
     }
 
     // FORK ADDITION (SCIM): see `Membership::release_external_id`. Same
-    // constraint (2026-08-08-000002), same reassignment case in ldap_import,
+    // constraint (2026-07-26-000002), same reassignment case in ldap_import,
     // same repair.
     pub async fn release_external_id(
         external_id: &str,
