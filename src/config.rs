@@ -1896,3 +1896,66 @@ handlebars::handlebars_helper!(webver: | web_vault_version: String |
 handlebars::handlebars_helper!(vwver: | vw_version: String |
     semver::VersionReq::parse(&vw_version).expect("Invalid Vaultwarden version compare string").matches(&VW_VERSION)
 );
+
+// FORK ADDITION (SCIM): coverage for the SCIM-related validators.
+//
+// `validate_config` is a pure function over `ConfigItems`, so these are cheap -
+// and the failures they prevent are not. A zero rate-limit value panics inside
+// `NonZeroU32::new(..).expect(..)` / `Quota::with_period` within a `LazyLock`,
+// which POISONS the lock: every subsequent SCIM request re-panics and the
+// endpoint stays dead until the process restarts. Both `err!` blocks could be
+// deleted with the whole suite still green.
+#[cfg(test)]
+mod scim_config_validation_tests {
+    use super::{ConfigBuilder, ConfigItems, validate_config};
+
+    // A config carrying every DECLARED default, not Rust's zero-values.
+    //
+    // ConfigItems::default() is all zeroes and empty strings, so validate_config
+    // returns at DATABASE_URL long before reaching anything SCIM owns - and
+    // hand-patching the fields in between just chases whichever validator comes
+    // next. ConfigBuilder::build() applies the defaults declared in the macro,
+    // which is the same path the server takes at startup.
+    fn valid_config() -> ConfigItems {
+        let mut cfg = ConfigBuilder::default().build();
+        cfg.database_url = String::from("sqlite:///tmp/vw-config-validation-test.sqlite3");
+        cfg
+    }
+
+    // Asserts on the MESSAGE, not merely on is_err(). validate_config returns at
+    // the FIRST failure, so "it errored" would pass even with the SCIM guards
+    // deleted - some other validator would have refused the same input. Naming
+    // the setting is what makes each of these a test of the guard it claims to
+    // test.
+    fn refusal_mentions(mutate: impl FnOnce(&mut ConfigItems), needle: &str) {
+        let mut cfg = valid_config();
+        mutate(&mut cfg);
+        let message = validate_config(&cfg, false).expect_err("this configuration must be refused").to_string();
+        assert!(message.contains(needle), "expected the refusal to name {needle}, got: {message}");
+    }
+
+    #[test]
+    fn the_declared_defaults_validate() {
+        // The control. Without it the three refusals below could all be passing
+        // because the baseline itself is invalid.
+        assert!(validate_config(&valid_config(), false).is_ok(), "the shipped defaults must validate");
+    }
+
+    #[test]
+    fn a_zero_scim_ratelimit_period_is_refused() {
+        refusal_mentions(|cfg| cfg.scim_ratelimit_seconds = 0, "SCIM_RATELIMIT_SECONDS");
+    }
+
+    #[test]
+    fn a_zero_scim_ratelimit_burst_is_refused() {
+        refusal_mentions(|cfg| cfg.scim_ratelimit_max_burst = 0, "SCIM_RATELIMIT_MAX_BURST");
+    }
+
+    #[test]
+    fn a_malformed_prune_schedule_is_refused() {
+        refusal_mentions(
+            |cfg| cfg.ratelimit_prune_schedule = String::from("not a cron expression"),
+            "RATELIMIT_PRUNE_SCHEDULE",
+        );
+    }
+}

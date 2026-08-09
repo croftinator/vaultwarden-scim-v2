@@ -325,7 +325,16 @@ async fn log_event_impl(
     event.act_user_uuid = Some(act_user_id.clone());
     event.device_type = Some(device_type);
     event.ip_address = Some(ip.to_string());
-    event.save(conn).await.unwrap_or(());
+    // FORK ADDITION (SCIM): say something when the audit write is dropped.
+    //
+    // This was `.unwrap_or(())`. Best-effort is a defensible choice for an event
+    // log, but silent best-effort is not: a SCIM credential can deprovision
+    // every member of an organization, and the org event stream is the only
+    // record of who did it. Losing that record without a line in the server log
+    // leaves an operator reconstructing a security event from nothing.
+    if let Err(e) = event.save(conn).await {
+        error!(target: "events", "Failed to record org event type {event_type} for org {org_id}: {e:#?}");
+    }
 }
 
 pub async fn event_cleanup_job(pool: DbPool) {

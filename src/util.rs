@@ -1008,3 +1008,56 @@ mod tests {
         });
     }
 }
+
+// FORK ADDITION (SCIM): tests for `log_query`, which is small, unexported, and
+// does two independent load-bearing jobs.
+//
+// Deliberately NOT behind the `unstable` feature like the module above, whose
+// two tests are also `#[ignore]`d - so in a normal `cargo test` run this file
+// had no runnable coverage at all. Both behaviours below regress silently: the
+// fairing runs before any request guard, so a bad slice takes the process down
+// on an unauthenticated request, and the redaction is a privacy control with no
+// visible symptom when it stops working.
+#[cfg(test)]
+mod log_query_tests {
+    use super::log_query;
+
+    #[test]
+    fn scim_queries_keep_parameter_names_and_drop_their_values() {
+        // A SCIM list request carries directory identity in the query itself, so
+        // an unredacted request log records every provisioned user's address.
+        let logged = log_query("/scim/v2/abc/Users", "filter=userName%20eq%20%22person@example.com%22&startIndex=1");
+        assert!(!logged.contains("person@example.com"), "a directory address must never reach the log: {logged}");
+        assert_eq!(logged, "filter=<redacted>&startIndex=<redacted>");
+    }
+
+    #[test]
+    fn a_valueless_scim_parameter_passes_through_unchanged() {
+        assert_eq!(log_query("/scim/v2/abc/Users", "bare"), "bare");
+    }
+
+    #[test]
+    fn non_scim_queries_keep_the_first_thirty_characters() {
+        let query = "a".repeat(50);
+        let logged = log_query("/api/sync", &query);
+        assert_eq!(logged.len(), 30);
+        assert!(query.starts_with(&logged));
+    }
+
+    #[test]
+    fn a_short_non_scim_query_is_not_padded_or_truncated() {
+        assert_eq!(log_query("/api/sync", "short=1"), "short=1");
+    }
+
+    #[test]
+    fn a_multibyte_query_is_cut_on_a_character_boundary() {
+        // The predecessor sliced a raw byte range, so a query whose 30-byte
+        // boundary fell inside a character panicked - inside a fairing that runs
+        // before every request guard, on unauthenticated input.
+        for query in [&"é".repeat(40), &"🔒".repeat(20), &"日本語".repeat(15)] {
+            let logged = log_query("/api/sync", query);
+            assert!(logged.len() <= 30, "must not exceed the byte budget: {logged:?}");
+            assert!(query.starts_with(&logged), "must be a prefix cut on a character boundary: {logged:?}");
+        }
+    }
+}

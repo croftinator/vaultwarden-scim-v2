@@ -177,6 +177,22 @@ fn attribute(
     mutability: &str,
     uniqueness: &str,
 ) -> Value {
+    attribute_returned(name, attr_type, multi_valued, required, mutability, uniqueness, "default")
+}
+
+// The same, with `returned` spelled out. Split off because one attribute is
+// accepted on write and never echoed back, and a schema-driven conformance
+// checker compares what the schema promises against what the resources carry.
+#[allow(clippy::too_many_arguments)]
+fn attribute_returned(
+    name: &str,
+    attr_type: &str,
+    multi_valued: bool,
+    required: bool,
+    mutability: &str,
+    uniqueness: &str,
+    returned: &str,
+) -> Value {
     json!({
         "name": name,
         "type": attr_type,
@@ -185,7 +201,7 @@ fn attribute(
         "required": required,
         "caseExact": false,
         "mutability": mutability,
-        "returned": "default",
+        "returned": returned,
         "uniqueness": uniqueness,
     })
 }
@@ -212,11 +228,23 @@ fn attribute(
 // schema's attribute definition. Listing it makes the served schema diverge from
 // the section 8.7.1 baseline a validator compares against.
 fn user_attributes() -> Vec<Value> {
-    let mut name = attribute("name", "complex", false, false, "immutable", "none");
+    // `returned: never`, unlike everything else here.
+    //
+    // `name` is genuinely honoured on create - ScimUserRequest::display_name()
+    // composes givenName and familyName when displayName is absent - so removing
+    // it from the schema would tell a client not to send an attribute this
+    // server uses. But `to_scim_user` never emits a `name` member on any User
+    // resource: the composed value lands in the global User row and comes back
+    // as displayName. Leaving this at the default said the attribute would be
+    // present in responses, and a schema-driven conformance checker (Microsoft's
+    // SCIM Validator is an explicit target) compares the advertised schema
+    // against the resources actually returned. `never` is the RFC 7643 section 7
+    // value for exactly this case: accepted on input, absent from output.
+    let mut name = attribute_returned("name", "complex", false, false, "immutable", "none", "never");
     name["subAttributes"] = json!([
-        attribute("formatted", "string", false, false, "immutable", "none"),
-        attribute("givenName", "string", false, false, "immutable", "none"),
-        attribute("familyName", "string", false, false, "immutable", "none"),
+        attribute_returned("formatted", "string", false, false, "immutable", "none", "never"),
+        attribute_returned("givenName", "string", false, false, "immutable", "none", "never"),
+        attribute_returned("familyName", "string", false, false, "immutable", "none", "never"),
     ]);
 
     let mut emails = attribute("emails", "complex", true, false, "immutable", "none");
