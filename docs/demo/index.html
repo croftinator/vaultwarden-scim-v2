@@ -70,6 +70,20 @@ pointed at <code>127.0.0.1:15433</code>. You also need a <strong>second browser
 profile</strong> for step 7 - one browser cannot hold two Bitwarden sessions, and Ada signs in there while you stay signed in as the Owner.
 </div>
 
+<div class="note">
+<strong>If you are ever unsure what to do, run this:</strong>
+<pre><code>tools/scim-demo.sh --next</code></pre>
+It inspects the live state and prints the single next action, with the exact
+credentials for it. It also repairs anything recoverable first - a stray account
+from an accidental SSO sign-in, or a member left half-onboarded - so it can never
+tell you to do something that cannot work.
+<br><br>
+The steps below are the narrated version of the same sequence. <strong>You do not
+need to follow them in order</strong>: <code>--next</code> derives the order from
+where you actually are, which is what makes wrong turns recoverable rather than
+terminal.
+</div>
+
 <h2>What you are looking at</h2>
 <table>
   <tr><th>Piece</th><th>Role</th></tr>
