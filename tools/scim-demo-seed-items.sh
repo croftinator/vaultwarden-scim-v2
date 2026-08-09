@@ -59,11 +59,28 @@ fi
     echo "       Register the account first: npx playwright test --config demo.config.ts" >&2
     exit 1; }
 
+# The items must belong to the ORGANIZATION, not the Owner's personal vault.
+#
+# This is the difference between a demo that makes its point and one that does
+# not. Provisioning members into an organization that shares nothing means
+# confirming Ada grants her access to precisely no credentials, and the payoff
+# of the whole walkthrough - "she is now in, and here is what she can see" -
+# silently evaporates. Personal items are also invisible to every other member
+# by design, so nothing about them can ever be demonstrated.
+bw sync --session "$SESSION" >/dev/null
+ORG_ID="$(bw list organizations --session "$SESSION" \
+    | python3 -c "import json,sys;o=[x for x in json.load(sys.stdin) if x['name']=='$DEMO_ORG_NAME'];print(o[0]['id'] if o else '')")"
+[ -n "$ORG_ID" ] || { echo "ERROR: no organization named $DEMO_ORG_NAME - register first" >&2; exit 1; }
+COLL_ID="$(bw list collections --organizationid "$ORG_ID" --session "$SESSION" \
+    | python3 -c "import json,sys;c=json.load(sys.stdin);print(c[0]['id'] if c else '')")"
+[ -n "$COLL_ID" ] || { echo "ERROR: $DEMO_ORG_NAME has no collection to put items in" >&2; exit 1; }
+
 # Fictional throughout. Nothing here resolves to a real service and no value is
 # a credential for anything - a demo that shipped a plausible real secret would
 # be a liability the first time someone screenshotted it.
 add_login() {
-    printf '{"type":1,"name":"%s","notes":null,"login":{"username":"%s","password":"%s"}}' "$1" "$2" "$3" \
+    printf '{"type":1,"name":"%s","notes":null,"organizationId":"%s","collectionIds":["%s"],"login":{"username":"%s","password":"%s"}}' \
+        "$1" "$ORG_ID" "$COLL_ID" "$2" "$3" \
         | base64 \
         | bw create item --session "$SESSION" >/dev/null
     printf '  + %s\n' "$1"
