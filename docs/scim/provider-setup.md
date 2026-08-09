@@ -16,6 +16,55 @@ corrected.
 > through the verification section below against a **throwaway tenant and a test
 > organisation** before you point this at anything real.
 
+## Choosing your rollout path
+
+Start here. **None of the three hyperscalers gives you working SCIM provisioning
+for free**, and each blocks in a different place - so the first question is not
+"how do I configure SCIM" but "can my identity platform do outbound SCIM at
+all".
+
+| Where your identity lives | Can it drive this server? | What to do |
+|---|---|---|
+| **Microsoft Entra ID**, P1 or P2 | **Yes** | [Entra walkthrough](#microsoft-entra-id). The best-supported path. |
+| Entra ID, free tier | No - *Automatic* provisioning is not offered | Upgrade, use a P2 trial, or fall back to Directory Connector below |
+| **Okta**, any tier incl. free developer | **Yes** | [Okta walkthrough](#okta). Cheapest cloud engine to validate properly. |
+| **Google Workspace** Business+ / **Cloud Identity Premium** | **Yes**, users; groups reportedly limited | [Google walkthrough](#google-workspace--cloud-identity) |
+| **Cloud Identity Free** | No outbound SCIM at all | Upgrade to Premium, or Directory Connector below |
+| **AWS IAM Identity Center** | **No** - it is a SCIM *server* | Provision from the IdP that already feeds AWS ([why](#aws-iam-identity-center---not-usable-as-a-source)) |
+| **Authentik** (self-hosted) | **Yes** | [Authentik walkthrough](#authentik-self-hosted). Also the only one testable locally. |
+| Anything else speaking SCIM 2.0 | Probably | Parts A and B, then point it at the endpoint |
+| No SCIM-capable IdP | - | Directory Connector, or manual invites |
+
+### If SCIM is not available to you
+
+**You are not stuck, and you do not have to invite everyone by hand.** Upstream
+Vaultwarden already implements the endpoint Bitwarden's **Directory Connector**
+pushes to, and this fork inherits it: `POST /api/public/organization/import`.
+
+Directory Connector is a separate Bitwarden application that reads a directory
+and pushes users and groups into an organization. It supports **Active
+Directory, LDAP, Microsoft Entra ID, Google Workspace and Okta**, and works
+against self-hosted servers. Critically for the rows above, it authenticates as
+the *client* - so it can read an Entra free tenant or Cloud Identity through
+their normal directory APIs, with **no SCIM tier requirement**.
+
+How it compares:
+
+| | SCIM (this feature) | Directory Connector |
+|---|---|---|
+| Runs where | Your IdP's cloud, pushing to you | A machine you operate, pulling then pushing |
+| Tier needed | Entra P1/P2, Workspace Business+, Cloud Identity Premium | None beyond directory read access |
+| Deprovision | Immediate, on the IdP's cycle | On the schedule you run it |
+| Setup | Configure once in the IdP | Install, configure, and keep a host running |
+| Confirm step | Manual (E2EE) | Manual (E2EE) - identical limit |
+
+Neither can auto-confirm members; that ceiling is the encryption model, not the
+transport. See [design.md](design.md).
+
+If you have neither SCIM nor a directory, organization invites in the web vault
+remain perfectly workable - this feature automates that flow, it does not gate
+it.
+
 ## Before you start
 
 Two things are the same for every provider, and both live in

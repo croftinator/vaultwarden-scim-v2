@@ -43,7 +43,7 @@ Start at **[docs/scim/](docs/scim/README.md)** - it indexes the rest.
 |---|---|
 | [deployment.md](docs/scim/deployment.md) | Cloud-agnostic containers, PostgreSQL, secrets, SSO, break-glass Owner |
 | [setup.md](docs/scim/setup.md) | Server config, org token, and the Entra ID walkthrough |
-| [provider-setup.md](docs/scim/provider-setup.md) | Setting up **and verifying** each IdP: Entra ID, Okta, Google Workspace, Authentik |
+| [provider-setup.md](docs/scim/provider-setup.md) | **Start here for rollout**: what each cloud actually allows, per-IdP setup, the fallback when SCIM is not available, and how to verify |
 | [providers.md](docs/scim/providers.md) | What each provider sends, and what is actually verified |
 | [client-rollout.md](docs/scim/client-rollout.md) | Pointing staff Bitwarden apps at your server, zero-touch and manual |
 | [operations.md](docs/scim/operations.md) | Member lifecycle and troubleshooting |

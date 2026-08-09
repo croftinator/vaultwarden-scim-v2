@@ -50,7 +50,7 @@ Start at the top and work down; each assumes the one before.
 |---|---|---|
 | **[deployment.md](deployment.md)** | Cloud-agnostic containers, PostgreSQL, secrets, SSO, and the break-glass Owner | Building the environment |
 | **[setup.md](setup.md)** | Server config, minting the org token, the Entra enterprise application, choosing which users and groups sync | Standing it up for the first time |
-| **[provider-setup.md](provider-setup.md)** | Step-by-step setup for Entra ID, Okta, Google Workspace and Authentik, plus the six-step verification every admin should run before rollout | Configuring and proving your IdP |
+| **[provider-setup.md](provider-setup.md)** | Which rollout path your cloud actually allows, step-by-step setup for each IdP, the Directory Connector fallback when SCIM is not available to you, and the six-step verification to run before rollout | Planning and proving your rollout |
 | **[providers.md](providers.md)** | What each provider sends, what "supported" is verified to mean, and why only one can be tested in CI | Understanding compatibility |
 | **[client-rollout.md](client-rollout.md)** | Pointing staff Bitwarden apps at your server, zero-touch via browser policy and MDM, manual fallback | Getting users onto it |
 | **[operations.md](operations.md)** | The member lifecycle and the troubleshooting table | Running it day to day |
