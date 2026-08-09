@@ -279,7 +279,17 @@ say "6. Server"
 # ---------------------------------------------------------------------------
 stop_server
 sleep 1
-( cd "$SANDBOX_DIR" && set -a && . ./.env && set +a && nohup "$VW_BIN" > vw.log 2>&1 & echo $! > "$PIDFILE" )
+# `exec` matters: without it $! is the pid of the SUBSHELL, not of the server,
+# and the pidfile then names a process that exits immediately. stop_server
+# finds nothing, leaves the real server running, and the next start silently
+# loses the port race - so you get an old binary serving a new config, which
+# is a genuinely confusing thing to debug. exec replaces the subshell with the
+# server, making $! correct.
+#
+# Appending rather than truncating, so a failed start cannot destroy the log
+# that explains the previous one.
+( cd "$SANDBOX_DIR" && set -a && . ./.env && set +a && exec nohup "$VW_BIN" >> vw.log 2>&1 ) &
+echo $! > "$PIDFILE"
 PROBE=(curl -sf -o /dev/null)
 [ -f "$CAROOT/rootCA.pem" ] && PROBE+=(--cacert "$CAROOT/rootCA.pem")
 UP=0

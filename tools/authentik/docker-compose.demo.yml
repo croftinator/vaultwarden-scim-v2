@@ -1,0 +1,104 @@
+# Authentik for the DEMO, as opposed to the e2e harness.
+#
+# tools/authentik/docker-compose.yml is shaped for CI: a per-run port, a per-run
+# project name, named volumes that get destroyed on exit. That is right there -
+# two concurrent runs must not collide, and a leftover container must never be
+# silently reused - and wrong for a demo you come back to tomorrow.
+#
+# The differences, all deliberate:
+#   - stable ports, so a bookmark and an OIDC redirect URI stay valid
+#   - persistent volumes, so the directory survives a restart
+#   - a blueprints mount, so the stack comes up already configured instead of
+#     needing the API-call sequence scim-authentik-e2e.sh performs at run time
+#
+# Same pinned tag as the harness. Bump both together or the demo and CI are
+# testing different software.
+#
+# Usage:
+#   docker compose -p scim-demo -f tools/authentik/docker-compose.demo.yml up -d
+#   docker compose -p scim-demo -f tools/authentik/docker-compose.demo.yml down     # keep data
+#   docker compose -p scim-demo -f tools/authentik/docker-compose.demo.yml down -v  # destroy it
+#
+# Requires a .env beside this file; tools/scim-demo.sh writes one.
+services:
+  postgresql:
+    image: docker.io/library/postgres:16.6-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 20s
+      interval: 10s
+      retries: 5
+      timeout: 5s
+    volumes:
+      - demo-database:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: ${PG_PASS:?}
+      POSTGRES_USER: ${PG_USER:-authentik}
+      POSTGRES_DB: ${PG_DB:-authentik}
+
+  redis:
+    image: docker.io/library/redis:7.4-alpine
+    command: --save 60 1 --loglevel warning
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      start_period: 20s
+      interval: 10s
+      retries: 5
+      timeout: 3s
+    volumes:
+      - demo-redis:/data
+
+  server:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG:?}
+    restart: unless-stopped
+    command: server
+    environment:
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?}
+    env_file:
+      - .env
+    ports:
+      - "${AK_PORT:-9000}:9000"
+      - "${AK_PORT_HTTPS:-9443}:9443"
+    volumes:
+      # Read-only: the demo's configuration is version-controlled here, and a
+      # container writing back into the repository would make it not so.
+      - ./blueprints:/blueprints/custom:ro
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG:?}
+    restart: unless-stopped
+    command: worker
+    environment:
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?}
+    env_file:
+      - .env
+    volumes:
+      # The WORKER is what actually applies blueprints; the server only needs
+      # them for the UI listing. Mounting into both keeps the two consistent.
+      - ./blueprints:/blueprints/custom:ro
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  demo-database:
+    driver: local
+  demo-redis:
+    driver: local
