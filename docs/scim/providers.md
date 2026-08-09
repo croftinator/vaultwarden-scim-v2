@@ -26,11 +26,13 @@ code path a strict client can take that a lenient one cannot.
 | **Okta** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live Okta org. |
 | **AWS IAM Identity Center** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live AWS instance. |
 | **Google Workspace / Cloud Identity** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live tenant. |
+| **Authentik** (self-hosted) | **Verified working** | The only provider actually run against this implementation: a full lifecycle sync, 46 requests, no errors. See "Rung 2b" in [testing.md](testing.md). |
 | Any other SCIM 2.0 client | Should work | Only the standard surface is implemented. |
 
 > [!IMPORTANT]
 > **"Supported" here means the vendor's documented request shapes are exercised
-> by the test suite, not that a live tenant has been synced.** Every provider in
+> by the test suite, not that a live tenant has been synced.** Authentik is the
+> one exception - a real engine has driven the endpoint end to end. Every provider in
 > that table carries the same caveat, Entra included. Tenant validation is a P1
 > item in `TODOS.md` and needs credentials this project does not have. Treat the
 > table as "no known incompatibility", not as a certification.

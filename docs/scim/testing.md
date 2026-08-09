@@ -329,12 +329,78 @@ Local mail capture pairs well with this: point SMTP at
 and every invite is captured locally, so your Entra test users can be fake
 addresses like `test1@example.com` with no real mailboxes.
 
-## What about self-hosted IdPs?
+## Rung 2b - a self-hosted provisioning engine (free, local, no tenant)
 
-Authentik, Keycloak with a SCIM plugin, and similar can act as SCIM clients
-against your endpoint. Be clear about what that buys you: they validate **RFC
-7643/7644 spec compliance**, not **Entra compatibility**. They send textbook
-SCIM, never the quirks above - which are already covered by rung 1. For this
-implementation they add little over rungs 1-3.
+**This is the only rung that puts a real provisioning engine in front of the
+endpoint, and it costs nothing.** An earlier version of this page said
+self-hosted IdPs "add little over rungs 1-3". That was wrong, and running one
+proved it.
+
+You need a SCIM **client** - something that pushes to your endpoint. Many
+self-hostable IdPs implement SCIM in the other direction (accepting provisioning
+into themselves), which is useless here; Zitadel is the common trap.
+
+| Option | Verdict |
+|---|---|
+| **Authentik** | Best choice. Native outbound SCIM provider, Docker Compose, free. Verified working against this implementation. |
+| **midPoint** (Evolveum) | Heavier identity-governance tool with a SCIM connector. Closest to enterprise reconciliation behaviour, much bigger to stand up. |
+| **Keycloak** | No outbound SCIM in core; depends on third-party plugins of varying maturity. |
+| Zitadel | SCIM server, not client. Cannot drive your endpoint. |
+
+### What a run against Authentik established
+
+Verified 2026-08-09 against a local Vaultwarden on this branch: **46 SCIM
+requests, zero 4xx, zero 5xx, zero server errors, and no code changes.**
+
+It drove the full lifecycle unprompted, on its own sync schedule:
+
+- `GET /ServiceProviderConfig` - it reads discovery before provisioning, which
+  the rung-1 tests treat as an endpoint rather than a dependency.
+- `GET /Users?filter=userName eq ...` - the existence probe.
+- `POST /Users`, then `PUT /Users/<id>` on later cycles. Worth noting: it
+  **updates with PUT, not PATCH**, so the full-replace path carries real traffic
+  rather than only test traffic.
+- `POST /Groups` and `PATCH /Groups/<id>` for member sync.
+- Deprovisioning via `active: false`. It never issued a single `DELETE` - the
+  same soft-delete convention Entra, Okta and Google use.
+
+The revoke/restore round trip behaved exactly as designed, and this is the part
+worth checking yourself if you change that code: deactivating a user in the
+directory left the membership row **present** with `status = -128` - the
+revoked-Invited offset - and its `akey` intact. Reactivating returned it to
+`status = 0`. Nothing was destroyed at any point, so a returning employee needs
+no re-confirmation.
+
+### What it did NOT establish
+
+Being precise, because the temptation is to over-read a green run:
+
+- **Not vendor compatibility.** Authentik sends textbook SCIM. It will never
+  produce Entra's `"Replace"` casing or string booleans, or Okta's path-less
+  deactivate. Those stay rung-1's job.
+- **Not concurrency.** Three users and one group is too small to make Authentik
+  parallelise, so the check-then-act races (last-owner revoke, externalId
+  uniqueness) were not stressed. Forcing that needs a directory large enough to
+  batch - a few hundred users - and is the obvious next experiment for anyone
+  who wants to close that gap.
+
+### Standing one up
+
+```bash
+curl -fsSL -o docker-compose.yml https://goauthentik.io/docker-compose.yml
+# set PG_PASS, AUTHENTIK_SECRET_KEY, AUTHENTIK_BOOTSTRAP_PASSWORD/TOKEN in .env
+docker compose up -d
+```
+
+Then create a SCIM provider pointing at
+`http://host.docker.internal:8000/scim/v2/<org_uuid>` with your bearer token,
+bind it to an application, and assign users. On Docker Desktop
+`host.docker.internal` is how the container reaches a Vaultwarden running on the
+host; on Linux use the host's bridge address or run both in one network.
+
+A shortcut for the endpoint side: the SCIM guard only needs an `organizations`
+row and a `scim_api_key` row holding the sha256 of your secret, so you can seed
+those directly with `sqlite3` and skip creating an account and organisation
+through the web vault entirely.
 
 ---

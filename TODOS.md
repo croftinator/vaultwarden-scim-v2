@@ -55,6 +55,18 @@ from a real tenant. docs/scim/providers.md says so in its support table, so
 The cheapest independent check remains Microsoft's hosted SCIM Validator, which
 tests SCIM 2.0 conformance generally despite the name and needs no tenant.
 
+**Partially closed 2026-08-09 - one engine has now actually run.** Authentik
+(self-hosted, free, Docker) was stood up locally against this branch and drove a
+full provisioning lifecycle: 46 SCIM requests, zero 4xx/5xx, no code changes.
+Discovery, the existence probe, POST-then-PUT user updates, group creation and
+member sync, deprovision via `active:false`, and the revoke/restore round trip
+with the membership row surviving at `status = -128` with its `akey` intact.
+
+That closes the "no provisioning engine has ever driven this" gap, though not
+the vendor-quirk or concurrency ones - three users is too small to make Authentik
+parallelise, so the check-then-act races were not stressed. Details and a
+reproduction recipe are in docs/scim/testing.md under "Rung 2b".
+
 **Made cheaper 2026-08-09.** `tools/scim-replay.sh` now takes
 `--profile entra|okta|aws|google`, swapping the create payload and deactivation
 form for that engine's documented shape, so one deployment can be validated
