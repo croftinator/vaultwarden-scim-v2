@@ -210,7 +210,30 @@ impl Organization {
             "useGroups": CONFIG.org_groups_enabled(),
             "useTotp": true,
             "usePolicies": true,
-            "useScim": CONFIG.scim_enabled(), // Implemented in this fork; see src/api/scim
+            // Left false even though this fork DOES implement SCIM, because the
+            // flag drives the web vault's UI and not its own endpoints.
+            //
+            // Verified against the pinned web-vault build (the digest in
+            // Dockerfile), not assumed: `canManageScim` is
+            // `(isAdmin || permissions.manageScim) && useScim`, and it gates a
+            // side-nav item pointing at `settings/scim`. That route is NOT
+            // registered in the bundle - zero occurrences of `{path:"scim"}` -
+            // because upstream hardcodes the flag false, so the page is dead
+            // code the build strips while the nav entry survives in shared
+            // library code. Setting this true therefore adds a "SCIM" link that
+            // leads nowhere.
+            //
+            // Even with the page present it could not work: the vault builds its
+            // SCIM URL from `urls.scim`, which is set to null for the SelfHosted
+            // region, and the only SCIM hosts it knows are scim.bitwarden.com
+            // and its EU/gov siblings. It has no way to reach this fork's
+            // /api/organizations/<id>/scim/api-key.
+            //
+            // Provisioning is driven by the documented flow in
+            // docs/scim/setup.md Part B instead. Precedent is one line up:
+            // `useDirectory` is likewise reported false while being supported.
+            // Revisit if the web vault ever ships a self-hosted SCIM page.
+            "useScim": false,
             "useSso": false, // Not supported
             "useKeyConnector": false, // Not supported
             "usePasswordManager": true,
@@ -495,7 +518,30 @@ impl Membership {
             "useEvents": CONFIG.org_events_enabled(),
             "useGroups": CONFIG.org_groups_enabled(),
             "useTotp": true,
-            "useScim": CONFIG.scim_enabled(), // Implemented in this fork; see src/api/scim
+            // Left false even though this fork DOES implement SCIM, because the
+            // flag drives the web vault's UI and not its own endpoints.
+            //
+            // Verified against the pinned web-vault build (the digest in
+            // Dockerfile), not assumed: `canManageScim` is
+            // `(isAdmin || permissions.manageScim) && useScim`, and it gates a
+            // side-nav item pointing at `settings/scim`. That route is NOT
+            // registered in the bundle - zero occurrences of `{path:"scim"}` -
+            // because upstream hardcodes the flag false, so the page is dead
+            // code the build strips while the nav entry survives in shared
+            // library code. Setting this true therefore adds a "SCIM" link that
+            // leads nowhere.
+            //
+            // Even with the page present it could not work: the vault builds its
+            // SCIM URL from `urls.scim`, which is set to null for the SelfHosted
+            // region, and the only SCIM hosts it knows are scim.bitwarden.com
+            // and its EU/gov siblings. It has no way to reach this fork's
+            // /api/organizations/<id>/scim/api-key.
+            //
+            // Provisioning is driven by the documented flow in
+            // docs/scim/setup.md Part B instead. Precedent is one line up:
+            // `useDirectory` is likewise reported false while being supported.
+            // Revisit if the web vault ever ships a self-hosted SCIM page.
+            "useScim": false,
             "usePolicies": true,
             "useApi": true,
             "selfHost": true,

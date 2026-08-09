@@ -464,7 +464,36 @@ rotation worker
 **Depends on:** Live Entra tenant validation (PIM for Groups needs a tenant to
 verify sync latency against)
 
-### BLOCKED: confirm the web vault does not surface dead SCIM controls
+### CLOSED 2026-08-09: the web vault DID surface a dead SCIM control
+
+**Resolved by inspecting the pinned web-vault image** rather than waiting for a
+browser session. The blocker below said the web-vault directory is a gitignored
+download and cannot be inspected from source - true, but it is also a Docker
+image pinned by digest in the Dockerfile, so `docker create` plus `docker cp`
+gets the exact bundle that ships.
+
+**Finding: setting the flag true adds a SCIM link that leads nowhere.**
+
+- `canManageScim` is `(isAdmin || permissions.manageScim) && useScim`, and it
+  gates a side-nav item whose route is `settings/scim`.
+- That route is **not registered**: zero occurrences of `{path:"scim"}` in the
+  bundle. Upstream hardcodes the flag false, so the settings page is dead code
+  the build strips - but the nav entry lives in shared library code and survives,
+  gated only on the flag.
+- Even with the page present it could not work. The vault builds its SCIM URL
+  from `urls.scim`, which is set to **null** for the SelfHosted region, and the
+  only SCIM hosts in the bundle are scim.bitwarden.com and its EU/gov siblings.
+  It has no way to reach this fork's `/api/organizations/<id>/scim/api-key`.
+
+**Action taken:** both lines reverted to `"useScim": false`, with the evidence
+recorded in the code comment so the next person does not have to redo this.
+Provisioning stays on the documented flow in docs/scim/setup.md Part B. Revisit
+only if the web vault ships a self-hosted SCIM page.
+
+**Effort:** S **(done)**
+**Priority:** ~~P1~~ closed
+
+### Superseded: the original blocked item
 
 **What:** `Organization::to_json` and `Membership::to_json` now report
 `"useScim": CONFIG.scim_enabled()` where upstream hardcoded `false`. Load the
