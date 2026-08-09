@@ -339,7 +339,7 @@ status=$(req GET "$BASE/Users/00000000-dead-beef-0000-000000000000")
 expect "unknown member id is 404" "$status" 404
 body_unknown="$(cat "$BODY_FILE")"
 # A malformed id fails Rocket's param guard before any handler. It must still
-# come back as a SCIM envelope - a default HTML error page would be unparseable
+# come back as a SCIM envelope - a default HTML error page would be unparsable
 # for a SCIM client. (This check caught exactly that bug.)
 status=$(req GET "$BASE/Users/not-a-uuid-at-all")
 expect "malformed id is a SCIM-enveloped 400, not an HTML page" "$status" 400 '.scimType' 'invalidValue'

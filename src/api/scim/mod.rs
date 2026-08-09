@@ -301,7 +301,7 @@ impl<'r, T: DeserializeOwned> FromData<'r> for ScimJson<T> {
         match serde_json::from_slice::<T>(&bytes) {
             Ok(value) => DataOutcome::Success(ScimJson(value)),
             Err(e) => {
-                warn!(target: "scim", "Rejecting unparseable SCIM body: {e}");
+                warn!(target: "scim", "Rejecting unparsable SCIM body: {e}");
                 DataOutcome::Error((Status::BadRequest, ScimError::bad_request("invalidSyntax", "Malformed SCIM body")))
             }
         }

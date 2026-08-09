@@ -16,15 +16,35 @@ Design rationale for individual decisions lives in
 cannot run one in Docker. What you can do is test in rungs of increasing cost,
 and only the last one needs a tenant.
 
-## Rung 1 - the test suite (seconds, no setup)
+## What the suite contains
+
+`cargo test --features sqlite` builds 187 tests. 158 are SCIM's; the other 29
+are upstream's and are unrelated to this feature.
+
+| Where | Count | What it covers |
+|---|---|---|
+| `src/api/scim/tests/mod.rs` | 121 | End-to-end over HTTP through the real Rocket router and a real database |
+| `src/api/scim/patch.rs` | 20 | The PATCH parser: op casing, string booleans, path-less values, member filters |
+| `src/api/scim/filter.rs` | 4 | The `eq` filter parser, including a 20,000-case fuzz pass |
+| `src/api/scim/error.rs` | 4 | Every error is a well-formed SCIM envelope with the RFC-sanctioned status |
+| `src/api/scim/users.rs` | 3 | The revocation-offset predicates, in isolation from HTTP |
+| `src/api/scim/guard.rs` | 3 | Bearer token parsing and its rejection shapes |
+| `src/api/scim/models.rs` | 3 | Entra's boolean coercion and displayName composition |
+
+The integration tests are the load-bearing ones. They drive real HTTP requests
+at the real router, with a real database underneath and real migrations applied,
+so a test passing means the endpoint works rather than that a function returns
+what it was told to. Mail is intercepted by an in-process sink, so nothing can
+leave the machine even though the suite runs with mail enabled.
+
+## Rung 1 - the suite on SQLite (seconds, no setup)
 
 ```bash
 cargo test --features sqlite
 ```
 
-Runs the real Rocket router against a temporary SQLite database in-process.
-Mail is intercepted by an in-process sink, so no message can leave the machine
-even though the suite runs with mail enabled.
+SQLite needs no server: its URL is derived from a hermetic `DATA_FOLDER` created
+per run. This is the fast loop and what you run constantly.
 
 ## Rung 1b - every backend (minutes, needs Docker)
 
@@ -34,13 +54,50 @@ tools/scim-test-backends.sh postgresql      # just one
 ```
 
 Three dialects ship and they genuinely differ - upsert semantics, foreign-key
-enforcement, timestamp precision and default collation case-sensitivity. This
-starts MySQL 8 and PostgreSQL 16 in Docker, migrates each from scratch, runs the
-suite, and tears them down. A green SQLite run says nothing about the other two.
-These tests encode Entra's actual quirks - `"Replace"` op casing, string
-booleans, path-less value objects, `members[value eq "..."]` removal - so they
-are a closer stand-in for Entra than any generic SCIM tool. Run this first and
-after every change.
+enforcement, timestamp precision, default collation case-sensitivity, and how
+much of an index key they will accept. A green SQLite run says nothing about the
+other two, and the migrations in particular are per-dialect: a failure there
+leaves the server unable to start at all, because migrations run at pool
+construction before Rocket listens.
+
+The script starts MySQL 8 and PostgreSQL 16 in Docker, applies the migrations
+from scratch, runs the suite, and tears the containers down.
+
+### Running one backend by hand
+
+The script is a convenience, not a requirement. Any reachable server works, and
+the suite decides which backend to use from `DATABASE_URL`:
+
+```bash
+docker run -d --name vw-pg -e POSTGRES_HOST_AUTH_METHOD=trust \
+    -e POSTGRES_DB=vaultwarden -p 5432:5432 postgres:16
+
+DATABASE_URL="postgresql://postgres@127.0.0.1:5432/vaultwarden" \
+    cargo test --no-default-features --features postgresql
+```
+
+On macOS the client libraries are keg-only, so a build against MySQL or
+PostgreSQL needs their paths exported first - `require_client_lib` in
+`tools/scim-test-backends.sh` shows exactly which variables, and is easier to
+copy than to rediscover.
+
+### When a backend has no server
+
+Every test in the module needs a connection, so without one they would all fail
+for the same uninteresting reason. Instead the suite skips itself and says so:
+
+```
+SKIP: this backend needs a live server. Run tools/scim-test-backends.sh, or set DATABASE_URL.
+```
+
+You get one clear line instead of 117 panics burying whatever you were working
+on. The tell is the clock: a real run takes 15 seconds, a skipped one takes 1.
+
+Rust's harness has no runtime "skipped" state, so those skips are counted as
+passes - which would be a green build that verified nothing. `SCIM_TESTS_REQUIRE_DB`
+exists for that: when set, a missing database is a hard failure instead of a
+skip. CI sets it (see below), so nobody can accidentally ship a step that passes
+by testing nothing.
 
 ## Rung 1c - other server configurations (seconds)
 
@@ -57,6 +114,69 @@ a different environment.
 Worth knowing: the `SSO_ONLY` test cross-checks the value it requested against
 what `CONFIG` reports, so if the override ever stops working the pass fails
 loudly instead of quietly testing the same branch twice.
+
+## What CI runs
+
+`.github/workflows/build.yml` runs the suite on every push and pull request,
+across two toolchains (the pinned `rust-toolchain` version and the declared
+MSRV) and six feature combinations. All three backends are covered for real:
+
+| Step | Database |
+|---|---|
+| `sqlite,mysql,postgresql,enable_mimalloc,s3` | SQLite (no `DATABASE_URL` set) |
+| `sqlite,mysql,postgresql,enable_mimalloc` | SQLite |
+| `sqlite,mysql,postgresql` | SQLite |
+| `sqlite` | SQLite |
+| `mysql` | **MySQL 8 service container** |
+| `postgresql` | **PostgreSQL 16 service container** |
+
+The combined steps exercise SQLite because no `DATABASE_URL` is set and that is
+what Vaultwarden falls back to; the two single-backend steps each get a service
+container and a `DATABASE_URL` pointing at it. Applying the migrations against a
+real server on every run is half the point - the SCIM migrations differ per
+dialect and no SQLite run can catch a fault in them.
+
+The containers are password-less on purpose. They are ephemeral, bound to the
+runner's localhost, and destroyed with it, so there is no credential to protect
+and no connection-string-shaped literal in the repository for a secret scanner
+to trip over.
+
+`SCIM_TESTS_REQUIRE_DB` is set for the whole job, so if a container fails to
+start or a `DATABASE_URL` stops reaching a step, the build goes red instead of
+skipping its way to a green that proved nothing.
+
+CI does **not** run rungs 2 to 4: they need a deployed instance or a tenant.
+
+## Adding a test
+
+Two conventions, both load-bearing:
+
+**Take the guard, not the lock.** Start every integration test with:
+
+```rust
+let _guard = scim_test_guard!();
+```
+
+not `TEST_LOCK.lock().await`. The macro takes the same lock - the tests share one
+database and must not interleave - and additionally skips when the backend has
+no server, which is what keeps a MySQL run on a laptop from producing 117
+identical panics.
+
+**Prove the test can fail.** A test that passes against the bug it is meant to
+catch is worse than no test, because it reports safety it never verified. Before
+committing, break the thing deliberately and watch it go red:
+
+```bash
+# comment out the guard, or invert the condition, then:
+cargo test --features sqlite the_name_of_your_test
+```
+
+Then restore it. Several tests in this suite exist because that step failed:
+`an_unmanaged_group_cannot_be_deleted_through_scim` returned 204 without its
+guard, and `post_groups_refuses_a_blank_or_missing_display_name` returned 201.
+Where a test asserts a refusal, add the matching control that proves the
+operation succeeds when it should - otherwise "refused" is equally explained by
+the whole path being broken.
 
 ## Rung 2 - replay Entra's requests at a running server
 

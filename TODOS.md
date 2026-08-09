@@ -379,7 +379,7 @@ dimension (`SSO_ONLY`); add rows as more appear.
 **Done:** `last_used_at` on `scim_api_key`
 (`2026-07-26-000003_add_scim_api_key_last_used`), written by the guard only
 after the secret verifies and rate-limited to one write per hour per org so a
-full sync does not become thousands of UPDATEs. Surfaced as `lastUsedAt` on
+full sync does not become thousands of UPDATE statements. Surfaced as `lastUsedAt` on
 `GET .../scim/status`, and reset on rotation so a new credential never inherits
 the old one's activity. The `enabled` flag is now wired to
 `PUT .../scim/api-key/enabled` (Owner + password/OTP) as a reversible kill

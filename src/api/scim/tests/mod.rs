@@ -11,6 +11,30 @@
 // Tests that build a rocket + database serialize on TEST_LOCK: the sqlite
 // file and the CONFIG global are shared process state.
 //
+// Backends: these run against whatever DATABASE_URL names, not only sqlite.
+// `tools/scim-test-backends.sh` runs all three locally, and CI gives the
+// mysql and postgresql steps a service container each. The three dialects
+// genuinely disagree - upsert semantics, foreign-key enforcement, collation
+// case-sensitivity, and how much of an index key they accept - and the
+// migrations are written per dialect, so a fault there can leave the server
+// unable to start. A green sqlite run does not speak for the other two.
+//
+// TWO CONVENTIONS FOR NEW TESTS. Both exist because they were learned the
+// hard way; full rationale in docs/scim/testing.md.
+//
+// 1. Open with `let _guard = scim_test_guard!();`, never
+//    `TEST_LOCK.lock().await` directly. The macro takes the same lock and
+//    additionally skips when the backend has no server, which is what turns
+//    "117 identical panics" into one actionable line.
+//
+// 2. Prove the test can fail before committing it. Break the guard or invert
+//    the condition it covers, watch the test go red, then restore it. A test
+//    that passes against the bug it exists to catch is worse than no test,
+//    because it reports safety it never verified - two tests here were caught
+//    doing exactly that. Where a test asserts a refusal, add the control that
+//    proves the operation still succeeds when it should, or "refused" is
+//    equally explained by the whole path being broken.
+//
 use std::sync::LazyLock;
 
 use rocket::{
@@ -1632,7 +1656,7 @@ async fn scim_can_deprovision_an_administrator_but_never_reinstate_one() {
         assert_privileged_refusal(response, "patch active:true", label).await;
         assert_eq!(member_status(&conn, &member, &org).await, -126, "membership type {label} must remain revoked");
 
-        // Still readable, so a mis-assignment surfaces as a clear per-user
+        // Still readable, so a misassignment surfaces as a clear per-user
         // error rather than a create loop on an address that already exists.
         let response = client.get(format!("/scim/v2/{org}/Users/{member}")).header(bearer(&token)).dispatch().await;
         assert_eq!(response.status(), Status::Ok, "membership type {label} must stay readable");
@@ -3772,7 +3796,7 @@ async fn every_emitted_scim_type_reaches_the_wire_with_its_rfc_status() {
     let (auth, ct, body) = scim_body(&token, &patch);
     let response =
         client.patch(format!("/scim/v2/{org}/Users/{member}")).header(auth).header(ct).body(body).dispatch().await;
-    assert_eq!(error_envelope(response).await, (400, String::from("invalidPath")), "unparseable PATCH path");
+    assert_eq!(error_envelope(response).await, (400, String::from("invalidPath")), "unparsable PATCH path");
 
     // noTarget - a remove whose filter selects nothing addressable.
     let patch = json!({
@@ -3814,7 +3838,7 @@ async fn every_emitted_scim_type_reaches_the_wire_with_its_rfc_status() {
 // Both take attacker-influenced strings straight off the wire: the filter
 // parser from a query parameter, the PATCH path parser from a request body.
 // Neither may panic, and neither may accept something it cannot faithfully
-// represent - a parser that silently mis-parses a filter returns the wrong
+// represent - a parser that silently misparses a filter returns the wrong
 // members, which is a data-disclosure bug rather than a parsing bug.
 //
 // The generator is a fixed-seed LCG rather than a fuzzing crate: no new
@@ -3908,7 +3932,7 @@ const FRAGMENTS: &[&str] = &[
 // quotes. A parser that accepts `a eq "x" or 1=1` and reports attribute `a`
 // would be silently dropping the injected tail.
 #[test]
-fn filter_parser_never_panics_and_never_mis_parses() {
+fn filter_parser_never_panics_and_never_misparses() {
     let mut rng = Lcg(0x5EED_1234);
     let mut accepted = 0_u32;
 
