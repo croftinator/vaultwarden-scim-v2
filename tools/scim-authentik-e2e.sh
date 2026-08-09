@@ -100,8 +100,24 @@ for i in $(seq 1 60); do
     [ "$code" = "200" ] || [ "$code" = "204" ] && { printf ' ready (%ss)\n' "$((i*5))"; break; }
     printf '.'; sleep 5
 done
-curl -s -o /dev/null -w '' "$AK_URL/-/health/ready/" || { echo; bad "Authentik never became ready"; exit 1; }
+curl -s -o /dev/null "$AK_URL/-/health/ready/" || { echo; bad "Authentik never became ready"; exit 1; }
 ok "Authentik is up"
+
+# health/ready reflects the SERVER. The bootstrap token is created by the
+# WORKER's startup task and lands a little later, so the API can be reachable
+# and still reject it. Locally that gap is hidden by however long you take to do
+# the next thing; in CI the next thing is immediate, and the first API call
+# failed with a bare KeyError. Poll until the token actually authenticates.
+printf '  waiting for the bootstrap token'
+AUTHED=0
+for i in $(seq 1 40); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $AK_TOKEN" "$AK_URL/api/v3/core/users/?page_size=1")"
+    [ "$code" = "200" ] && { AUTHED=1; printf ' ready (%ss)\n' "$((i*5))"; break; }
+    printf '.'; sleep 5
+done
+[ "$AUTHED" -eq 1 ] && ok "API authenticates with the bootstrap token" \
+                    || { printf '\n'; bad "bootstrap token never became usable"; exit 1; }
 
 api() { # api <METHOD> <PATH> [BODY]
     local m="$1" p="$2" b="${3:-}"
@@ -117,14 +133,22 @@ api() { # api <METHOD> <PATH> [BODY]
 sect "2. Point Authentik at Vaultwarden"
 # ---------------------------------------------------------------------------
 MAPS="$(api GET '/propertymappings/provider/scim/?page_size=20')"
-UMAP="$(printf '%s' "$MAPS" | python3 -c "
+pick_map() { # pick_map <substring>
+    printf '%s' "$MAPS" | python3 -c "
 import json,sys
-for r in json.load(sys.stdin)['results']:
-    if 'User' in r['name']: print(r['pk']); break")"
-GMAP="$(printf '%s' "$MAPS" | python3 -c "
-import json,sys
-for r in json.load(sys.stdin)['results']:
-    if 'Group' in r['name']: print(r['pk']); break")"
+try:
+    d = json.load(sys.stdin)
+except Exception as e:
+    print('PARSE_ERROR', e, file=sys.stderr); raise SystemExit(1)
+if 'results' not in d:
+    print('UNEXPECTED_RESPONSE', json.dumps(d)[:200], file=sys.stderr); raise SystemExit(1)
+for r in d['results']:
+    if '$1' in r['name']:
+        print(r['pk']); break
+"
+}
+UMAP="$(pick_map User)"
+GMAP="$(pick_map Group)"
 [ -n "$UMAP" ] && ok "found the default SCIM property mappings" || bad "no SCIM property mappings"
 
 PROV="$(api POST '/providers/scim/' "{\"name\":\"Vaultwarden\",
