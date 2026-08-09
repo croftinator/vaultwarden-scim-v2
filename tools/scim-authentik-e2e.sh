@@ -27,9 +27,12 @@
 #             cannot resolve "localhost" to your host: use
 #             host.docker.internal on Docker Desktop, or 172.17.0.1 on Linux.
 #   --db      Asserts revoke PRESERVED the membership row and its akey rather
-#             than deleting it - the invariant the whole design rests on. If
-#             given, sqlite3 must be present: a silently skipped invariant check
-#             is worse than a missing one, because the run still reports green.
+#             than deleting it - the invariant the whole design rests on. Takes
+#             either a sqlite FILE PATH or a postgresql:// URL, and the matching
+#             client (sqlite3 or psql) must be present: a silently skipped
+#             invariant check is worse than a missing one, because the run still
+#             reports green. The assertions themselves are the same either way -
+#             the SQL is dialect-neutral, only the client differs.
 #   --keep    Leave the Authentik stack running for inspection.
 #
 # Requires: docker (with compose), curl, python3. Exit 0 if every check passed.
@@ -74,13 +77,55 @@ done
 [ -n "$DOMAIN" ] && [ -n "$ORG_ID" ] && [ -n "$SCIM_TOKEN" ] || {
     echo "ERROR: --domain, --org and a SCIM_TOKEN are all required (see --help)" >&2; exit 2; }
 # --db is a promise that the database invariants WILL be asserted. Skipping them
-# because sqlite3 happens to be missing, and still exiting 0, is the failure
-# this whole harness exists to avoid.
+# because a client happens to be missing, and still exiting 0, is the failure
+# this whole harness exists to avoid. That applies equally to both backends, so
+# the reachability check below is not a formality: an unreachable PostgreSQL
+# would otherwise turn every invariant assertion into an empty string, and an
+# empty string compares unequal to the sentinel, which reads as a real failure
+# rather than as a missing database.
+DB_KIND=""
+PSQL=""
 if [ -n "$DB_PATH" ]; then
-    command -v sqlite3 >/dev/null 2>&1 || {
-        echo "ERROR: --db was given but sqlite3 is not installed; the invariant checks cannot run" >&2; exit 2; }
-    [ -f "$DB_PATH" ] || { echo "ERROR: no database at $DB_PATH" >&2; exit 2; }
+    case "$DB_PATH" in
+        postgresql://*|postgres://*)
+            DB_KIND=postgresql
+            # Homebrew's libpq is keg-only, so psql is installed but not on
+            # PATH - indistinguishable from absent unless you go looking.
+            if command -v psql >/dev/null 2>&1; then
+                PSQL="psql"
+            else
+                for _p in /opt/homebrew/opt /usr/local/opt; do
+                    [ -x "$_p/libpq/bin/psql" ] && { PSQL="$_p/libpq/bin/psql"; break; }
+                done
+            fi
+            [ -n "$PSQL" ] || {
+                echo "ERROR: --db is a PostgreSQL URL but psql was not found; the invariant checks cannot run" >&2
+                echo "       macOS:  brew install libpq   (keg-only; this script finds it there)" >&2
+                echo "       Debian: apt install postgresql-client" >&2
+                exit 2; }
+            "$PSQL" "$DB_PATH" -v ON_ERROR_STOP=1 -tAqc 'SELECT 1' >/dev/null 2>&1 || {
+                echo "ERROR: cannot reach the database at the given --db URL" >&2; exit 2; }
+            ;;
+        *)
+            DB_KIND=sqlite
+            command -v sqlite3 >/dev/null 2>&1 || {
+                echo "ERROR: --db was given but sqlite3 is not installed; the invariant checks cannot run" >&2; exit 2; }
+            [ -f "$DB_PATH" ] || { echo "ERROR: no database at $DB_PATH" >&2; exit 2; }
+            ;;
+    esac
 fi
+
+# One entry point for both dialects. Every statement this harness runs is plain
+# SELECT/UPDATE with a join and a LIKE, so nothing below needs a per-dialect
+# variant - and `psql -tA` emits bare unpadded values exactly as sqlite3 does,
+# which is what lets the string comparisons on akey and status stay identical.
+db() {
+    if [ "$DB_KIND" = "postgresql" ]; then
+        "$PSQL" "$DB_PATH" -v ON_ERROR_STOP=1 -tAqc "$1"
+    else
+        sqlite3 "$DB_PATH" "$1"
+    fi
+}
 
 PASS=0; FAIL=0
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
@@ -303,12 +348,12 @@ sect "4. Deprovision (the highest-value path)"
 # design), so the harness writes it directly.
 AKEY_SENTINEL="SENTINEL-WRAPPED-ORG-KEY-$$"
 if [ -n "$DB_PATH" ]; then
-    sqlite3 "$DB_PATH" "
+    db "
       UPDATE users_organizations
       SET akey='$AKEY_SENTINEL', status=2
       WHERE user_uuid IN (SELECT uuid FROM users WHERE email LIKE 'ak.alice%');" \
       || { bad "could not seed the confirmed membership"; exit 1; }
-    seeded="$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM users_organizations uo
+    seeded="$(db "SELECT COUNT(*) FROM users_organizations uo
               JOIN users u ON u.uuid=uo.user_uuid
               WHERE u.email LIKE 'ak.alice%' AND uo.akey='$AKEY_SENTINEL' AND uo.status=2;")"
     [ "${seeded:-0}" -eq 1 ] || { bad "the confirmed membership did not seed"; exit 1; }
@@ -337,12 +382,12 @@ done
 # previous `akey IS NOT NULL` was true for every row that existed - it restated
 # the row-count check above it and could not detect akey loss of any kind.
 if [ -n "$DB_PATH" ]; then
-    rows="$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM users_organizations uo
+    rows="$(db "SELECT COUNT(*) FROM users_organizations uo
             JOIN users u ON u.uuid=uo.user_uuid WHERE u.email LIKE 'ak.%';")"
     [ "${rows:-0}" -eq 3 ] && ok "all three membership rows survived (revoke, not delete)" \
                            || bad "expected 3 membership rows, found ${rows:-0}"
 
-    akey_now="$(sqlite3 "$DB_PATH" "SELECT uo.akey FROM users_organizations uo
+    akey_now="$(db "SELECT uo.akey FROM users_organizations uo
                 JOIN users u ON u.uuid=uo.user_uuid WHERE u.email LIKE 'ak.alice%';")"
     [ "$akey_now" = "$AKEY_SENTINEL" ] \
         && ok "the revoked member kept its wrapped org key byte for byte" \
@@ -353,7 +398,7 @@ if [ -n "$DB_PATH" ]; then
     # regression storing the MembershipStatus::Revoked sentinel (-1) instead of
     # applying ACTIVATE_REVOKE_DIFF (128) still reads as inactive. Confirmed (2)
     # must become exactly -126.
-    status_now="$(sqlite3 "$DB_PATH" "SELECT uo.status FROM users_organizations uo
+    status_now="$(db "SELECT uo.status FROM users_organizations uo
                   JOIN users u ON u.uuid=uo.user_uuid WHERE u.email LIKE 'ak.alice%';")"
     [ "$status_now" = "-126" ] \
         && ok "revoked-confirmed is stored as -126 (the 128 offset, not a sentinel)" \
@@ -384,13 +429,13 @@ done
 # the property the design actually promises: a returning employee needs no
 # re-confirmation because their wrapped org key was never touched.
 if [ -n "$DB_PATH" ]; then
-    akey_after="$(sqlite3 "$DB_PATH" "SELECT uo.akey FROM users_organizations uo
+    akey_after="$(db "SELECT uo.akey FROM users_organizations uo
                   JOIN users u ON u.uuid=uo.user_uuid WHERE u.email LIKE 'ak.alice%';")"
     [ "$akey_after" = "$AKEY_SENTINEL" ] \
         && ok "the reinstated member still holds the same wrapped org key" \
         || bad "reinstatement changed the akey: expected '$AKEY_SENTINEL', found '$akey_after'"
 
-    status_after="$(sqlite3 "$DB_PATH" "SELECT uo.status FROM users_organizations uo
+    status_after="$(db "SELECT uo.status FROM users_organizations uo
                     JOIN users u ON u.uuid=uo.user_uuid WHERE u.email LIKE 'ak.alice%';")"
     [ "$status_after" = "2" ] \
         && ok "restore returned the member to Confirmed, not to Invited" \

@@ -408,6 +408,76 @@ Being precise, because the temptation is to over-read a green run:
   batch - a few hundred users - and is the obvious next experiment for anyone
   who wants to close that gap.
 
+### Running it against PostgreSQL
+
+The run described above used SQLite. Nothing about the harness requires that,
+and a real deployment almost certainly will not - so the more representative
+run puts a real provisioning engine in front of a real database. Rung 1b already
+proves the dialects for the in-process suite; this is the same question one
+level up.
+
+Only the database moves. Authentik keeps its own PostgreSQL (it always had one,
+in `tools/authentik/docker-compose.yml`); this adds a second, separate instance
+for Vaultwarden, on port 15433 so it cannot collide with the throwaway container
+`tools/scim-test-backends.sh` starts on 15432.
+
+```bash
+docker compose -f tools/local-stack/docker-compose.yml up -d
+
+# macOS: libpq is keg-only, so the linker needs pointing at it
+export LIBRARY_PATH=/opt/homebrew/opt/libpq/lib:${LIBRARY_PATH:-}
+export PKG_CONFIG_PATH=/opt/homebrew/opt/libpq/lib/pkgconfig:${PKG_CONFIG_PATH:-}
+cargo build --profile ci --no-default-features --features postgresql
+
+PG='postgresql://vaultwarden:vwscim@127.0.0.1:15433/vaultwarden'
+# Honour CARGO_TARGET_DIR if it is set - a shared target directory is a common
+# local setting, and the binary is then not under ./target at all.
+VW="${CARGO_TARGET_DIR:-target}/ci/vaultwarden"
+
+# 0.0.0.0, not loopback: the Authentik containers have to reach it
+DATABASE_URL="$PG" tools/ci-seed-vaultwarden.sh /tmp/vw "$VW" 0.0.0.0 > /tmp/seed.env
+. /tmp/seed.env
+
+SCIM_TOKEN="$TOKEN" tools/scim-authentik-e2e.sh \
+    --domain http://host.docker.internal:8000 \
+    --org "$ORG" --db "$PG"
+```
+
+`--db` takes either a SQLite file path or a `postgresql://` URL, and the
+assertions are identical either way - every statement the harness runs is plain
+`SELECT`/`UPDATE` with a join and a `LIKE`, so only the client binary differs.
+It refuses to start if `psql` is missing or the URL is unreachable, for the same
+reason it refuses when `sqlite3` is missing: an invariant check that silently
+does not run, on a harness that still exits 0, is worse than no check at all.
+
+Two things this does **not** cover. `tools/scim-owner-race.sh` is still
+SQLite-only - it reads `vw-data/db.sqlite3` directly - so the last-owner
+concurrency race is unproven on PostgreSQL, which is the backend whose locking
+behaviour differs most and therefore the one where it would be most worth
+knowing. And the Authentik job in `provisioning-e2e.yml` still runs SQLite only;
+the PostgreSQL path above is a local run, not something CI does on a schedule.
+
+### Vaultwarden's own database, hands on
+
+The seeder writes an organization and a SCIM key straight into the database and
+turns the web vault off, which is right for CI and useless for looking around.
+For a browsable server on the same PostgreSQL, hand it the extra config and then
+follow Part B of [setup.md](setup.md) to register an Owner and mint a token the
+real way:
+
+```bash
+SEED_EXTRA_ENV='WEB_VAULT_ENABLED=true
+SMTP_HOST=127.0.0.1
+SMTP_PORT=1025
+SMTP_SECURITY=off
+SMTP_FROM=vaultwarden@example.com' \
+DATABASE_URL="$PG" tools/ci-seed-vaultwarden.sh /tmp/vw-ui "$VW" 0.0.0.0
+```
+
+Mailpit catches every invite at <http://localhost:8025>, so provisioned users
+can be fake addresses with no real mailboxes - the same trick the tunnel section
+above uses, just wired in by default here.
+
 ## Rung 2c - concurrency stress (the races the suite cannot reach)
 
 Two guards in this implementation are check-then-act: the last-owner revoke and

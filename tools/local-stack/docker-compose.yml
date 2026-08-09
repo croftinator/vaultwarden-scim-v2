@@ -1,0 +1,62 @@
+# Local supporting services for testing SCIM against a non-sqlite backend.
+#
+# Vaultwarden itself is NOT in here, deliberately. Building this fork as a
+# container image is a full Rust compile - twenty minutes before you can see
+# whether a one-line change worked - whereas `cargo build --features postgresql`
+# against an already-warm target tree is seconds. So the server runs on the
+# host and only its dependencies run in Docker.
+#
+# What this gives you that sqlite cannot: PostgreSQL's `ON CONFLICT` upsert
+# instead of MySQL's `replace_into`, real foreign-key enforcement without a
+# runtime PRAGMA, and timestamp precision and collation behaviour that differ
+# from sqlite's. tools/scim-test-backends.sh covers those for the in-process
+# suite; this file is what lets a real provisioning engine drive them.
+#
+# Usage:
+#   docker compose -f tools/local-stack/docker-compose.yml up -d
+#   docker compose -f tools/local-stack/docker-compose.yml down -v
+#
+# Ports are deliberately off the defaults so this cannot collide with a
+# PostgreSQL you actually care about, nor with tools/scim-test-backends.sh,
+# which uses 15432 for its own throwaway container.
+services:
+  postgresql:
+    image: docker.io/library/postgres:16.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${PG_PASS:-vwscim}
+      POSTGRES_USER: ${PG_USER:-vaultwarden}
+      POSTGRES_DB: ${PG_DB:-vaultwarden}
+    ports:
+      - "${PG_PORT:-15433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Probes the server rather than grepping the log: PostgreSQL's entrypoint
+      # runs a throwaway init server that logs "ready to accept connections"
+      # and then shuts down, so a log match is true well before the real server
+      # is listening. tools/scim-test-backends.sh documents the same trap.
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 10s
+      interval: 5s
+      retries: 10
+      timeout: 5s
+
+  # Invites are email-delivered, and so is the one-time code that Part B of
+  # docs/scim/setup.md uses to mint the SCIM token. Without SMTP a provisioned
+  # member is created but never told, which makes the hands-on path impossible
+  # to follow end to end. Mailpit accepts everything and shows it in a web UI,
+  # so nothing leaves the machine.
+  mailpit:
+    image: docker.io/axllent/mailpit:v1.21
+    restart: unless-stopped
+    ports:
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+
+volumes:
+  pgdata:
+    driver: local
