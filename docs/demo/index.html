@@ -67,7 +67,7 @@ sign-in and provisioning - the same shape as Microsoft Entra in a real deploymen
 (<a href="http://localhost:9000">http://localhost:9000</a>), Mailpit
 (<a href="http://localhost:8025">http://localhost:8025</a>), and a database client
 pointed at <code>127.0.0.1:15433</code>. You also need a <strong>second browser
-profile</strong> for step 7 - one browser cannot hold two Bitwarden sessions.
+profile</strong> for step 7 - one browser cannot hold two Bitwarden sessions, and Ada signs in there while you stay signed in as the Owner.
 </div>
 
 <h2>What you are looking at</h2>
@@ -94,7 +94,7 @@ not - proving SCIM syncs what it is scoped to and leaves the rest alone.</p>
 
   <li>
     <span class="where">Web vault</span>
-    <p class="do">Look at the vault items and the Acme Corp organization.</p>
+    <p class="do">Look at the vault items and the Example Corp organization.</p>
     <p class="why">Real encrypted data, written by a real client. None of it could have
     been inserted with SQL - the server never holds the key that would let it.</p>
     <div class="clip"></div>
@@ -102,11 +102,15 @@ not - proving SCIM syncs what it is scoped to and leaves the rest alone.</p>
 
   <li>
     <span class="where">Web vault</span>
-    <p class="do">Log out. Log back in using <em>Enterprise single sign-on</em>.</p>
-    <p class="why">Authentik authenticates you and Vaultwarden never sees the password.
-    Note what did <em>not</em> happen: SSO proved who you are, but your vault still
-    unlocked from a key derived in your browser. Authentication and decryption are
-    separate, which is the point people most often assume away.</p>
+    <p class="do">Note the <em>Enterprise single sign-on</em> button, but stay signed in as the Owner.</p>
+    <p class="why">The Owner exists <strong>only in Vaultwarden</strong> and has no
+    Authentik identity, so SSO cannot authenticate them - somebody has to hold the
+    organization key before anyone can be provisioned, and that person cannot
+    themselves come from the directory. SSO is demonstrated at step 7, as Ada, who
+    does come from the directory.</p>
+    <div class="warn">Signing in with SSO here authenticates you as whoever Authentik
+    knows - its own <code>akadmin</code>, if nothing else - and creates a stray
+    Vaultwarden account for that identity. Harmless, but not the demo.</div>
     <div class="clip"></div>
   </li>
 
@@ -141,11 +145,20 @@ ORDER BY u.email;</code></pre>
   </li>
 
   <li>
-    <span class="where">Mailpit + second browser profile</span>
-    <p class="do">Open Ada's invite, accept it as Ada, set a master password.</p>
-    <p><code>ada.lovelace@example.com</code> / <code>demo-master-password-2</code></p>
-    <p class="why">Only Ada can do this. Her status moves to <strong>Accepted</strong>
-    (<code>1</code>) - still no organization key, because she has not been given one.</p>
+    <span class="where">Second browser profile</span>
+    <p class="do">Go to the web vault as Ada and click <em>Enterprise single sign-on</em>.
+    Sign in at Authentik as <code>ada.lovelace</code> / <code>demo-sso-password-2</code>.</p>
+    <p class="why">Vaultwarden then shows <strong>Join organization - finish joining by
+    setting a master password</strong>. Set it to
+    <code>demo-master-password-2</code>.</p>
+    <p class="why">This is SSO and SCIM combining, and it is the most realistic moment
+    in the demo: SCIM had already created her membership, SSO proves she is Ada, and the
+    master password she sets now derives the vault key <em>in her browser</em>. Two
+    different credentials doing two different jobs - the Authentik password proves
+    identity, the master password unlocks data. Her status moves to
+    <strong>Accepted</strong> (<code>1</code>); she still has no organization key.</p>
+    <div class="note">The emailed invite in Mailpit is the alternative route to the same
+    place, for a member whose directory has no SSO. Either works.</div>
     <div class="clip"></div>
   </li>
 

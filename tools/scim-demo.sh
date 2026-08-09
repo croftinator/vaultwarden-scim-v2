@@ -151,6 +151,21 @@ for _ in $(seq 1 40); do
 done
 ok "Authentik ready at $AK_URL, blueprints applied"
 
+# Give the demo member a password so SSO can actually be DEMONSTRATED as her.
+#
+# The directory users are otherwise passwordless, which is right for the ones
+# that only ever get provisioned and deprovisioned. But the walkthrough signs in
+# as Ada over SSO, and that needs a real Authentik credential. The Owner
+# deliberately does NOT get one: they exist only in Vaultwarden, which is why
+# asking them to sign in via SSO cannot work - Authentik has never heard of them.
+ADA_PK="$(ak_api GET "/core/users/?username=ada.lovelace" \
+    | python3 -c "import json,sys;r=json.load(sys.stdin)['results'];print(r[0]['pk'] if r else '')")"
+if [ -n "$ADA_PK" ]; then
+    ak_api POST "/core/users/$ADA_PK/set_password/" \
+        "{\"password\":\"$DEMO_MEMBER_SSO_PASSWORD\"}" >/dev/null
+    ok "SSO password set for ada.lovelace"
+fi
+
 # ---------------------------------------------------------------------------
 say "3. Reset"
 # ---------------------------------------------------------------------------

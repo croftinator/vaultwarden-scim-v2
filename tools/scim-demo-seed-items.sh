@@ -87,12 +87,12 @@ add_login() {
 }
 
 printf '\033[1mSeeding the demo vault\033[0m\n'
-add_login "Acme AWS root"        "root@acme.example" "Aa1!demo-not-real-0001"
-add_login "Acme GitHub org"      "acme-bot"          "Aa1!demo-not-real-0002"
-add_login "Acme Grafana"         "admin"             "Aa1!demo-not-real-0003"
-add_login "Acme Jira"            "svc-jira"          "Aa1!demo-not-real-0004"
-add_login "Acme Postgres (prod)" "acme_app"          "Aa1!demo-not-real-0005"
-add_login "Acme SMTP relay"      "mailer"            "Aa1!demo-not-real-0006"
+add_login "Example AWS root"        "root@example.com" "Aa1!demo-not-real-0001"
+add_login "Example GitHub org"      "example-bot"          "Aa1!demo-not-real-0002"
+add_login "Example Grafana"         "admin"             "Aa1!demo-not-real-0003"
+add_login "Example Jira"            "svc-jira"          "Aa1!demo-not-real-0004"
+add_login "Example Postgres (prod)" "example_app"          "Aa1!demo-not-real-0005"
+add_login "Example SMTP relay"      "mailer"            "Aa1!demo-not-real-0006"
 
 # Read back through a fresh sync rather than trusting the writes: an item that
 # encrypts on the way out but does not decrypt on the way in is exactly the

@@ -66,10 +66,10 @@ flowchart TB
     subgraph ak["Authentik directory"]
         direction TB
         subgraph eng["Group: Engineering"]
-            ADA["Ada Lovelace<br/><i>taken to Confirmed</i>"]
+            ADA["Ada Lovelace<br/><i>confirmed, then deprovisioned</i>"]
             GRACE["Grace Hopper"]
             ALAN["Alan Turing"]
-            KATH["Katherine Johnson<br/><i>deprovisioning subject</i>"]
+            KATH["Katherine Johnson<br/><i>stays Invited: the -128 contrast</i>"]
         end
         subgraph con["Group: Contractors"]
             CHARLES["Charles Babbage<br/><i>never provisioned</i>"]
@@ -81,7 +81,7 @@ flowchart TB
     eng ==>|"SCIM sync"| ORG
     con -.->|"not in scope"| ORG
 
-    subgraph vw["Vaultwarden: Acme Corp"]
+    subgraph vw["Vaultwarden: Example Corp"]
         ORG["Organization members"]
     end
 
