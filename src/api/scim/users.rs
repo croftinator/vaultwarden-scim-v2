@@ -551,9 +551,10 @@ async fn update_external_id(
     // application. Re-read to tell the two causes apart and answer the race with
     // the same 409 the sequential case gets.
     if member.save(conn).await.is_err() {
-        if Membership::find_by_external_id_and_org(external_id, &token.org_uuid, conn).await.is_some_and(
-            |existing| existing.uuid != member.uuid,
-        ) {
+        if Membership::find_by_external_id_and_org(external_id, &token.org_uuid, conn)
+            .await
+            .is_some_and(|existing| existing.uuid != member.uuid)
+        {
             return Err(ScimError::conflict("uniqueness", "A member with this externalId already exists"));
         }
         return Err(ScimError::internal());
@@ -646,11 +647,7 @@ async fn precheck_active_change(
 // architectural decision rather than a local one. A single conditional UPDATE
 // does NOT close it: the two requests target different rows, so their row locks
 // never conflict and both snapshots still read the pre-revoke count.
-async fn reject_last_owner_revoke(
-    member: &Membership,
-    token: &ScimToken,
-    conn: &DbConn,
-) -> Result<(), ScimError> {
+async fn reject_last_owner_revoke(member: &Membership, token: &ScimToken, conn: &DbConn) -> Result<(), ScimError> {
     if member.atype == MembershipType::Owner
         && Membership::count_active_by_org_and_type(&token.org_uuid, MembershipType::Owner, conn).await <= 1
     {

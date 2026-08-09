@@ -47,12 +47,57 @@ jobs:
     # This is done globally to prevent rebuilds when the RUSTFLAGS env variable changes.
     env:
       RUSTFLAGS: "-Dwarnings"
+      # FORK ADDITION (SCIM). The SCIM suite skips itself when its backend has
+      # no database, so a developer without a server gets a clear skip instead
+      # of 117 panics. Rust has no runtime "skipped" state, so those skips count
+      # as passes - which in CI would be a step reporting success having tested
+      # nothing. This makes the skip an error here: if a service container fails
+      # to start, or DATABASE_URL stops reaching a step, the build goes red
+      # rather than green-but-empty. sqlite is unaffected, it needs no server.
+      SCIM_TESTS_REQUIRE_DB: "1"
     strategy:
       fail-fast: false
       matrix:
         channel:
           - "rust-toolchain" # The version defined in rust-toolchain
           - "msrv" # The supported MSRV
+
+    # FORK ADDITION (SCIM). Upstream needs no database to run its tests; this
+    # fork's SCIM suite does, and the single-backend steps below are the only
+    # place MySQL and PostgreSQL behaviour is exercised in CI. Without a live
+    # server those tests skip themselves, so the steps would go green having
+    # verified nothing - including the SCIM migrations, which each backend
+    # applies differently and which a failure would leave unstartable.
+    #
+    # Both containers are password-less on purpose. They are ephemeral, bound to
+    # the runner's localhost, and destroyed with it, so there is no credential to
+    # protect - and no connection-string-shaped literal in the repository for a
+    # secret scanner to flag.
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: vaultwarden
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: vaultwarden
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
 
     steps:
       # Install dependencies
@@ -147,15 +192,24 @@ jobs:
         run: |
           cargo test --profile ci --features sqlite
 
+      # FORK ADDITION (SCIM): DATABASE_URL points these two at the service
+      # containers declared above. Without it the SCIM suite skips itself and
+      # the step passes having tested nothing. Applying the embedded migrations
+      # against a real server is half the value here - the SCIM migrations
+      # differ per dialect, and a failure leaves the server unable to start.
       - name: "test features: mysql"
         id: test_mysql
         if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: mysql://root@127.0.0.1:3306/vaultwarden
         run: |
           cargo test --profile ci --features mysql
 
       - name: "test features: postgresql"
         id: test_postgresql
         if: ${{ !cancelled() }}
+        env:
+          DATABASE_URL: postgresql://postgres@127.0.0.1:5432/vaultwarden
         run: |
           cargo test --profile ci --features postgresql
       # End Run cargo tests

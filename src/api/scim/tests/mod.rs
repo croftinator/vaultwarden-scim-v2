@@ -27,8 +27,7 @@ use crate::{
         DbConn, DbPool,
         models::{
             Collection, CollectionGroup, Event, EventType, Group, GroupId, GroupUser, Membership, MembershipId,
-            MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationId, ScimApiKey,
-            User,
+            MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationId, ScimApiKey, User,
         },
     },
 };
@@ -38,6 +37,48 @@ use crate::{
 use test_support as _;
 
 static TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+// Whether this build can actually reach a database.
+//
+// sqlite derives its URL from the hermetic DATA_FOLDER, so it always can.
+// MySQL and PostgreSQL need a live server: `tools/scim-test-backends.sh` starts
+// one in Docker and exports DATABASE_URL.
+fn backend_is_runnable() -> bool {
+    cfg!(sqlite) || std::env::var("DATABASE_URL").is_ok()
+}
+
+// Takes the suite lock, or SKIPS the test when this backend has no server.
+//
+// A developer running `cargo test --features postgresql` without a server
+// should get a clear skip, not 117 panics burying whatever they were working
+// on. Real cross-backend verification needs a database, and this is the one
+// place that can tell the difference.
+//
+// The skip is deliberately NOT silent, and deliberately NOT trusted in CI.
+// Rust's harness has no runtime "skipped" state, so an early return counts as a
+// pass - which is exactly the false green this guard could otherwise create: a
+// step that reports success having verified nothing. `SCIM_TESTS_REQUIRE_DB`
+// closes that hole. CI sets it, so if a service container fails to start or
+// DATABASE_URL stops being passed, the suite fails loudly instead of skipping
+// its way to green.
+macro_rules! scim_test_guard {
+    () => {{
+        if !backend_is_runnable() {
+            assert!(
+                std::env::var("SCIM_TESTS_REQUIRE_DB").is_err(),
+                "SCIM_TESTS_REQUIRE_DB is set, but this backend has no database. \
+                 The CI service container did not start, or DATABASE_URL was not passed \
+                 to this step. Refusing to skip and report a green build."
+            );
+            eprintln!(
+                "SKIP: this backend needs a live server. Run tools/scim-test-backends.sh, \
+                 or set DATABASE_URL."
+            );
+            return;
+        }
+        TEST_LOCK.lock().await
+    }};
+}
 
 const SCIM_CONTENT_TYPE: &str = "application/scim+json";
 
@@ -123,7 +164,7 @@ async fn body_of(response: LocalResponse<'_>) -> String {
 
 #[rocket::async_test]
 async fn valid_token_reaches_discovery() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-authz-ok").await;
@@ -148,7 +189,7 @@ async fn valid_token_reaches_discovery() {
 
 #[rocket::async_test]
 async fn auth_failures_are_uniform_401s() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
 
@@ -221,7 +262,7 @@ async fn auth_failures_are_uniform_401s() {
 
 #[rocket::async_test]
 async fn minted_token_round_trips_and_rotation_kills_the_old_one() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-mint-org").await;
@@ -243,7 +284,7 @@ async fn minted_token_round_trips_and_rotation_kills_the_old_one() {
 
 #[rocket::async_test]
 async fn malformed_resource_id_is_scim_enveloped_not_html() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-malformed-id-org").await;
@@ -263,7 +304,7 @@ async fn malformed_resource_id_is_scim_enveloped_not_html() {
 
 #[rocket::async_test]
 async fn unknown_scim_route_is_scim_enveloped_404() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, _pool) = scim_client().await;
 
     let response = client.get("/scim/v2/some-org/Nope").dispatch().await;
@@ -331,7 +372,7 @@ fn parse_json(body: &str) -> Value {
 
 #[rocket::async_test]
 async fn post_creates_invited_user() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-post-org").await;
@@ -366,7 +407,7 @@ async fn post_creates_invited_user() {
 
 #[rocket::async_test]
 async fn post_existing_credentialed_user_becomes_accepted() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     // Accepted is only reachable when no invite mail will be sent AND the
     // account already has credentials to log in with. The hermetic environment
     // has mail enabled, so this branch has to opt out of it.
@@ -395,7 +436,7 @@ async fn post_existing_credentialed_user_becomes_accepted() {
 
 #[rocket::async_test]
 async fn post_duplicate_is_409_uniqueness() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-dup-org").await;
@@ -433,7 +474,7 @@ async fn post_duplicate_is_409_uniqueness() {
 
 #[rocket::async_test]
 async fn patch_active_lifecycle_hits_correct_status_offsets() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-patch-org").await;
@@ -492,7 +533,7 @@ async fn patch_active_lifecycle_hits_correct_status_offsets() {
 
 #[rocket::async_test]
 async fn delete_revokes_and_keeps_the_row() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-delete-org").await;
@@ -512,7 +553,7 @@ async fn delete_revokes_and_keeps_the_row() {
 
 #[rocket::async_test]
 async fn last_active_owner_cannot_be_revoked() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-owner-org").await;
@@ -539,7 +580,7 @@ async fn last_active_owner_cannot_be_revoked() {
 
 #[rocket::async_test]
 async fn filter_round_trip_and_enumeration_shape() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-filter-org").await;
@@ -584,7 +625,7 @@ async fn filter_round_trip_and_enumeration_shape() {
 
 #[rocket::async_test]
 async fn unknown_member_and_foreign_member_are_identical_404s() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org_a = seed_org(&conn, "scim-404-a").await;
@@ -610,7 +651,7 @@ async fn unknown_member_and_foreign_member_are_identical_404s() {
 
 #[rocket::async_test]
 async fn post_inactive_creates_revoked_membership() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-inactive-org").await;
@@ -633,7 +674,7 @@ async fn post_inactive_creates_revoked_membership() {
 
 #[rocket::async_test]
 async fn patch_unsupported_path_is_invalid_path() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-badpatch-org").await;
@@ -663,7 +704,7 @@ fn url_escape(raw: &str) -> String {
 
 #[rocket::async_test]
 async fn patch_displayname_rename_is_accepted_noop() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-rename-org").await;
@@ -687,7 +728,7 @@ async fn patch_displayname_rename_is_accepted_noop() {
 
 #[rocket::async_test]
 async fn patch_and_put_update_external_id_with_uniqueness() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-extid-org").await;
@@ -735,7 +776,7 @@ async fn patch_and_put_update_external_id_with_uniqueness() {
 
 #[rocket::async_test]
 async fn put_does_not_change_email_or_role() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-put-immutable-org").await;
@@ -759,7 +800,7 @@ async fn put_does_not_change_email_or_role() {
 
 #[rocket::async_test]
 async fn provisioning_rollback_spares_preexisting_users() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (_client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-rollback-org").await;
@@ -794,7 +835,7 @@ async fn provisioning_rollback_spares_preexisting_users() {
 
 #[rocket::async_test]
 async fn pagination_edges() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-page-org").await;
@@ -830,7 +871,7 @@ async fn pagination_edges() {
 
 #[rocket::async_test]
 async fn group_crud_and_member_diff_lifecycle() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-group-org").await;
@@ -915,7 +956,7 @@ async fn group_crud_and_member_diff_lifecycle() {
 
 #[rocket::async_test]
 async fn group_member_must_be_provisioned_first() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-group-order-org").await;
@@ -945,7 +986,7 @@ async fn group_member_must_be_provisioned_first() {
 
 #[rocket::async_test]
 async fn group_put_replaces_member_set() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-group-put-org").await;
@@ -981,7 +1022,7 @@ async fn group_put_replaces_member_set() {
 
 #[rocket::async_test]
 async fn group_put_omitted_members_kept_but_empty_list_clears() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-group-sparse-put-org").await;
@@ -1027,7 +1068,7 @@ async fn group_put_omitted_members_kept_but_empty_list_clears() {
 
 #[rocket::async_test]
 async fn group_external_id_uniqueness_enforced_on_put_and_patch() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-group-extid-org").await;
@@ -1100,7 +1141,7 @@ async fn group_external_id_uniqueness_enforced_on_put_and_patch() {
 async fn revoke_and_restore_preserve_the_wrapped_org_key() {
     const AKEY: &str = "2.ENCRYPTED-WRAPPED-ORG-KEY-BLOB|mac";
 
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-akey-org").await;
@@ -1153,7 +1194,7 @@ async fn revoke_and_restore_preserve_the_wrapped_org_key() {
 // User::find_by_mail before narrowing to the org.
 #[rocket::async_test]
 async fn filters_cannot_see_members_of_another_org() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org_a = seed_org(&conn, "scim-filter-iso-a").await;
@@ -1181,7 +1222,7 @@ async fn filters_cannot_see_members_of_another_org() {
 // org argument in any one of them would expose another tenant's groups.
 #[rocket::async_test]
 async fn foreign_group_is_invisible_on_every_verb() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org_a = seed_org(&conn, "scim-group-iso-a").await;
@@ -1229,7 +1270,7 @@ async fn foreign_group_is_invisible_on_every_verb() {
 // env enabled ORG_EVENTS_ENABLED, so nothing had ever asserted a SCIM event row.
 #[rocket::async_test]
 async fn provisioning_actions_are_written_to_the_org_event_log() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-audit-org").await;
@@ -1274,7 +1315,7 @@ async fn provisioning_actions_are_written_to_the_org_event_log() {
 // member's own row and turns every routine sync into a 409.
 #[rocket::async_test]
 async fn reasserting_a_members_own_external_id_stays_a_success() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-extid-selfassert-org").await;
@@ -1309,7 +1350,7 @@ async fn reasserting_a_members_own_external_id_stays_a_success() {
 // filter entirely would keep such a test green.
 #[rocket::async_test]
 async fn group_display_name_filter_discriminates_and_ignores_case() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-group-filter-org").await;
@@ -1343,7 +1384,7 @@ async fn group_display_name_filter_discriminates_and_ignores_case() {
 // replace must not swallow the other member operations in the same PatchOp.
 #[rocket::async_test]
 async fn group_patch_applies_member_operations_in_order() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-group-op-order-org").await;
@@ -1434,7 +1475,7 @@ async fn group_patch_applies_member_operations_in_order() {
 // carries no signal about which check rejected it.
 #[rocket::async_test]
 async fn scim_disabled_refuses_a_valid_token_with_the_uniform_401() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-disabled-org").await;
@@ -1465,7 +1506,7 @@ async fn scim_disabled_refuses_a_valid_token_with_the_uniform_401() {
 // and loudly, inside a SCIM envelope rather than as an HTML error page.
 #[rocket::async_test]
 async fn groups_disabled_returns_a_scim_enveloped_501_on_every_verb() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-groups-disabled-org").await;
@@ -1548,7 +1589,7 @@ async fn assert_privileged_refusal(response: LocalResponse<'_>, what: &str, labe
 // failure than a recoverable mass-revoke.
 #[rocket::async_test]
 async fn scim_can_deprovision_an_administrator_but_never_reinstate_one() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-privileged-org").await;
@@ -1625,7 +1666,7 @@ async fn scim_can_deprovision_an_administrator_but_never_reinstate_one() {
 // deprovision revokes one row and leaves the other live.
 #[rocket::async_test]
 async fn concurrent_create_yields_exactly_one_membership() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-race-create-org").await;
@@ -1660,7 +1701,7 @@ async fn concurrent_create_yields_exactly_one_membership() {
 async fn concurrent_revoke_and_restore_converge_without_losing_the_key() {
     const AKEY: &str = "2.RACE-WRAPPED-ORG-KEY|mac";
 
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
 
     let conn = pool.get().await.expect("conn");
@@ -1705,7 +1746,7 @@ async fn concurrent_revoke_and_restore_converge_without_losing_the_key() {
 // converge without dropping a member that no request asked to remove.
 #[rocket::async_test]
 async fn concurrent_group_member_writes_converge() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-race-group-org").await;
@@ -1759,7 +1800,7 @@ async fn concurrent_group_member_writes_converge() {
 // correlation key - a duplicate makes later syncs target an arbitrary group.
 #[rocket::async_test]
 async fn concurrent_group_create_cannot_duplicate_an_external_id() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-race-grp-ext-org").await;
@@ -1807,7 +1848,7 @@ async fn concurrent_group_create_cannot_duplicate_an_external_id() {
 // no-op at the row level, not just return the same status.
 #[rocket::async_test]
 async fn replaying_a_sync_cycle_changes_nothing() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-replay-org").await;
@@ -1856,7 +1897,7 @@ async fn replaying_a_sync_cycle_changes_nothing() {
 // A2: provisioning sends exactly one invite, to the right person.
 #[rocket::async_test]
 async fn provisioning_sends_exactly_one_invite() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     crate::mail::test_sink::reset();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
@@ -1881,7 +1922,7 @@ async fn provisioning_sends_exactly_one_invite() {
 // may never have received the original.
 #[rocket::async_test]
 async fn restore_reinvites_only_when_the_member_never_joined() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-mail-restore-org").await;
@@ -1927,7 +1968,7 @@ async fn restore_reinvites_only_when_the_member_never_joined() {
 // made Entra churn create-then-delete and risked quarantining the tenant.
 #[rocket::async_test]
 async fn smtp_outage_keeps_the_membership_and_does_not_fail_the_request() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     crate::mail::test_sink::reset();
     // RAII, not a bare toggle. Five assertions follow before the matching
     // fail_sends(false), and a panic in any of them would leave the global
@@ -1975,7 +2016,7 @@ async fn smtp_outage_keeps_the_membership_and_does_not_fail_the_request() {
 // the person is not being invited to anything yet.
 #[rocket::async_test]
 async fn creating_an_inactive_member_sends_no_invite() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     crate::mail::test_sink::reset();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
@@ -1999,7 +2040,7 @@ async fn creating_an_inactive_member_sends_no_invite() {
 // dropped.
 #[rocket::async_test]
 async fn mail_disabled_writes_an_invitation_row_for_unregistered_accounts() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     crate::mail::test_sink::reset();
     let _mail_off = scim::test_config::mail_enabled(false);
     let (client, pool) = scim_client().await;
@@ -2119,7 +2160,7 @@ fn password_body(payload: &Value) -> (Header<'static>, String) {
 // The whole mint / use / rotate / revoke cycle, driven over HTTP.
 #[rocket::async_test]
 async fn scim_token_lifecycle_over_http() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (manage, pool) = manage_client().await;
     let (scim_api, _) = scim_client().await;
     let conn = pool.get().await.expect("conn");
@@ -2199,7 +2240,7 @@ async fn scim_token_lifecycle_over_http() {
 // Minting is a protected action: an admin session alone is not enough.
 #[rocket::async_test]
 async fn minting_requires_reauthentication_and_the_right_org() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (manage, pool) = manage_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-manage-authz-org").await;
@@ -2251,7 +2292,7 @@ async fn minting_requires_reauthentication_and_the_right_org() {
 // credential - that is an administrative action.
 #[rocket::async_test]
 async fn a_plain_member_cannot_manage_the_scim_token() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (manage, pool) = manage_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-manage-member-org").await;
@@ -2285,7 +2326,7 @@ async fn a_plain_member_cannot_manage_the_scim_token() {
 // means no Owner survives a compromise of the identity provider.
 #[rocket::async_test]
 async fn status_reports_when_every_owner_is_directory_linked() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (manage, pool) = manage_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-breakglass-org").await;
@@ -2324,7 +2365,7 @@ async fn status_reports_when_every_owner_is_directory_linked() {
 
 #[rocket::async_test]
 async fn malformed_credentials_are_all_the_same_401() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-auth-edges-org").await;
@@ -2367,7 +2408,7 @@ async fn malformed_credentials_are_all_the_same_401() {
 // and must look no different from any other bad credential.
 #[rocket::async_test]
 async fn a_token_for_a_deleted_org_is_an_ordinary_401() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-deleted-org").await;
@@ -2395,7 +2436,7 @@ async fn a_token_for_a_deleted_org_is_an_ordinary_401() {
 
 #[rocket::async_test]
 async fn hostile_string_input_is_rejected_or_stored_verbatim_never_5xx() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-hostile-input-org").await;
@@ -2438,7 +2479,7 @@ async fn hostile_string_input_is_rejected_or_stored_verbatim_never_5xx() {
 
 #[rocket::async_test]
 async fn malformed_and_oversized_bodies_stay_in_the_scim_envelope() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-bad-body-org").await;
@@ -2491,7 +2532,7 @@ async fn malformed_and_oversized_bodies_stay_in_the_scim_envelope() {
 
 #[rocket::async_test]
 async fn pagination_parameters_never_panic() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-page-edges-org").await;
@@ -2537,7 +2578,7 @@ async fn pagination_parameters_never_panic() {
 // result - a provisioning client reads either as authoritative.
 #[rocket::async_test]
 async fn unsupported_filters_fail_loudly() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-filter-grammar-org").await;
@@ -2580,7 +2621,7 @@ async fn unsupported_filters_fail_loudly() {
 // still thinks they exist. Subsequent syncs must 404, never resurrect the row.
 #[rocket::async_test]
 async fn a_member_deleted_in_the_vault_is_not_resurrected_by_a_sync() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-vault-delete-org").await;
@@ -2625,7 +2666,7 @@ async fn a_member_deleted_in_the_vault_is_not_resurrected_by_a_sync() {
 // can still offboard them.
 #[rocket::async_test]
 async fn promoting_a_member_makes_it_grant_immune_but_still_deprovisionable() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-promote-org").await;
@@ -2670,7 +2711,7 @@ async fn promoting_a_member_makes_it_grant_immune_but_still_deprovisionable() {
 // must fail closed and leave nothing half-applied.
 #[rocket::async_test]
 async fn credential_changes_mid_sync_fail_closed() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-credential-churn-org").await;
@@ -2707,7 +2748,7 @@ async fn credential_changes_mid_sync_fail_closed() {
 // PATCH still in flight from the IdP.
 #[rocket::async_test]
 async fn a_group_deleted_in_the_vault_is_not_resurrected() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-group-vanish-org").await;
@@ -2749,7 +2790,7 @@ async fn a_group_deleted_in_the_vault_is_not_resurrected() {
 async fn deprovisioning_in_one_org_leaves_the_other_untouched() {
     const AKEY_B: &str = "2.ORG-B-WRAPPED-KEY|mac";
 
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
 
@@ -2781,7 +2822,7 @@ async fn deprovisioning_in_one_org_leaves_the_other_untouched() {
 // membership, not two.
 #[rocket::async_test]
 async fn a_person_in_two_assigned_groups_has_one_membership() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-two-groups-org").await;
@@ -2823,7 +2864,7 @@ async fn a_person_in_two_assigned_groups_has_one_membership() {
 // operation is idempotent and ends in the state the last request asked for.
 #[rocket::async_test]
 async fn retried_deprovision_after_restore_is_idempotent() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-retry-order-org").await;
@@ -2877,7 +2918,7 @@ async fn retried_deprovision_after_restore_is_idempotent() {
 // would begin refusing provisioned users with no other test noticing.
 #[rocket::async_test]
 async fn a_scim_provisioned_account_stays_linkable_by_sso() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-linkable-org").await;
@@ -2911,7 +2952,7 @@ async fn a_scim_provisioned_account_stays_linkable_by_sso() {
 // membership to the existing account rather than colliding or duplicating.
 #[rocket::async_test]
 async fn scim_attaches_to_an_account_sso_created_first() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-order-org").await;
@@ -2947,7 +2988,7 @@ async fn scim_attaches_to_an_account_sso_created_first() {
 // a duplicate account for an already-provisioned person.
 #[rocket::async_test]
 async fn mixed_case_directory_addresses_resolve_to_one_account() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-case-org").await;
@@ -2978,7 +3019,7 @@ async fn mixed_case_directory_addresses_resolve_to_one_account() {
 // would lose them too - and their SSO identity binding with it.
 #[rocket::async_test]
 async fn deprovisioning_leaves_the_account_able_to_authenticate() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-deprov-org").await;
@@ -3003,7 +3044,7 @@ async fn deprovisioning_leaves_the_account_able_to_authenticate() {
 // the SSO binding both depend on.
 #[rocket::async_test]
 async fn the_shared_account_survives_one_org_deprovisioning() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org_a = seed_org(&conn, "scim-sso-shared-a").await;
@@ -3100,7 +3141,7 @@ async fn attempt_sso_login(client: &Client, code: &str) -> (Status, String) {
 // SSO_SIGNUPS_MATCH_EMAIL disabled, because the shell has no keypair.
 #[rocket::async_test]
 async fn sso_login_adopts_a_scim_provisioned_shell_account() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_and_identity_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-adopt-org").await;
@@ -3140,7 +3181,7 @@ async fn sso_login_adopts_a_scim_provisioned_shell_account() {
 // be cleared server-side.
 #[rocket::async_test]
 async fn a_recreated_directory_entry_is_locked_out_by_the_old_identity_binding() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_and_identity_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-recreate-org").await;
@@ -3179,7 +3220,7 @@ async fn a_recreated_directory_entry_is_locked_out_by_the_old_identity_binding()
 // which is what makes SCIM the thing that grants access.
 #[rocket::async_test]
 async fn sso_login_alone_grants_no_organization_access() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_and_identity_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-noaccess-org").await;
@@ -3200,7 +3241,7 @@ async fn sso_login_alone_grants_no_organization_access() {
 // nothing. This is the state an offboarded employee is left in.
 #[rocket::async_test]
 async fn a_deprovisioned_person_can_still_sign_in_but_reaches_nothing() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_and_identity_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-offboard-org").await;
@@ -3237,7 +3278,7 @@ async fn a_deprovisioned_person_can_still_sign_in_but_reaches_nothing() {
 // SSO_SIGNUPS_MATCH_EMAIL=false the server must refuse to adopt it.
 #[rocket::async_test]
 async fn sso_refuses_an_account_that_has_already_registered() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_and_identity_client().await;
     let conn = pool.get().await.expect("conn");
 
@@ -3269,7 +3310,7 @@ async fn sso_refuses_an_account_that_has_already_registered() {
 // hand over an existing account - that is an account-takeover primitive.
 #[rocket::async_test]
 async fn sso_refuses_an_explicitly_unverified_email() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_and_identity_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-unverified-org").await;
@@ -3302,7 +3343,7 @@ async fn sso_refuses_an_explicitly_unverified_email() {
 // operator has opted in with SSO_ALLOW_UNKNOWN_EMAIL_VERIFICATION. Fail closed.
 #[rocket::async_test]
 async fn sso_refuses_an_unknown_email_verification_status() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_and_identity_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-unknown-org").await;
@@ -3343,7 +3384,7 @@ async fn sso_refuses_an_unknown_email_verification_status() {
 // SSO_ONLY pass driven by tools/scim-test-config-matrix.sh.
 #[rocket::async_test]
 async fn the_invite_routes_through_sso_exactly_when_sso_only_is_set() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     crate::mail::test_sink::reset();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
@@ -3401,7 +3442,7 @@ async fn the_invite_routes_through_sso_exactly_when_sso_only_is_set() {
 // A failed login attempt must not be able to damage an established binding.
 #[rocket::async_test]
 async fn a_second_identity_claiming_the_same_address_cannot_disturb_the_first() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_and_identity_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-collision-org").await;
@@ -3449,7 +3490,7 @@ async fn a_second_identity_claiming_the_same_address_cannot_disturb_the_first() 
 // its scope.
 #[rocket::async_test]
 async fn sso_created_accounts_are_invisible_to_the_scim_collection() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_and_identity_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-sso-invisible-org").await;
@@ -3490,7 +3531,7 @@ async fn sso_created_accounts_are_invisible_to_the_scim_collection() {
 // different code paths, so nothing but a test keeps them in agreement.
 #[rocket::async_test]
 async fn location_header_and_meta_location_agree_on_every_create() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-conformance-loc-org").await;
@@ -3540,7 +3581,7 @@ async fn location_header_and_meta_location_agree_on_every_create() {
 // because they take a different responder.
 #[rocket::async_test]
 async fn every_response_carries_the_scim_content_type_including_errors() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-conformance-ct-org").await;
@@ -3587,7 +3628,7 @@ async fn every_response_carries_the_scim_content_type_including_errors() {
 // page forever, and both look fine on a single small page.
 #[rocket::async_test]
 async fn list_response_counts_are_pre_and_post_pagination_respectively() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-conformance-page-org").await;
@@ -3632,7 +3673,7 @@ async fn list_response_counts_are_pre_and_post_pagination_respectively() {
 // anything unsupported must not be advertised.
 #[rocket::async_test]
 async fn discovery_promises_match_what_the_implementation_does() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-conformance-disco-org").await;
@@ -3691,7 +3732,7 @@ async fn error_envelope(response: LocalResponse<'_>) -> (u16, String) {
 // Entra can therefore distinguish "retry differently" from "give up".
 #[rocket::async_test]
 async fn every_emitted_scim_type_reaches_the_wire_with_its_rfc_status() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-conformance-types-org").await;
@@ -3801,6 +3842,18 @@ impl Lcg {
     fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.below(items.len())]
     }
+
+    // Deliberately NOT `pick` with `T` inferred, for the string-slice case.
+    //
+    // `input.push_str(rng.pick(FRAGMENTS))` compiles on 1.97 and fails on the
+    // declared MSRV (1.95.0), because the two resolve `T` from opposite ends:
+    // 1.97 takes it from the argument (`&[&str]` gives `T = &str`), while 1.95
+    // takes it from the return position, where `push_str` wants `&str`, giving
+    // `T = str` and then rejecting the argument as `&[str]`. Naming the concrete
+    // type here removes the inference entirely, so both toolchains agree.
+    fn pick_str<'a>(&mut self, items: &'a [&'a str]) -> &'a str {
+        items[self.below(items.len())]
+    }
 }
 
 /// Fragments chosen to sit near the parser's decision boundaries: the
@@ -3863,7 +3916,7 @@ fn filter_parser_never_panics_and_never_mis_parses() {
         let parts = 1 + rng.below(6);
         let mut input = String::new();
         for _ in 0..parts {
-            input.push_str(rng.pick(FRAGMENTS));
+            input.push_str(rng.pick_str(FRAGMENTS));
             if rng.below(3) == 0 {
                 input.push(' ');
             }
@@ -3946,7 +3999,7 @@ fn patch_path_parser_never_panics_on_arbitrary_paths() {
         let parts = 1 + rng.below(6);
         let mut path = String::new();
         for _ in 0..parts {
-            path.push_str(rng.pick(PATH_FRAGMENTS));
+            path.push_str(rng.pick_str(PATH_FRAGMENTS));
         }
 
         let op = json!({
@@ -4051,7 +4104,7 @@ async fn the_rate_limiter_recovers_once_its_window_passes() {
 // putting the Owner back afterwards.
 #[rocket::async_test]
 async fn only_an_owner_can_mint_or_revoke_the_scim_credential() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (manage, pool) = manage_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-owner-gate-org").await;
@@ -4090,8 +4143,7 @@ async fn only_an_owner_can_mint_or_revoke_the_scim_credential() {
         // state and lastUsedAt, and it reports how many Owners are
         // directory-linked - a map of the organization's recovery path - to a
         // role that cannot mint, revoke or disable the credential it describes.
-        let response =
-            manage.get(format!("/api/organizations/{org}/scim/status")).header(session).dispatch().await;
+        let response = manage.get(format!("/api/organizations/{org}/scim/status")).header(session).dispatch().await;
         assert_ne!(
             response.status(),
             Status::Ok,
@@ -4124,7 +4176,7 @@ async fn only_an_owner_can_mint_or_revoke_the_scim_credential() {
 // part of the all-backends run (tools/scim-test-backends.sh).
 #[rocket::async_test]
 async fn every_rotation_overwrites_the_stored_digest() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-rotation-digest-org").await;
@@ -4165,7 +4217,7 @@ async fn every_rotation_overwrites_the_stored_digest() {
 // application - taking deprovisioning, the highest-value path here, down with it.
 #[rocket::async_test]
 async fn a_privileged_member_can_be_unlinked_but_not_linked() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-unlink-org").await;
@@ -4233,7 +4285,7 @@ async fn a_privileged_member_can_be_unlinked_but_not_linked() {
 // pages or on none and a full sync would silently skip them.
 #[rocket::async_test]
 async fn user_paging_covers_every_member_exactly_once() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-paging-org").await;
@@ -4289,7 +4341,7 @@ async fn served_schemas_describe_what_the_handlers_accept() {
     // Attributes the POST/PUT handlers read out of the request body.
     const CLIENT_SUPPLIED: [&str; 5] = ["userName", "displayName", "name", "emails", "active"];
 
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-schema-contract-org").await;
@@ -4347,7 +4399,7 @@ async fn served_schemas_describe_what_the_handlers_accept() {
 // retrievable; without handlers, every location the collections advertise 404s.
 #[rocket::async_test]
 async fn advertised_discovery_locations_resolve() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-discovery-location-org").await;
@@ -4391,7 +4443,7 @@ async fn assert_member_cap_refusal(response: LocalResponse<'_>, what: &str) {
 // cap - that distinction is the whole point of GroupPatch::member_count.
 #[rocket::async_test]
 async fn oversized_member_lists_are_refused_on_every_write_path() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-member-cap-org").await;
@@ -4463,7 +4515,7 @@ async fn oversized_member_lists_are_refused_on_every_write_path() {
 // the change as applied and never retry.
 #[rocket::async_test]
 async fn a_group_display_name_cannot_be_cleared() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-group-name-org").await;
@@ -4499,7 +4551,7 @@ async fn a_group_display_name_cannot_be_cleared() {
 // (the CONFIG.ip_header default), so the dispatched request is attributed to it.
 #[rocket::async_test]
 async fn a_throttled_request_gets_a_scim_429_with_retry_after() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-429-org").await;
@@ -4548,7 +4600,7 @@ async fn a_throttled_request_gets_a_scim_429_with_retry_after() {
 // an override for each. That made this a security guard with no proof it held.
 #[rocket::async_test]
 async fn the_signup_gates_refuse_new_accounts_and_write_nothing() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-signup-gate-org").await;
@@ -4607,7 +4659,7 @@ async fn the_signup_gates_refuse_new_accounts_and_write_nothing() {
 // authenticating requests.
 #[rocket::async_test]
 async fn key_usage_is_recorded_and_reset_on_rotation() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-lastused-org").await;
@@ -4639,7 +4691,7 @@ async fn key_usage_is_recorded_and_reset_on_rotation() {
 // against it.
 #[rocket::async_test]
 async fn a_rejected_request_does_not_record_usage() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-lastused-reject-org").await;
@@ -4661,7 +4713,7 @@ async fn a_rejected_request_does_not_record_usage() {
 // now and resumes without touching Entra.
 #[rocket::async_test]
 async fn the_key_can_be_disabled_and_re_enabled_without_rotating() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (manage, pool) = manage_client().await;
     let (scim_api, _) = scim_client().await;
     let conn = pool.get().await.expect("conn");
@@ -4714,7 +4766,7 @@ async fn the_key_can_be_disabled_and_re_enabled_without_rotating() {
 // The kill switch is an Owner action, like minting and deleting.
 #[rocket::async_test]
 async fn a_non_owner_cannot_disable_the_key() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (manage, pool) = manage_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-killswitch-authz-org").await;
@@ -4754,7 +4806,7 @@ async fn a_non_owner_cannot_disable_the_key() {
 /// Entra uses for full replacement, so it was the half that mattered.
 #[rocket::async_test]
 async fn group_put_refuses_a_blank_display_name() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-put-blankname-org").await;
@@ -4800,7 +4852,7 @@ async fn group_put_refuses_a_blank_display_name() {
 /// Entra retry forever and eventually quarantine the application.
 #[rocket::async_test]
 async fn over_long_attributes_are_refused_with_400_not_500() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-attrlen-org").await;
@@ -4924,7 +4976,7 @@ async fn over_long_attributes_are_refused_with_400_not_500() {
 /// request that half-applied, which the client then retries.
 #[rocket::async_test]
 async fn a_refused_active_change_rolls_back_nothing_because_it_writes_nothing() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-precheck-org").await;
@@ -4984,7 +5036,7 @@ async fn a_refused_active_change_rolls_back_nothing_because_it_writes_nothing() 
 /// to let SCIM put it back, so the org was left with no owner at all.
 #[rocket::async_test]
 async fn the_last_owner_guard_covers_an_unconfirmed_sole_owner() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
 
@@ -5024,7 +5076,7 @@ async fn the_last_owner_guard_covers_an_unconfirmed_sole_owner() {
 /// the one `rollback_provisioning` outcome with no test.
 #[rocket::async_test]
 async fn rollback_spares_an_account_another_org_has_claimed() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (_client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org_a = seed_org(&conn, "scim-rollback-race-a").await;
@@ -5070,7 +5122,7 @@ async fn rollback_spares_an_account_another_org_has_claimed() {
 /// and "already gone" is the steady state for one.
 #[rocket::async_test]
 async fn a_group_member_removal_cannot_reach_into_another_org() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org_a = seed_org(&conn, "scim-xorg-remove-a").await;
@@ -5134,7 +5186,7 @@ async fn a_member_list_crossing_the_chunk_boundary_resolves_completely() {
     // 600 > 500, so this spans two chunks.
     const MEMBERS: usize = 600;
 
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-chunk-org").await;
@@ -5172,7 +5224,7 @@ async fn a_member_list_crossing_the_chunk_boundary_resolves_completely() {
 /// condition would not fail anything.
 #[rocket::async_test]
 async fn the_last_used_write_is_throttled_not_repeated() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-lastused-throttle-org").await;
@@ -5208,7 +5260,7 @@ async fn the_last_used_write_is_throttled_not_repeated() {
 /// quarantines the whole application.
 #[rocket::async_test]
 async fn an_unmanaged_group_accepts_removals_but_refuses_additions() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-unmanaged-grp-org").await;
@@ -5344,7 +5396,7 @@ async fn an_unmanaged_group_accepts_removals_but_refuses_additions() {
 /// is not enough on its own; the two-request form is the one a naive fix misses.
 #[rocket::async_test]
 async fn a_scim_token_cannot_adopt_an_admin_owned_group_by_setting_its_external_id() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-adoption-org").await;
@@ -5452,7 +5504,7 @@ async fn a_scim_token_cannot_adopt_an_admin_owned_group_by_setting_its_external_
 /// write, so the request fails while the group is still untouched.
 #[rocket::async_test]
 async fn a_failing_patch_operation_leaves_no_committed_member_change() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-patch-atomic-org").await;
@@ -5534,7 +5586,7 @@ async fn a_failing_patch_operation_leaves_no_committed_member_change() {
 /// userName and externalId were already capped; displayName was not.
 #[rocket::async_test]
 async fn an_over_long_display_name_is_refused_with_400_not_500() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-longname-org").await;
@@ -5598,7 +5650,7 @@ async fn an_over_long_display_name_is_refused_with_400_not_500() {
 /// forever.
 #[rocket::async_test]
 async fn a_policy_blocked_restore_is_refused_and_leaves_the_member_revoked() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-policy-restore-org").await;
@@ -5661,7 +5713,7 @@ async fn a_policy_blocked_restore_is_refused_and_leaves_the_member_revoked() {
 /// the tenant as a loop of 409s.
 #[rocket::async_test]
 async fn external_id_filters_find_the_resource_they_name() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-extid-filter-org").await;
@@ -5681,8 +5733,7 @@ async fn external_id_filters_find_the_resource_they_name() {
 
     let filter = url_escape("externalId eq \"entra-extid-match\"");
     let (auth, ct, _) = scim_body(&token, &json!({}));
-    let response =
-        client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;
+    let response = client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;
     assert_eq!(response.status(), Status::Ok);
     let listed = parse_json(&body_of(response).await);
     assert_eq!(listed["totalResults"], json!(1), "the externalId filter must match the member");
@@ -5692,8 +5743,7 @@ async fn external_id_filters_find_the_resource_they_name() {
     // is the shape Entra's own probe depends on.
     let filter = url_escape("externalId eq \"entra-extid-absent\"");
     let (auth, ct, _) = scim_body(&token, &json!({}));
-    let response =
-        client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;
+    let response = client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;
     assert_eq!(response.status(), Status::Ok);
     assert_eq!(parse_json(&body_of(response).await)["totalResults"], json!(0));
 
@@ -5726,7 +5776,7 @@ async fn external_id_filters_find_the_resource_they_name() {
 /// there is no race and 409 is the only acceptable answer.
 #[rocket::async_test]
 async fn a_sequential_duplicate_group_external_id_is_a_409() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-dup-grp-extid-org").await;
@@ -5767,7 +5817,7 @@ async fn a_sequential_duplicate_group_external_id_is_a_409() {
 /// value thing this feature does.
 #[rocket::async_test]
 async fn an_smtp_outage_during_restore_still_restores_the_member() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     crate::mail::test_sink::reset();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
@@ -5829,7 +5879,7 @@ async fn an_smtp_outage_during_restore_still_restores_the_member() {
 /// additions.
 #[rocket::async_test]
 async fn an_unmanaged_group_cannot_be_deleted_through_scim() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-grp-delete-org").await;
@@ -5848,14 +5898,10 @@ async fn an_unmanaged_group_cannot_be_deleted_through_scim() {
         .expect("granting collection access");
 
     let (auth, ct, _) = scim_body(&token, &json!({}));
-    let response =
-        client.delete(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).dispatch().await;
+    let response = client.delete(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).dispatch().await;
     assert_eq!(response.status(), Status::BadRequest, "deleting an unmanaged access-granting group must be refused");
     assert_eq!(parse_json(&body_of(response).await)["scimType"], json!("mutability"));
-    assert!(
-        Group::find_by_uuid_and_org(&group_id, &org, &conn).await.is_some(),
-        "the group must still exist"
-    );
+    assert!(Group::find_by_uuid_and_org(&group_id, &org, &conn).await.is_some(), "the group must still exist");
 
     // The control: a group SCIM owns is still deletable, so the refusal above is
     // not just group deletion being broken.
@@ -5870,8 +5916,7 @@ async fn an_unmanaged_group_cannot_be_deleted_through_scim() {
     let owned_id = parse_json(&body_of(response).await)["id"].as_str().expect("id").to_owned();
 
     let (auth, ct, _) = scim_body(&token, &json!({}));
-    let response =
-        client.delete(format!("/scim/v2/{org}/Groups/{owned_id}")).header(auth).header(ct).dispatch().await;
+    let response = client.delete(format!("/scim/v2/{org}/Groups/{owned_id}")).header(auth).header(ct).dispatch().await;
     assert_eq!(response.status(), Status::NoContent, "a SCIM-managed group must still be deletable");
 }
 
@@ -5882,7 +5927,7 @@ async fn an_unmanaged_group_cannot_be_deleted_through_scim() {
 /// a good name, so deleting the check would have kept the suite green.
 #[rocket::async_test]
 async fn post_groups_refuses_a_blank_or_missing_display_name() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-blank-grpname-org").await;
@@ -5918,7 +5963,7 @@ async fn post_groups_refuses_a_blank_or_missing_display_name() {
 /// nothing in the suite would notice.
 #[rocket::async_test]
 async fn unimplemented_query_parameters_are_tolerated() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-queryparam-org").await;
@@ -5962,7 +6007,7 @@ async fn unimplemented_query_parameters_are_tolerated() {
 /// typo or a deletion would have been silent.
 #[rocket::async_test]
 async fn the_emails_value_filter_alias_resolves() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-emailsvalue-org").await;
@@ -5985,7 +6030,7 @@ async fn the_emails_value_filter_alias_resolves() {
 /// own comment names 405 as the other reachable one.
 #[rocket::async_test]
 async fn a_method_not_allowed_stays_in_the_scim_envelope() {
-    let _guard = TEST_LOCK.lock().await;
+    let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
     let org = seed_org(&conn, "scim-405-org").await;
