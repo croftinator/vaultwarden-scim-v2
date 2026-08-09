@@ -42,7 +42,7 @@ Start at the top and work down; each assumes the one before.
 | **[operations.md](operations.md)** | The member lifecycle and the troubleshooting table | Running it day to day |
 | **[reference.md](reference.md)** | Deliberate behaviours, deviations, and named RFC divergences | Something looks wrong but may be by design |
 | **[upgrading.md](upgrading.md)** | Whether an upgrade needs downtime, how to tell, and the exact sequence | Before any deploy |
-| **[testing.md](testing.md)** | What the suite covers, the rungs from unit tests to a live tenant, and how to add a test | Validating a change |
+| **[testing.md](testing.md)** | What the suite covers, which feedback loop to use when, the rungs up to a live tenant, and how to add a test | Validating a change |
 | **[design.md](design.md)** | Architecture, the E2EE security model, threat model, decision log | Changing the implementation |
 
 

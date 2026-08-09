@@ -115,6 +115,65 @@ Worth knowing: the `SSO_ONLY` test cross-checks the value it requested against
 what `CONFIG` reports, so if the override ever stops working the pass fails
 loudly instead of quietly testing the same branch twice.
 
+## Fast feedback: which loop to use when
+
+Three loops, each roughly an order of magnitude slower and broader than the one
+above it. Use the cheapest one that could plausibly catch what you just changed,
+and let the slower ones run behind you.
+
+| Loop | Time | Covers | Use it |
+|---|---|---|---|
+| `cargo test --features sqlite` locally | ~20s warm | Everything on SQLite, one toolchain | Constantly, while editing |
+| **SCIM tests** workflow (`scim-tests.yml`) | **1.9 min** | Same, in a clean CI environment, plus `cargo fmt` | Every push, automatically |
+| **Build** workflow (`build.yml`) | **~12 min** | 2 toolchains, 6 feature sets, real MySQL and PostgreSQL, clippy | The merge gate |
+
+Those are measured, not estimated: 1.9 and 12.3 minutes on the same commit.
+
+### Why the gate takes twelve minutes
+
+Almost none of it is testing. The 193 tests run in about 17 seconds; the rest is
+compiling the crate **six times**. Each `cargo test --features X` uses a
+different feature set, which changes codegen, so the previous build's cache
+cannot be reused:
+
+| Step | Time |
+|---|---|
+| First combo (cold) | 3.0 min |
+| Five further combos | ~1.3 min each |
+| clippy | 1.4 min |
+| Container startup, checkout, toolchain, cache | ~2 min |
+
+That is the right trade for a gate and the wrong one for the edit-run loop,
+which is why the fast workflow exists rather than the gate being trimmed.
+
+### What the fast workflow deliberately does not prove
+
+One toolchain, one backend, no clippy, and no cross-dialect migration check. A
+green SCIM-tests run means "worth waiting for the real gate", not "ready to
+merge". In particular it cannot catch:
+
+- A migration that works on SQLite and fails on MySQL or PostgreSQL - which is
+  the failure that leaves a server unable to start, since migrations run at pool
+  construction before Rocket listens.
+- A build that breaks on the declared MSRV. This has happened: a type-inference
+  difference between 1.95 and 1.97 sat undetected for two weeks because nothing
+  had run the older toolchain.
+- A clippy lint, which is `-D warnings` in CI and so fails the gate.
+
+### The faster option that was rejected
+
+Turning `build.yml`'s six feature combinations into a matrix axis would run them
+as parallel jobs and cut the gate from about twelve minutes to about five. It was
+not done, and the reason is worth recording so it is not repeatedly rediscovered:
+it restructures the single workflow file upstream edits most often, and this fork
+merges from upstream regularly. A seven-minute saving is not worth a merge
+conflict on every `sync-upstream`, forever. Adding a new file costs nothing,
+because upstream will never touch it.
+
+If you want faster local iteration instead, narrow the run rather than the
+coverage - `cargo test --features sqlite scim::` skips the upstream tests, and
+naming a single test skips almost all of the work.
+
 ## What CI runs
 
 `.github/workflows/build.yml` runs the suite on every push and pull request,
@@ -144,6 +203,14 @@ to trip over.
 `SCIM_TESTS_REQUIRE_DB` is set for the whole job, so if a container fails to
 start or a `DATABASE_URL` stops reaching a step, the build goes red instead of
 skipping its way to a green that proved nothing.
+
+`.github/workflows/scim-tests.yml` is the fast counterpart described above: one
+feature set, SQLite, plus `cargo fmt`, in under two minutes. It sets
+`SCIM_TESTS_REQUIRE_DB` too - SQLite needs no server, so a skip there would mean
+the guard itself broke and should fail rather than pass quietly. Its cache key is
+deliberately different from `build.yml`'s: that job compiles six feature sets and
+this one compiles a single different set, so a shared key would mean each evicts
+the other and neither hits.
 
 CI does **not** run rungs 2 to 4: they need a deployed instance or a tenant.
 
