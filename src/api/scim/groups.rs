@@ -341,11 +341,7 @@ async fn reject_privileged_group_adoption(
 // group that has an externalId to clear - so a guard built on it fires only for
 // `access_all` groups and silently waves through the collection-granting case
 // it was written for.
-async fn reject_privileged_group_abandonment(
-    group: &Group,
-    token: &ScimToken,
-    conn: &DbConn,
-) -> Result<(), ScimError> {
+async fn reject_privileged_group_abandonment(group: &Group, token: &ScimToken, conn: &DbConn) -> Result<(), ScimError> {
     if group.external_id.is_none() {
         return Ok(());
     }

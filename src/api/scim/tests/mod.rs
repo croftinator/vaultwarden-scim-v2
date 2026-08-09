@@ -6765,10 +6765,7 @@ async fn clearing_the_external_id_of_an_access_granting_group_is_refused_on_ever
     // Every shape that reaches `set_external_id(None)`. The whitespace cases
     // matter because `set_external_id` stores a blank-but-present value as NULL,
     // so a guard keyed on `is_empty()` alone lets "   " through and clears.
-    let patch_clears = [
-        ("PATCH replace \"\"", json!("")),
-        ("PATCH replace \"   \"", json!("   ")),
-    ];
+    let patch_clears = [("PATCH replace \"\"", json!("")), ("PATCH replace \"   \"", json!("   "))];
     for (label, value) in patch_clears {
         let clear = json!({
             "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
@@ -6841,8 +6838,13 @@ async fn clearing_the_external_id_of_an_access_granting_group_is_refused_on_ever
         "Operations": [{"op": "replace", "path": "externalId", "value": ""}],
     });
     let (auth, ct, body) = scim_body(&token, &clear);
-    let response =
-        client.patch(format!("/scim/v2/{org}/Groups/{harmless_id}")).header(auth).header(ct).body(body).dispatch().await;
+    let response = client
+        .patch(format!("/scim/v2/{org}/Groups/{harmless_id}"))
+        .header(auth)
+        .header(ct)
+        .body(body)
+        .dispatch()
+        .await;
     assert_eq!(response.status(), Status::Ok, "a group that grants nothing must stay decorrelatable");
     assert!(external_id_now(harmless_id, org.clone()).await.is_none(), "the control clear must have applied");
 }
