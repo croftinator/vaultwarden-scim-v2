@@ -96,8 +96,27 @@ Reading it as a description of what it *sends* is the same trap Zitadel sets,
 and is why the first question about any provider must be **which direction does
 its SCIM run**.
 
-If your users live in Identity Center, provision Vaultwarden from the IdP that
-feeds it - Entra, Okta or Google - rather than from AWS.
+**In practice this costs you nothing**, because Identity Center is almost never
+the source of record. The standard enterprise pattern is Entra ID (or Okta) as
+the directory, feeding Identity Center over SAML and SCIM - AWS publishes a
+dedicated guide for exactly that, and the UI you click through to enable it is
+titled *"Inbound automatic provisioning"*. Identity Center is a **downstream
+consumer of provisioning, the same as this server is.**
+
+So if your users reach AWS through Identity Center, they got there from an IdP
+that can also provision Vaultwarden directly. Point that IdP at both. The
+topology is a fan-out from one directory, not a chain through AWS:
+
+```
+Entra ID / Okta ──SCIM──▶ AWS IAM Identity Center
+        │
+        └─────────SCIM──▶ Vaultwarden (this server)
+```
+
+Sources: [AWS - Configure SAML and SCIM with Microsoft Entra ID and IAM Identity
+Center](https://docs.aws.amazon.com/singlesignon/latest/userguide/idp-microsoft-entra.html),
+[AWS - provision from an external identity
+provider](https://docs.aws.amazon.com/singlesignon/latest/userguide/provision-automatically.html).
 
 ### Google Workspace / Cloud Identity
 

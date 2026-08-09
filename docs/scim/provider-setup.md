@@ -240,8 +240,12 @@ documentation is titled "Provision users and groups **from an external identity
 provider** using SCIM" and instructs you to configure the connection in your IdP
 using the endpoint and token that Identity Center generates.
 
-If your users live in Identity Center, they got there from Entra, Okta or Google
-- provision Vaultwarden from that IdP instead, using the section above or below.
+**This is not a gap in practice.** Identity Center is almost never an
+organisation's source of record - the standard pattern is Entra ID or Okta
+feeding it over SAML and SCIM, and the AWS console page for enabling that is
+literally titled *"Inbound automatic provisioning"*. If your users reach AWS
+through Identity Center, they came from an IdP that can provision Vaultwarden
+directly. Point that IdP at both, and follow its section above or below.
 
 An earlier version of this guide had setup steps here. They were wrong, and the
 reason is worth keeping: AWS publishes a thorough SCIM implementation guide that
@@ -288,27 +292,45 @@ Sources: [Google - configure user provisioning](https://knowledge.workspace.goog
 
 ## Authentik (self-hosted)
 
-Free, Docker-based, and the only engine here that can be run locally or in CI -
-which makes it the best way to see the whole lifecycle work before committing to
-a cloud tenant.
+Free, Docker-based, and the only engine here that can run locally or in CI -
+which makes it the best way to watch the whole lifecycle work before committing
+to a cloud tenant.
 
-1. **Providers → Create → SCIM Provider**.
-2. **URL** = your SCIM endpoint. **Token** = the bearer token.
-3. Leave the default User and Group property mappings.
-4. **Applications → Create**, bound to that provider.
-5. Assign users and groups.
+1. Log in as an administrator and open the **Admin interface**.
+2. **Applications → Applications → Create with wizard** (or **New Application**).
+3. Name the application, continue, and choose **SCIM** as the *Provider Type*.
+4. On **Configure Provider**: **URL** = your SCIM endpoint, **Token** = the
+   bearer token. Leave the default User and Group property mappings - Authentik
+   notes they work for most setups.
+5. Continue through bindings and **Create**.
 
-Authentik syncs on its own schedule and also on object save, so changes usually
-appear within a minute.
+If you created the provider separately rather than through the wizard, bind it
+explicitly - and note the model, because it catches people out:
+
+6. **Applications → Applications →** edit your application.
+7. Click **+** next to **Backchannel providers**, select the SCIM provider,
+   **Confirm**, then **Save changes**.
+
+**A SCIM provider is a *backchannel* provider, not a normal one.** It becomes
+active through that backchannel binding rather than by being set as the
+application's main provider. If nothing is syncing and the configuration looks
+right, this is the first thing to check.
+
+Sync timing, from Authentik's own docs: a change to a user or group is sent to
+all SCIM providers **as it happens**, and every SCIM provider is **fully
+synchronised once an hour**. So new work appears within seconds, while a
+correction to something already synced may wait for the hourly pass.
 
 `tools/scim-authentik-e2e.sh` automates all of this against a running server,
-including the assertions in the verification section. It is the fastest way to
-watch a real engine drive the endpoint:
+including the assertions in the verification section:
 
 ```bash
 tools/scim-authentik-e2e.sh --domain http://host.docker.internal:8000 \
   --org "$ORG" --token "$TOK" --db /path/to/db.sqlite3
 ```
+
+Source: [Authentik - create a SCIM provider](https://docs.goauthentik.io/add-secure-apps/providers/scim/create-scim-provider/),
+[Authentik - SCIM provider](https://docs.goauthentik.io/docs/add-secure-apps/providers/scim/).
 
 ---
 

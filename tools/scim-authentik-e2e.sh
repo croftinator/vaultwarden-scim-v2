@@ -132,24 +132,40 @@ api() { # api <METHOD> <PATH> [BODY]
 # ---------------------------------------------------------------------------
 sect "2. Point Authentik at Vaultwarden"
 # ---------------------------------------------------------------------------
-MAPS="$(api GET '/propertymappings/provider/scim/?page_size=20')"
-pick_map() { # pick_map <substring>
-    printf '%s' "$MAPS" | python3 -c "
+# The default SCIM property mappings ship as a BLUEPRINT, applied by the worker
+# after startup - later still than the bootstrap token. Querying immediately
+# returns an empty result set, not an error, so this polls for content rather
+# than for a status code. Same race as the token, one layer deeper.
+printf '  waiting for the SCIM property mappings'
+UMAP=""; GMAP=""
+for i in $(seq 1 40); do
+    MAPS="$(api GET '/propertymappings/provider/scim/?page_size=20')"
+    UMAP="$(printf '%s' "$MAPS" | python3 -c "
 import json,sys
-try:
-    d = json.load(sys.stdin)
-except Exception as e:
-    print('PARSE_ERROR', e, file=sys.stderr); raise SystemExit(1)
-if 'results' not in d:
-    print('UNEXPECTED_RESPONSE', json.dumps(d)[:200], file=sys.stderr); raise SystemExit(1)
-for r in d['results']:
-    if '$1' in r['name']:
-        print(r['pk']); break
-"
-}
-UMAP="$(pick_map User)"
-GMAP="$(pick_map Group)"
-[ -n "$UMAP" ] && ok "found the default SCIM property mappings" || bad "no SCIM property mappings"
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit
+for r in d.get('results', []):
+    if 'User' in r.get('name',''): print(r['pk']); break
+" 2>/dev/null)"
+    GMAP="$(printf '%s' "$MAPS" | python3 -c "
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit
+for r in d.get('results', []):
+    if 'Group' in r.get('name',''): print(r['pk']); break
+" 2>/dev/null)"
+    [ -n "$UMAP" ] && [ -n "$GMAP" ] && { printf ' found (%ss)\n' "$((i*5))"; break; }
+    printf '.'; sleep 5
+done
+
+if [ -n "$UMAP" ] && [ -n "$GMAP" ]; then
+    ok "found the default SCIM property mappings"
+else
+    printf '\n'
+    bad "SCIM property mappings never appeared"
+    echo "  last response was: $(printf '%s' "$MAPS" | head -c 300)"
+    exit 1
+fi
 
 PROV="$(api POST '/providers/scim/' "{\"name\":\"Vaultwarden\",
   \"url\":\"$DOMAIN/scim/v2/$ORG_ID\",\"token\":\"$SCIM_TOKEN\",
