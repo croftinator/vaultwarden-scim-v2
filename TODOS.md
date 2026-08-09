@@ -90,6 +90,18 @@ Still open on this thread: the same treatment for externalId uniqueness under
 concurrent creates, and the multi-replica case, which no single-process lock can
 close. See docs/scim/testing.md "Rung 2c".
 
+**Now running in CI 2026-08-09.** The Authentik lifecycle is automated as
+`tools/scim-authentik-e2e.sh` and runs weekly and on demand in
+`provisioning-e2e.yml`: 13 assertions, all passing, including database checks
+that revoke preserved every membership row and its akey.
+
+Two ordering bugs had to be fixed to get there, both of which only ever appear
+in CI and are worth remembering when automating anything against Authentik:
+`/-/health/ready/` reflects the server, while the bootstrap token is created by
+the worker (about 5s later) and the default SCIM property mappings arrive later
+still as a blueprint (about 20s). Both passed locally purely because a human
+takes longer than that to type the next command.
+
 **Partially closed 2026-08-09 - one engine has now actually run.** Authentik
 (self-hosted, free, Docker) was stood up locally against this branch and drove a
 full provisioning lifecycle: 46 SCIM requests, zero 4xx/5xx, no code changes.

@@ -366,6 +366,13 @@ into themselves), which is useless here; Zitadel is the common trap.
 Verified 2026-08-09 against a local Vaultwarden on this branch: **46 SCIM
 requests, zero 4xx, zero 5xx, zero server errors, and no code changes.**
 
+**This now runs unattended in CI** (`provisioning-e2e.yml`, weekly and on
+demand), where it makes 13 assertions and passes all of them - including two
+straight against the database: that every membership row survived deprovisioning
+rather than being deleted, and that the revoked member kept its `akey`. The
+E2EE invariant the whole design rests on is therefore checked by a real
+provisioning engine on a schedule, not just once by hand.
+
 It drove the full lifecycle unprompted, on its own sync schedule:
 
 - `GET /ServiceProviderConfig` - it reads discovery before provisioning, which
