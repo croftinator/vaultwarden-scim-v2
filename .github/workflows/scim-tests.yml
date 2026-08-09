@@ -123,5 +123,12 @@ jobs:
         with:
           node-version: "22"
 
+      # Chromium cannot start its sandbox on ubuntu-24.04 runners: Ubuntu
+      # 23.10+ restricts unprivileged user namespaces through AppArmor. The
+      # input is this repository's own markdown on a throwaway runner, so
+      # disabling it here costs nothing; the script keeps the sandbox by
+      # default so a local run is not silently weakened.
       - name: "Render every mermaid block"
+        env:
+          MERMAID_NO_SANDBOX: "1"
         run: tools/check-mermaid.sh
