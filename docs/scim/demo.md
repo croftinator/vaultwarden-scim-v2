@@ -196,9 +196,23 @@ if CONFIG.mail_enabled() {
 ```
 
 With SMTP configured - as any realistic deployment and this demo both are - the
-emailed invite link is the proof of address ownership and remains required. So
-SSO and the invite are **sequential, not alternatives**: SSO creates the account
-and its client-side keys, the emailed link joins the organization.
+emailed invite link is the proof of address ownership and remains required.
+
+**Order matters, and getting it wrong is a dead end.** The invite link carries
+the real organization identifier, so following it first both creates the account
+and joins the organization in one step. Signing in via SSO first creates only the
+account; the invite link afterwards presents the same "set a master password"
+form, which the server then refuses:
+
+```rust
+if user.private_key.is_some() {
+    err!("Account already initialized, cannot set password")   // accounts.rs:443
+}
+```
+
+Recovering from that means logging in as the user first and re-opening the link.
+So the walkthrough does the invite first and demonstrates SSO afterwards, as the
+steady state a real employee lives in.
 
 This is upstream behaviour and not something SCIM changes. It is worth stating
 because the SSO screen says "Finish joining this organization", which reasonably

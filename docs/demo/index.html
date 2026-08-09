@@ -153,36 +153,40 @@ ORDER BY u.email;</code></pre>
   </li>
 
   <li>
-    <span class="where">Second browser profile</span>
-    <p class="do">Go to the web vault as Ada and click <em>Enterprise single sign-on</em>.
-    Sign in at Authentik as <code>ada.lovelace</code> / <code>demo-sso-password-2</code>.</p>
-    <div class="warn">This profile must have <strong>no existing Authentik session</strong>,
-    or you will be signed in as whoever it already holds without being asked. If you see
-    no Authentik login prompt, that is what has happened - sign out of Authentik in this
-    profile and retry.</div>
-    <p class="why">Vaultwarden then shows <strong>Join organization - finish joining by
-    setting a master password</strong>. Set it to
-    <code>demo-master-password-2</code>.</p>
-    <p class="why">This is SSO and SCIM combining, and it is the most realistic moment
-    in the demo: SCIM had already created her membership, SSO proves she is Ada, and the
-    master password she sets now derives the vault key <em>in her browser</em>. Two
-    different credentials doing two different jobs - the Authentik password proves
-    identity, the master password unlocks data. Her status moves to
-    <strong>Accepted</strong> (<code>1</code>); she still has no organization key.</p>
-    <p class="do">Then open Mailpit, find <strong>Join Example Corp</strong> addressed to
-    Ada, and click the link while signed in as her. <em>Now</em> she is
-    <strong>Accepted</strong> (<code>1</code>).</p>
-    <div class="warn">SSO does <strong>not</strong> accept the organization invite, and
-    this catches everyone. The SSO screen sends a placeholder org identifier
-    (<code>FAKE_SSO_IDENTIFIER</code>, <code>src/sso.rs:20</code>), so
-    <code>post_set_password</code> skips <code>accept_org_invite</code>
-    (<code>src/api/core/accounts.rs:481</code>). The fallback that would accept it runs
-    only when mail is DISABLED - with SMTP configured, the emailed link is treated as
-    the proof of address ownership and is required.
+    <span class="where">Mailpit + second browser profile</span>
+    <p class="do">Open Mailpit, find <strong>Join Example Corp</strong> addressed to
+    <code>ada.lovelace@example.com</code>, and click the link. Set her master password
+    to <code>demo-master-password-2</code>.</p>
+    <p class="why">One step does two things: it creates her account, deriving a master
+    key in her browser, and it joins her to the organization. Her status becomes
+    <strong>Accepted</strong> (<code>1</code>) - she has an account, but still no
+    organization key.</p>
+    <div class="warn"><strong>Do this before showing SSO, not after.</strong> The invite
+    link carries the real organization identifier, so <code>post_set_password</code>
+    runs <code>accept_org_invite</code> and the join completes
+    (<code>src/api/core/accounts.rs:481</code>).
     <br><br>
-    So the two are sequential, not alternatives: SSO creates the account and its keys,
-    the emailed invite joins the organization. On a server with no SMTP the invite is
-    accepted automatically and this step disappears.</div>
+    Sign in via SSO <em>first</em> and you get stuck: SSO sends
+    <code>FAKE_SSO_IDENTIFIER</code> (<code>src/sso.rs:20</code>) instead, so the join is
+    skipped and only the account is created. The invite link then shows the same
+    "set a master password" form, which the server refuses with <em>"Account already
+    initialized"</em> - because <code>private_key</code> already exists
+    (<code>accounts.rs:443</code>). Recovering means logging in as Ada first, then
+    re-opening the link.</div>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Second browser profile</span>
+    <p class="do">Now log Ada out and sign back in with
+    <em>Enterprise single sign-on</em>: <code>ada.lovelace</code> /
+    <code>demo-sso-password-2</code> at Authentik.</p>
+    <p class="why">This is the steady state a real employee lives in. Two credentials
+    doing two different jobs: the Authentik password proves she is Ada, the master
+    password derives her vault key in the browser. The server sees neither.</p>
+    <div class="warn">This profile must have <strong>no existing Authentik session</strong>,
+    or you are signed in as whoever it already holds without being asked. No Authentik
+    login prompt means exactly that - sign out of Authentik here and retry.</div>
     <div class="clip"></div>
   </li>
 
