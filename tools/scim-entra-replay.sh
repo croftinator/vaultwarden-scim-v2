@@ -13,10 +13,22 @@
 # (cargo test --features sqlite) deliberately do not: TLS/proxy setup, the
 # configured DOMAIN, rate limiting, and the catchers all participate here.
 #
+# Profiles: the quirk-heavy shapes below are Entra's, but the same script can
+# fire the other engines' documented shapes with --profile. Everything outside
+# the create and deactivate steps is plain SCIM 2.0 and is identical for all of
+# them, which is the point - if a provider needs something different there, that
+# is a compatibility gap worth knowing about.
+#
+#   --profile entra   (default) capitalised ops, string booleans, path-less values
+#   --profile okta    path-less replace carrying a value object
+#   --profile aws     explicit path with a real boolean; DELETE on unassignment
+#   --profile google  name parts with no displayName, server composes it
+#
 # Usage:
 #   tools/scim-entra-replay.sh --domain https://vault.example.com \
 #                              --org  <org_uuid> \
-#                              --token scim_v1.<org_uuid>.<secret>
+#                              --token scim_v1.<org_uuid>.<secret> \
+#                              [--profile entra|okta|aws|google]
 #
 #   Or via environment:
 #     DOMAIN=... ORG_ID=... SCIM_TOKEN=... tools/scim-entra-replay.sh
@@ -32,6 +44,7 @@ set -uo pipefail
 DOMAIN="${DOMAIN:-}"
 ORG_ID="${ORG_ID:-}"
 SCIM_TOKEN="${SCIM_TOKEN:-}"
+PROFILE="${PROFILE:-entra}"
 KEEP=0
 
 while [ $# -gt 0 ]; do
@@ -41,6 +54,13 @@ while [ $# -gt 0 ]; do
         --domain) DOMAIN="${2:-}"; [ -n "$DOMAIN" ] || { echo "--domain needs a value" >&2; exit 2; }; shift 2 ;;
         --org)    ORG_ID="${2:-}"; [ -n "$ORG_ID" ] || { echo "--org needs a value" >&2; exit 2; }; shift 2 ;;
         --token)  SCIM_TOKEN="${2:-}"; [ -n "$SCIM_TOKEN" ] || { echo "--token needs a value" >&2; exit 2; }; shift 2 ;;
+        --profile)
+            PROFILE="${2:-}"
+            case "$PROFILE" in
+                entra|okta|aws|google) ;;
+                *) echo "--profile must be one of: entra okta aws google" >&2; exit 2 ;;
+            esac
+            shift 2 ;;
         --keep)   KEEP=1; shift ;;          # leave test data behind for inspection
         # Print the header comment block, stopping at the first non-comment
         # line so the help text cannot drift when the header is edited.
@@ -176,20 +196,43 @@ section "4. Provision a user (Entra POST shape, unknown attrs included)"
 # ---------------------------------------------------------------------------
 # Entra sends the enterprise extension and attributes this server ignores.
 # RFC 7643 s2.1 requires unknown attributes to be ignored, not rejected.
-create_body=$(jq -n --arg u "$USER_EMAIL" --arg e "$EXT_ID" '{
-  schemas: [
-    "urn:ietf:params:scim:schemas:core:2.0:User",
-    "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
-  ],
-  userName: $u,
-  externalId: $e,
-  active: true,
-  name: { givenName: "Replay", familyName: "Tester" },
-  emails: [ { value: $u, type: "work", primary: true } ],
-  title: "Ignored Title",
-  preferredLanguage: "en-US",
-  "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": { department: "Ignored" }
-}')
+case "$PROFILE" in
+    entra)
+        # Entra sends the enterprise extension and attributes this server
+        # ignores. RFC 7643 s2.1 requires unknown attributes to be ignored.
+        create_body=$(jq -n --arg u "$USER_EMAIL" --arg e "$EXT_ID" '{
+          schemas: [
+            "urn:ietf:params:scim:schemas:core:2.0:User",
+            "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
+          ],
+          userName: $u, externalId: $e, active: true,
+          name: { givenName: "Replay", familyName: "Tester" },
+          emails: [ { value: $u, type: "work", primary: true } ],
+          title: "Ignored Title",
+          preferredLanguage: "en-US",
+          "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": { department: "Ignored" }
+        }')
+        ;;
+    okta|aws)
+        create_body=$(jq -n --arg u "$USER_EMAIL" --arg e "$EXT_ID" '{
+          schemas: [ "urn:ietf:params:scim:schemas:core:2.0:User" ],
+          userName: $u, externalId: $e, active: true,
+          displayName: "Replay Tester",
+          name: { givenName: "Replay", familyName: "Tester" },
+          emails: [ { value: $u, type: "work", primary: true } ]
+        }')
+        ;;
+    google)
+        # No displayName: Google sends the parts and expects the server to
+        # compose one. Asserted below.
+        create_body=$(jq -n --arg u "$USER_EMAIL" --arg e "$EXT_ID" '{
+          schemas: [ "urn:ietf:params:scim:schemas:core:2.0:User" ],
+          userName: $u, externalId: $e, active: true,
+          name: { givenName: "Replay", familyName: "Tester" },
+          emails: [ { value: $u, type: "work", primary: true } ]
+        }')
+        ;;
+esac
 status=$(req POST "$BASE/Users" "$create_body")
 expect "POST /Users creates the member (201)" "$status" 201 '.active' 'true'
 MEMBER_ID="$(jq -r '.id // empty' < "$BODY_FILE")"
@@ -206,10 +249,17 @@ expect "duplicate POST is 409 uniqueness" "$status" 409 '.scimType' 'uniqueness'
 section "5. Entra PATCH quirks"
 # ---------------------------------------------------------------------------
 # Quirk 1: capital-R "Replace" and a STRING boolean "False".
-deactivate=$(jq -n '{
-  schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-  Operations: [ { op: "Replace", path: "active", value: "False" } ]
-}')
+case "$PROFILE" in
+    entra)  # capitalised op AND a string boolean, both non-spec
+        deactivate=$(jq -n '{schemas:["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+          Operations:[{op:"Replace", path:"active", value:"False"}]}') ;;
+    okta)   # path-less replace carrying a value object
+        deactivate=$(jq -n '{schemas:["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+          Operations:[{op:"replace", value:{active:false}}]}') ;;
+    aws|google)  # spec-correct: explicit path, real boolean
+        deactivate=$(jq -n '{schemas:["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+          Operations:[{op:"replace", path:"active", value:false}]}') ;;
+esac
 status=$(req PATCH "$BASE/Users/$MEMBER_ID" "$deactivate")
 expect 'PATCH op:"Replace" + string "False" deactivates' "$status" 200 '.active' 'false'
 

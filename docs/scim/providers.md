@@ -96,6 +96,24 @@ Configure automated provisioning for a custom SCIM app.
 - Suspension maps to `active: false`; reinstatement is lossless.
 - Google uses `PUT` for full-resource updates as well as `PATCH`.
 
+## Getting a tenant to validate against
+
+The support table says "not run against a live tenant" for every provider,
+including Entra. That gap is smaller than it looks, because most of these can be
+obtained free. Rough order of effort:
+
+| Provider | Cost to validate | Notes |
+|---|---|---|
+| **Microsoft SCIM Validator** | Free, no tenant | Only needs a Microsoft account and a publicly reachable HTTPS endpoint. Despite the name it checks SCIM 2.0 conformance generally, so it is the best first move for any provider. |
+| **Okta** | Free developer account | `developer.okta.com`. Create a private SCIM 2.0 app, enable provisioning, point it at your endpoint. Closest thing to a full engine at zero cost. |
+| **AWS IAM Identity Center** | Free service, needs an AWS account | No charge for Identity Center itself. Enable it, add an external SCIM application, and use the generated endpoint and token. |
+| **Google Workspace** | Needs a paid plan | Automated provisioning is not on the free tier. A trial works. |
+| **Microsoft Entra ID** | Needs P1/P2 | A free tenant will not offer *Automatic* provisioning at all. Use a P2 trial or a developer sandbox. |
+
+Your endpoint has to be publicly reachable over HTTPS for any of them - see
+"Exposing a local server" in [testing.md](testing.md), and read the warning
+there before opening a tunnel to a dev box.
+
 ## Testing against your provider
 
 Rungs 1 to 3 in [testing.md](testing.md) need no tenant at all:
@@ -104,7 +122,17 @@ Rungs 1 to 3 in [testing.md](testing.md) need no tenant at all:
    providers plus the Entra quirk corpus.
 2. `tools/scim-entra-replay.sh` fires the shapes at a **running** server over
    real HTTPS, so TLS, your reverse proxy, the rate limiter and the error
-   catchers all participate.
+   catchers all participate. It takes `--profile entra|okta|aws|google`, which
+   swaps the create payload and the deactivation form for that engine's
+   documented shape; everything else it fires is plain SCIM 2.0 and is identical
+   for all four. Running all four against one deployment takes about a minute:
+
+   ```bash
+   for p in entra okta aws google; do
+     tools/scim-entra-replay.sh --domain https://vault.example.com \
+       --org <org_uuid> --token scim_v1.<org_uuid>.<secret> --profile "$p"
+   done
+   ```
 3. <https://scimvalidator.microsoft.com> is Microsoft's hosted conformance
    validator. Despite the name it checks SCIM 2.0 conformance generally, needs
    only a Microsoft account, and is the cheapest way to get an independent

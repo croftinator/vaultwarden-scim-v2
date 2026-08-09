@@ -55,6 +55,16 @@ from a real tenant. docs/scim/providers.md says so in its support table, so
 The cheapest independent check remains Microsoft's hosted SCIM Validator, which
 tests SCIM 2.0 conformance generally despite the name and needs no tenant.
 
+**Made cheaper 2026-08-09.** `tools/scim-entra-replay.sh` now takes
+`--profile entra|okta|aws|google`, swapping the create payload and deactivation
+form for that engine's documented shape, so one deployment can be validated
+against all four in about a minute. docs/scim/providers.md now also lists what
+each tenant actually costs to obtain - Okta is a free developer account, AWS IAM
+Identity Center is free with any AWS account, and the Microsoft SCIM Validator
+needs no tenant at all. Only Google Workspace and Entra P1/P2 need paid plans or
+trials. The remaining work is running them, which needs credentials this project
+does not have.
+
 ### Live Entra ID tenant validation
 
 **What:** Run the full lifecycle against a throwaway Entra tenant: Test
