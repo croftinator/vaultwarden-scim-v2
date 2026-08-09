@@ -90,7 +90,9 @@ end-to-end encryption.
   Owner, while the web vault refuses an Admin revoking an Owner outright. Since
   the admin guard admits Admins and Owners alike, allowing an Admin to mint
   would have let them issue themselves a credential that does what their own
-  session is denied. Reading `/scim/status` still only needs an admin session.
+  session is denied. **Reading `/scim/status` also requires the Owner role** (no
+  password/OTP step-up), for the same reason: it reports the credential state and
+  the break-glass Owner counts that describe it.
 - **SCIM never grants administrative privilege.** It cannot create an
   administrator (provisioning always makes a plain member) and cannot promote
   one (roles never sync). On an existing Owner, Admin, or Manager it can

@@ -12,12 +12,13 @@ third green-path test and believe it bought something:
 Design rationale for individual decisions lives in
 [design.md](design.md#test-strategy).
 
-**None of the three big providers can be run locally.** Entra ID, AWS IAM
-Identity Center and Google Workspace ship no container, no emulator and no local
-mode - the provisioning engine *is* the SaaS product, welded to their identity
-backends, so there is nothing to hand out. (LocalStack emulates much of AWS, but
-Identity Center's outbound SCIM is an enterprise SSO control plane rather than a
-data API; do not assume it is covered.) Microsoft's hosted
+**None of the three big providers can be run locally.** Entra ID, Okta and
+Google Workspace ship no container, no emulator and no local mode - the
+provisioning engine *is* the SaaS product, welded to their identity backends, so
+there is nothing to hand out. (AWS IAM Identity Center is not on that list
+because it is not a provisioning source at all: it is a SCIM *server*, and
+cannot drive this endpoint in any deployment. See "does NOT work, and why" in
+[providers.md](providers.md).) Microsoft's hosted
 [SCIM Validator](https://scimvalidator.microsoft.com) is the only vendor tool
 that helps, and it needs a public endpoint and an interactive sign-in, so it
 cannot run unattended either.
@@ -285,10 +286,12 @@ SCIM never deletes accounts.
 
 ## Other identity providers
 
-Rung 1 covers the documented provisioning cycle for Okta, AWS IAM Identity
-Center and Google Workspace as well as Entra: the import probe, the create
-payload each engine sends, its deactivation form, group membership, and the
-lossless reactivation. Those tests are written from published vendor
+Rung 1 covers the documented provisioning cycle for Okta and Google Workspace as
+well as Entra, plus a strict spec-correct client that sends nothing beyond the
+RFC baseline: the import probe, the create payload each engine sends, its
+deactivation form, group membership, and the lossless reactivation. AWS IAM
+Identity Center is deliberately absent - it is a SCIM server, not a client, and
+cannot drive this endpoint at all. Those tests are written from published vendor
 documentation rather than observed traffic, which is the same caveat the Entra
 coverage carries. [providers.md](providers.md) states what "supported" is
 verified to mean for each.

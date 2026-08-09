@@ -85,11 +85,11 @@ Three constraints that will waste your afternoon if you miss them:
 - **HTTPS is mandatory.** Every engine here refuses a plain-HTTP endpoint. It
   must also be publicly reachable; these are SaaS services calling inward.
 - **The reverse proxy must set the client IP header** (`X-Real-IP` by default),
-  or the rate limiter sees every request as one client and throttles your sync.
-- **Do not scope organization Owners into provisioning.** See "Keep organization
-  administrators out of scope" in [setup.md](setup.md#part-d---choose-which-users-and-groups-sync).
-  A directory-driven revoke of your last Owner is the one mistake with no easy
-  way back.
+  **and** the proxy's own address must be listed in `IP_HEADER_TRUSTED_PROXIES`.
+  Both halves are required: with only the first, the header is ignored and every
+  request falls back to the peer address, so the whole IdP shares one rate-limit
+  bucket and a sync gets 429s. It fails silently at default log levels.
+  [deployment.md](deployment.md) is the canonical copy of this guidance.
 
 ---
 
@@ -213,20 +213,14 @@ configuration will fix it.
 *Automatic* provisioning at all - the mode simply is not there. Use a P2 trial or
 a developer sandbox.
 
-The full walkthrough is [setup.md Part C](setup.md#part-c---configure-the-entra-enterprise-application).
-In outline:
+**The walkthrough is [setup.md Part C](setup.md#part-c---configure-the-entra-enterprise-application).**
+Follow it there rather than here: this page used to carry a second, shorter
+version of the same steps, and the two had already drifted into contradicting
+each other on attribute mappings. One copy, kept current.
 
-1. **Entra admin centre → Enterprise applications → New application → Create
-   your own → Integrate any other application**.
-2. Open **Provisioning**, set Mode to **Automatic**.
-3. **Tenant URL** = your SCIM endpoint. **Secret Token** = the bearer token.
-4. **Test Connection**, then Save.
-5. Under **Mappings**, review *Provision Azure Active Directory Users*. The
-   defaults work; the attribute that matters is `userPrincipalName` or `mail`
-   mapping to `userName`.
-6. **Users and groups** - assign only the people and groups that should exist in
-   Vaultwarden.
-7. Turn **Provisioning Status** on.
+The one step setup.md Part C does not mention, because it belongs at the end of
+a rollout rather than during configuration: turn **Provisioning Status** on when
+you are ready for the first cycle.
 
 Entra behaviour worth knowing:
 
@@ -402,7 +396,7 @@ Source: [Authentik - create a SCIM provider](https://docs.goauthentik.io/add-sec
 | Test connection fails, `401` | Wrong token, wrong org id, SCIM disabled, or the key was revoked. Check `/api/organizations/<org>/scim/status` as an Owner. |
 | Test connection fails, timeout | Endpoint not publicly reachable, or not HTTPS. Every engine here refuses plain HTTP. |
 | Users provision but get no email | SMTP not configured. The membership sits at *Invited* and nobody can join. |
-| `429` responses during a sync | The rate limiter is seeing every request as one client. Your proxy is not setting the client IP header (`X-Real-IP` by default). |
+| `429` responses during a sync | The rate limiter is seeing every request as one client. Your proxy is not setting the client IP header (`X-Real-IP` by default), or its address is missing from `IP_HEADER_TRUSTED_PROXIES`. |
 | Groups appear with no members | The members are not themselves in scope. Most engines only push group members who are also assigned to the application. |
 | Everything 404s | The org id in the URL is wrong, or the organization was deleted. |
 | A user vanished after deprovisioning | Should not happen - this server revokes rather than deletes. Investigate before rolling out. |

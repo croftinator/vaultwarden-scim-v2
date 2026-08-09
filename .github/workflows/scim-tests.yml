@@ -35,6 +35,8 @@ on:
       - "Cargo.*"
       - "build.rs"
       - "rust-toolchain.toml"
+      - "docs/scim/**"
+      - "tools/check-mermaid.sh"
   pull_request:
     paths:
       - ".github/workflows/scim-tests.yml"
@@ -45,6 +47,8 @@ on:
       - "Cargo.*"
       - "build.rs"
       - "rust-toolchain.toml"
+      - "docs/scim/**"
+      - "tools/check-mermaid.sh"
 
 defaults:
   run:
@@ -97,3 +101,27 @@ jobs:
       - name: "check formatting"
         if: ${{ !cancelled() }}
         run: cargo fmt --all -- --check
+
+  # The diagrams in docs/scim/ are the architecture reference, and a mermaid
+  # block with a syntax error does not fail loudly - GitHub renders it as a grey
+  # error box, so a broken diagram survives review and is only noticed by
+  # somebody who needed it. tools/check-mermaid.sh has existed since the docs
+  # landed and was wired into no workflow at all, so it only ran when a human
+  # remembered to run it.
+  mermaid:
+    name: SCIM diagrams render
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Set up Node"
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "22"
+
+      - name: "Render every mermaid block"
+        run: tools/check-mermaid.sh

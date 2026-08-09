@@ -300,7 +300,7 @@ their behalf.
 There is also a fourth step that is **not** the user's: an administrator must
 **confirm** each member in the web vault before they can access shared items.
 SCIM deliberately cannot do this. Budget admin time for it in the rollout, and
-see the "Verify and confirm members" part of [README.md](README.md).
+see [Part E of setup.md](setup.md#part-e---verify-and-confirm-members).
 
 ---
 
@@ -318,10 +318,10 @@ see the "Verify and confirm members" part of [README.md](README.md).
    device.
 5. **Desktop and CLI (ongoing).** Opt-in, documented.
 6. **Communicate the deprovision reality to admins.** Offboarding must be driven
-   from Entra, not by revoking in the vault - a vault-side revoke is silently
-   reversed on the next sync if the IdP still shows the user active. This is in
-   [README.md](README.md) under "Behaviour notes and deviations" and it is the
-   single most important operational fact for your admins.
+   from the identity provider, not by revoking in the vault - a vault-side
+   revoke is silently reversed on the next sync if the IdP still shows the user
+   active. [reference.md](reference.md) is the canonical statement of this, and
+   it is the single most important operational fact for your admins.
 
 ---
 

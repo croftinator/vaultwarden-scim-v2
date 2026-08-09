@@ -33,8 +33,12 @@ the usual reason the setup stalls partway.
   log into. SCIM provisions *into* an org; it does not create one. Owner, not
   Admin: minting the token is deliberately gated on `OwnerHeaders`, because the
   credential it produces can revoke an Owner and an Admin session is not allowed
-  to do that interactively. An Admin session can read `GET .../scim/status` and
-  nothing else.
+  to do that interactively. Every SCIM credential endpoint needs Owner, reading
+  `GET .../scim/status` included - an Admin session gets a 403.
+- [ ] **An Entra ID P1 or P2 licence.** A free tenant does not offer *Automatic*
+  provisioning at all - the mode is simply absent, so Part C cannot be completed.
+  Use a P2 trial or a developer sandbox. Each provider has its own tier
+  requirement; [provider-setup.md](provider-setup.md) lists them.
 - [ ] **An Entra tenant** where you can create an enterprise application
   (Application Administrator role or higher). Use a **throwaway test tenant and
   a test org first** - never wire a new SCIM connector straight into production.

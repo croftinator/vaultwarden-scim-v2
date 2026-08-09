@@ -145,7 +145,7 @@ That constraint is the whole reason this repository is arranged the way it is:
 
 | Layer | Covers | Why it exists |
 |---|---|---|
-| In-process suite | All four vendors' **documented** request shapes | The only option for the three that cannot be run |
+| In-process suite | Three vendors' **documented** request shapes, plus a strict spec-correct client | The only option for the three that cannot be run |
 | `tools/scim-authentik-e2e.sh` | One **real** engine, full lifecycle, unattended | Authentik is self-hostable, so it is the only engine CI can drive |
 | `tools/scim-replay.sh` | Any vendor's shapes over real HTTPS | Manual, against a live deployment |
 | A live tenant | Assignment scoping, sync cycles, nested groups | The only way to finish the job for the SaaS three |
@@ -179,13 +179,13 @@ Rungs 1 to 3 in [testing.md](testing.md) need no tenant at all:
    providers plus the Entra quirk corpus.
 2. `tools/scim-replay.sh` fires the shapes at a **running** server over
    real HTTPS, so TLS, your reverse proxy, the rate limiter and the error
-   catchers all participate. It takes `--profile entra|okta|aws|google`, which
+   catchers all participate. It takes `--profile entra|okta|strict|google`, which
    swaps the create payload and the deactivation form for that engine's
    documented shape; everything else it fires is plain SCIM 2.0 and is identical
    for all four. Running all four against one deployment takes about a minute:
 
    ```bash
-   for p in entra okta aws google; do
+   for p in entra okta strict google; do
      tools/scim-replay.sh --domain https://vault.example.com \
        --org <org_uuid> --token scim_v1.<org_uuid>.<secret> --profile "$p"
    done
