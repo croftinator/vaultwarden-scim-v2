@@ -108,9 +108,17 @@ not - proving SCIM syncs what it is scoped to and leaves the rest alone.</p>
     organization key before anyone can be provisioned, and that person cannot
     themselves come from the directory. SSO is demonstrated at step 7, as Ada, who
     does come from the directory.</p>
-    <div class="warn">Signing in with SSO here authenticates you as whoever Authentik
-    knows - its own <code>akadmin</code>, if nothing else - and creates a stray
-    Vaultwarden account for that identity. Harmless, but not the demo.</div>
+    <div class="warn"><strong>The email you type is ignored by the SSO button.</strong>
+    Vaultwarden redirects to Authentik and lets Authentik decide who you are - so if
+    you already have an Authentik session in that browser (from opening its admin UI
+    at step 4, say), you are silently signed in as <em>that</em> identity, with no
+    prompt. Typing <code>owner@example.com</code> and clicking SSO signs you in as
+    <code>akadmin</code> and creates a stray <code>admin@example.com</code> account
+    in Vaultwarden.
+    <br><br>
+    Two consequences worth planning around: keep the Authentik admin UI in a
+    <em>different</em> browser profile from the one you demo in, and if you do end up
+    with a stray account, <code>tools/scim-demo.sh --reset</code> clears it.</div>
     <div class="clip"></div>
   </li>
 
@@ -148,6 +156,10 @@ ORDER BY u.email;</code></pre>
     <span class="where">Second browser profile</span>
     <p class="do">Go to the web vault as Ada and click <em>Enterprise single sign-on</em>.
     Sign in at Authentik as <code>ada.lovelace</code> / <code>demo-sso-password-2</code>.</p>
+    <div class="warn">This profile must have <strong>no existing Authentik session</strong>,
+    or you will be signed in as whoever it already holds without being asked. If you see
+    no Authentik login prompt, that is what has happened - sign out of Authentik in this
+    profile and retry.</div>
     <p class="why">Vaultwarden then shows <strong>Join organization - finish joining by
     setting a master password</strong>. Set it to
     <code>demo-master-password-2</code>.</p>
