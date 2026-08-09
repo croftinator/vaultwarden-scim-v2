@@ -5,7 +5,7 @@ read the reason before changing it - most of these are load-bearing under
 end-to-end encryption.
 
 - **DELETE = revoke.** Both a soft delete (`active: false`, which Entra, Okta
-  and Google all use) and a hard DELETE (which AWS IAM Identity Center issues on
+  and Google all use) and a hard DELETE (which a strict SCIM client may issue on
   unassignment) revoke the membership. The row and its keys survive, so restoring a
   returning user needs no re-confirmation. No destructive operation is
   exposed to the IdP at all. This is a deliberate deviation from RFC 7644.

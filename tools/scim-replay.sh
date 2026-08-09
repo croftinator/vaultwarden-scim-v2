@@ -22,14 +22,14 @@
 #
 #   --profile entra   (default) capitalised ops, string booleans, path-less values
 #   --profile okta    path-less replace carrying a value object
-#   --profile aws     explicit path with a real boolean; DELETE on unassignment
+#   --profile strict  explicit path with a real boolean (spec-correct minimum)
 #   --profile google  name parts with no displayName, server composes it
 #
 # Usage:
 #   tools/scim-replay.sh --domain https://vault.example.com \
 #                              --org  <org_uuid> \
 #                              --token scim_v1.<org_uuid>.<secret> \
-#                              [--profile entra|okta|aws|google]
+#                              [--profile entra|okta|strict|google]
 #
 #   Or via environment:
 #     DOMAIN=... ORG_ID=... SCIM_TOKEN=... tools/scim-replay.sh
@@ -58,8 +58,8 @@ while [ $# -gt 0 ]; do
         --profile)
             PROFILE="${2:-}"
             case "$PROFILE" in
-                entra|okta|aws|google) ;;
-                *) echo "--profile must be one of: entra okta aws google" >&2; exit 2 ;;
+                entra|okta|strict|google) ;;
+                *) echo "--profile must be one of: entra okta strict google" >&2; exit 2 ;;
             esac
             shift 2 ;;
         --keep)   KEEP=1; shift ;;          # leave test data behind for inspection
@@ -214,7 +214,7 @@ case "$PROFILE" in
           "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": { department: "Ignored" }
         }')
         ;;
-    okta|aws)
+    okta|strict)
         create_body=$(jq -n --arg u "$USER_EMAIL" --arg e "$EXT_ID" '{
           schemas: [ "urn:ietf:params:scim:schemas:core:2.0:User" ],
           userName: $u, externalId: $e, active: true,
@@ -257,7 +257,7 @@ case "$PROFILE" in
     okta)   # path-less replace carrying a value object
         deactivate=$(jq -n '{schemas:["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
           Operations:[{op:"replace", value:{active:false}}]}') ;;
-    aws|google)  # spec-correct: explicit path, real boolean
+    strict|google)  # spec-correct: explicit path, real boolean
         deactivate=$(jq -n '{schemas:["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
           Operations:[{op:"replace", path:"active", value:false}]}') ;;
 esac

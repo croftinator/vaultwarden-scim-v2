@@ -4,7 +4,7 @@
 > **Parts A and B apply to every provider.** Part C is a Microsoft Entra ID
 > walkthrough, because that is the engine this was built against first. The
 > endpoints are standard SCIM 2.0 and nothing in them is Entra-specific - for
-> Okta, AWS IAM Identity Center, Google Workspace or Authentik, do Parts A and
+> Okta, Google Workspace or Authentik, do Parts A and
 > B here and then follow the per-provider notes in
 > [providers.md](providers.md).
 
@@ -186,7 +186,7 @@ restore the rest from the web vault.
 > **No identity provider has been validated against a live tenant yet. Do not
 > roll this out to production without testing it yourself first.**
 >
-> Entra ID, Okta, AWS IAM Identity Center and Google Workspace are covered by
+> Entra ID, Okta and Google Workspace are covered by
 > tests written from each vendor's *published documentation*, not from observed
 > traffic. Authentik is the one exception, verified end to end, but it is not one
 > of the major cloud providers. Run the full lifecycle against a **throwaway**

@@ -4,7 +4,7 @@ A SCIM v2 provisioning server (RFC 7643 / RFC 7644) for this Vaultwarden fork,
 so organization membership can be driven from an identity provider.
 
 Standard SCIM 2.0, so any compliant provisioning engine works. **Microsoft Entra
-ID**, **Okta**, **AWS IAM Identity Center** and **Google Workspace** each have
+ID**, **Okta** and **Google Workspace** each have
 their documented request cycle covered end to end by the test suite - see
 [providers.md](providers.md), including the honest limits of what "covered"
 means without a live tenant.
@@ -13,7 +13,7 @@ means without a live tenant.
 > **No identity provider has been validated against a live tenant yet. Do not
 > roll this out to production without testing it yourself first.**
 >
-> Entra ID, Okta, AWS IAM Identity Center and Google Workspace are covered by
+> Entra ID, Okta and Google Workspace are covered by
 > tests written from each vendor's *published documentation*, not from observed
 > traffic. Authentik is the one exception, verified end to end, but it is not one
 > of the major cloud providers. Run the full lifecycle against a **throwaway**
@@ -50,7 +50,7 @@ Start at the top and work down; each assumes the one before.
 |---|---|---|
 | **[deployment.md](deployment.md)** | Cloud-agnostic containers, PostgreSQL, secrets, SSO, and the break-glass Owner | Building the environment |
 | **[setup.md](setup.md)** | Server config, minting the org token, the Entra enterprise application, choosing which users and groups sync | Standing it up for the first time |
-| **[provider-setup.md](provider-setup.md)** | Step-by-step setup for Entra ID, Okta, AWS Identity Center, Google Workspace and Authentik, plus the six-step verification every admin should run before rollout | Configuring and proving your IdP |
+| **[provider-setup.md](provider-setup.md)** | Step-by-step setup for Entra ID, Okta, Google Workspace and Authentik, plus the six-step verification every admin should run before rollout | Configuring and proving your IdP |
 | **[providers.md](providers.md)** | What each provider sends, what "supported" is verified to mean, and why only one can be tested in CI | Understanding compatibility |
 | **[client-rollout.md](client-rollout.md)** | Pointing staff Bitwarden apps at your server, zero-touch via browser policy and MDM, manual fallback | Getting users onto it |
 | **[operations.md](operations.md)** | The member lifecycle and the troubleshooting table | Running it day to day |

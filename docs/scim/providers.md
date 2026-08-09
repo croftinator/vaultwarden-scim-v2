@@ -24,7 +24,7 @@ code path a strict client can take that a lenient one cannot.
 |---|---|---|
 | **Microsoft Entra ID** | Primary target | Request shapes replayed in the suite and by `tools/scim-replay.sh`. No live tenant sync yet - see TODOS.md. |
 | **Okta** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live Okta org. |
-| **AWS IAM Identity Center** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live AWS instance. |
+| **AWS IAM Identity Center** | **Not applicable - cannot drive this endpoint** | It is a SCIM *server*: it RECEIVES provisioning from an IdP and has no outbound SCIM to third-party applications. Corrected 2026-08-09 after checking AWS's documentation; an earlier version of this table wrongly listed it as supported. |
 | **Google Workspace / Cloud Identity** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live tenant. |
 | **Authentik** (self-hosted) | **Verified working** | The only provider actually run against this implementation: a full lifecycle sync, 46 requests, no errors. See "Rung 2b" in [testing.md](testing.md). |
 | Any other SCIM 2.0 client | Should work | Only the standard surface is implemented. |
@@ -77,16 +77,27 @@ with the bearer token as the API token. Enable Create, Update and Deactivate.
 - Reassignment reactivates the existing membership rather than creating a new
   one, which is lossless here because revocation preserves the wrapped org key.
 
-### AWS IAM Identity Center
+### AWS IAM Identity Center - does NOT work, and why
 
-Use the SCIM endpoint and access token from the Identity Center console.
+**IAM Identity Center cannot provision into this server, or into any third-party
+SCIM application.** It is a SCIM *server*, not a client: its documentation is
+titled "Provision users and groups **from an external identity provider** using
+SCIM", and it tells you to configure the connection *in your IdP* using the SCIM
+endpoint and bearer token that **Identity Center** generates. Provisioning flows
+Entra/Okta/Google -> Identity Center, never Identity Center -> your app.
 
-- AWS is the narrowest engine of the four: it sends only `eq` filters, and only
-  on `userName` for Users and `displayName` for Groups. Both are implemented.
-- It deactivates with an explicit `path: "active"` and a real JSON boolean.
-- It issues `DELETE` on unassignment. That revokes rather than destroys, so the
-  membership row and its `akey` survive and re-assignment needs no re-confirm.
-- AWS does not read `/Schemas`, but the endpoint is there for anything that does.
+Applications that Identity Center fronts get access through SAML plus permission
+sets and assignments. There is no outbound SCIM push.
+
+This entry was wrong until 2026-08-09 and is left here rather than deleted,
+because the mistake is easy to repeat: AWS publishes a detailed SCIM
+implementation guide, and it is entirely about what Identity Center *accepts*.
+Reading it as a description of what it *sends* is the same trap Zitadel sets,
+and is why the first question about any provider must be **which direction does
+its SCIM run**.
+
+If your users live in Identity Center, provision Vaultwarden from the IdP that
+feeds it - Entra, Okta or Google - rather than from AWS.
 
 ### Google Workspace / Cloud Identity
 
@@ -100,12 +111,10 @@ Configure automated provisioning for a custom SCIM app.
 
 ## Why only one of these can run in CI
 
-Entra ID, AWS IAM Identity Center and Google Workspace ship **no container, no
-emulator and no local mode**. That is not an oversight - the provisioning engine
+Entra ID, Okta and Google Workspace ship **no container, no emulator and no
+local mode**. That is not an oversight - the provisioning engine
 *is* the SaaS product, welded to their identity backends, so there is nothing to
-hand out. LocalStack emulates a great deal of AWS, but IAM Identity Center's
-outbound SCIM provisioning is an enterprise SSO control plane rather than a data
-API, and should not be assumed covered.
+hand out.
 
 Microsoft is the only one of the three offering anything, and it is hosted
 rather than local: the [SCIM Validator](https://scimvalidator.microsoft.com)
@@ -136,7 +145,6 @@ obtained free. Rough order of effort:
 |---|---|---|
 | **Microsoft SCIM Validator** | Free, no tenant | Only needs a Microsoft account and a publicly reachable HTTPS endpoint. Despite the name it checks SCIM 2.0 conformance generally, so it is the best first move for any provider. |
 | **Okta** | Free developer account | `developer.okta.com`. Create a private SCIM 2.0 app, enable provisioning, point it at your endpoint. Closest thing to a full engine at zero cost. |
-| **AWS IAM Identity Center** | Free service, needs an AWS account | No charge for Identity Center itself. Enable it, add an external SCIM application, and use the generated endpoint and token. |
 | **Google Workspace** | Needs a paid plan | Automated provisioning is not on the free tier. A trial works. |
 | **Microsoft Entra ID** | Needs P1/P2 | A free tenant will not offer *Automatic* provisioning at all. Use a P2 trial or a developer sandbox. |
 

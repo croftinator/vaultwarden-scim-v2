@@ -6377,29 +6377,36 @@ async fn the_okta_provisioning_cycle_works_end_to_end() {
     assert_eq!(parse_json(&body_of(response).await)["active"], json!(true), "restore must be lossless");
 }
 
-/// AWS IAM Identity Center's documented provisioning cycle.
+/// A strict, spec-correct client's provisioning cycle.
 ///
-/// AWS is the narrowest of the engines: it sends only `eq` filters, and only on
-/// `userName` for Users and `displayName` for Groups - exactly the two this
-/// server implements. It deactivates with an explicit `path: "active"` and a
-/// real JSON boolean, which is the spec-correct form Entra's string "False"
-/// tolerance sits alongside rather than replaces.
+/// The minimal profile: only `eq` filters, and only on `userName` for Users and
+/// `displayName` for Groups; deactivation with an explicit `path: "active"` and
+/// a real JSON boolean; and `DELETE` on unassignment rather than `active:false`.
+/// This is the shape Entra's string-"False" tolerance sits ALONGSIDE rather than
+/// replaces, so it proves the lenient parsing did not break the strict path.
+///
+/// Named for the behaviour, not a vendor. It was originally written as "AWS IAM
+/// Identity Center" - which was wrong, and worth recording so nobody restores
+/// it: **IAM Identity Center is a SCIM server, not a client.** It RECEIVES
+/// provisioning from an IdP and cannot push to a third-party application like
+/// this one. Its published SCIM limits describe what it accepts, not what it
+/// sends. See docs/scim/providers.md.
 #[rocket::async_test]
-async fn the_aws_identity_center_provisioning_cycle_works_end_to_end() {
+async fn a_strict_spec_correct_provisioning_cycle_works_end_to_end() {
     let _guard = scim_test_guard!();
     let (client, pool) = scim_client().await;
     let conn = pool.get().await.expect("conn");
-    let org = seed_org(&conn, "scim-aws-org").await;
+    let org = seed_org(&conn, "scim-strict-org").await;
     let token = seed_scim_key(&conn, &org).await;
 
     let create = json!({
         "schemas": [scim::discovery::USER_SCHEMA_URN],
-        "userName": "aws.user@example.com",
+        "userName": "strict.user@example.com",
         "name": {"givenName": "Aws", "familyName": "User"},
-        "emails": [{"value": "aws.user@example.com", "type": "work", "primary": true}],
+        "emails": [{"value": "strict.user@example.com", "type": "work", "primary": true}],
         "displayName": "Aws User",
         "active": true,
-        "externalId": "aws-ext-1",
+        "externalId": "strict-ext-1",
     });
     let (auth, ct, body) = scim_body(&token, &create);
     let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
@@ -6407,26 +6414,30 @@ async fn the_aws_identity_center_provisioning_cycle_works_end_to_end() {
     let member_id = parse_json(&body_of(response).await)["id"].as_str().expect("id").to_owned();
 
     // The only two filters AWS emits.
-    let filter = url_escape("userName eq \"aws.user@example.com\"");
+    let filter = url_escape("userName eq \"strict.user@example.com\"");
     let (auth, ct, _) = scim_body(&token, &json!({}));
     let response = client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;
-    assert_eq!(parse_json(&body_of(response).await)["totalResults"], json!(1), "AWS userName filter must match");
+    assert_eq!(parse_json(&body_of(response).await)["totalResults"], json!(1), "a strict userName filter must match");
 
     let create_group = json!({
         "schemas": [scim::discovery::GROUP_SCHEMA_URN],
-        "displayName": "AWS Group",
-        "externalId": "aws-grp-1",
+        "displayName": "Strict Group",
+        "externalId": "strict-grp-1",
         "members": [{"value": member_id}],
     });
     let (auth, ct, body) = scim_body(&token, &create_group);
     let response = client.post(format!("/scim/v2/{org}/Groups")).header(auth).header(ct).body(body).dispatch().await;
     assert_eq!(response.status(), Status::Created);
 
-    let filter = url_escape("displayName eq \"AWS Group\"");
+    let filter = url_escape("displayName eq \"Strict Group\"");
     let (auth, ct, _) = scim_body(&token, &json!({}));
     let response =
         client.get(format!("/scim/v2/{org}/Groups?filter={filter}")).header(auth).header(ct).dispatch().await;
-    assert_eq!(parse_json(&body_of(response).await)["totalResults"], json!(1), "AWS displayName filter must match");
+    assert_eq!(
+        parse_json(&body_of(response).await)["totalResults"],
+        json!(1),
+        "a strict displayName filter must match"
+    );
 
     // Deactivation: explicit path, real boolean.
     let deactivate = json!({
@@ -6439,7 +6450,7 @@ async fn the_aws_identity_center_provisioning_cycle_works_end_to_end() {
     assert_eq!(response.status(), Status::Ok);
     assert_eq!(parse_json(&body_of(response).await)["active"], json!(false));
 
-    // AWS also issues DELETE on unassignment; the row must survive as a revocation so
+    // A strict client may issue DELETE on unassignment; the row must survive as a revocation so
     // the akey is preserved and reassignment is lossless.
     let (auth, ct, _) = scim_body(&token, &json!({}));
     let response = client.delete(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).dispatch().await;

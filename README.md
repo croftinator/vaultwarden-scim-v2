@@ -6,7 +6,7 @@ membership can be driven from an identity provider.
 
 Standard SCIM 2.0, so any compliant provisioning engine works - nothing in the
 request path branches on which client is calling. **Microsoft Entra ID**,
-**Okta**, **AWS IAM Identity Center** and **Google Workspace** each have their
+**Okta** and **Google Workspace** each have their
 documented request cycle covered by the test suite, and **Authentik** has been
 verified end to end against a running server. See
 [providers.md](docs/scim/providers.md), including what "supported" is verified
@@ -20,7 +20,7 @@ stays a manual admin action - the docs explain why.
 > **No identity provider has been validated against a live tenant yet. Do not
 > roll this out to production without testing it yourself first.**
 >
-> Entra ID, Okta, AWS IAM Identity Center and Google Workspace are covered by
+> Entra ID, Okta and Google Workspace are covered by
 > tests written from each vendor's *published documentation*, not from observed
 > traffic against a real tenant. That catches protocol mistakes; it cannot catch
 > a vendor behaving differently from its own documentation, and they sometimes
@@ -43,7 +43,7 @@ Start at **[docs/scim/](docs/scim/README.md)** - it indexes the rest.
 |---|---|
 | [deployment.md](docs/scim/deployment.md) | Cloud-agnostic containers, PostgreSQL, secrets, SSO, break-glass Owner |
 | [setup.md](docs/scim/setup.md) | Server config, org token, and the Entra ID walkthrough |
-| [provider-setup.md](docs/scim/provider-setup.md) | Setting up **and verifying** each IdP: Entra ID, Okta, AWS Identity Center, Google Workspace, Authentik |
+| [provider-setup.md](docs/scim/provider-setup.md) | Setting up **and verifying** each IdP: Entra ID, Okta, Google Workspace, Authentik |
 | [providers.md](docs/scim/providers.md) | What each provider sends, and what is actually verified |
 | [client-rollout.md](docs/scim/client-rollout.md) | Pointing staff Bitwarden apps at your server, zero-touch and manual |
 | [operations.md](docs/scim/operations.md) | Member lifecycle and troubleshooting |

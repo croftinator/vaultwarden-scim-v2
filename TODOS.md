@@ -42,6 +42,24 @@ the other branch.
 **Effort:** -
 **Priority:** closed
 
+### AWS IAM Identity Center was never a viable source - CLOSED 2026-08-09
+
+Verified against AWS's own documentation, which is titled "Provision users and
+groups **from an external identity provider** using SCIM" and instructs you to
+configure the connection *in your IdP* using the endpoint and token Identity
+Center generates. It is a SCIM **server**: provisioning flows Entra/Okta/Google
+-> Identity Center, never Identity Center -> a third-party application.
+
+Earlier documentation and a test here listed it as a supported source. That was
+wrong and is corrected: the test is renamed to describe the strict, spec-correct
+profile it actually exercises (explicit path, real boolean, DELETE on
+unassignment), the replay script's `--profile aws` became `--profile strict`, and
+providers.md now explains the mistake rather than deleting it, because the trap
+is easy to repeat - AWS publishes a thorough SCIM guide describing what Identity
+Center ACCEPTS, which reads exactly like a description of what it SENDS.
+
+The first question about any provider is which direction its SCIM runs.
+
 ### Live tenant validation, all providers
 
 **Scope widened 2026-08-09.** The suite now covers the documented provisioning

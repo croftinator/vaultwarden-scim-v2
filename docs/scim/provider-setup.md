@@ -1,7 +1,12 @@
 # Setting up and verifying each identity provider
 
-Step-by-step for Entra ID, Okta, AWS IAM Identity Center, Google Workspace and
-Authentik, plus the verification procedure that proves it actually worked.
+Step-by-step for Entra ID, Okta, Google Workspace and Authentik, plus the
+verification procedure that proves it actually worked.
+
+Console paths were checked against each vendor's documentation on 2026-08-09 and
+are cited below. **Vendor UIs move constantly** - if a menu is not where this
+says, trust the vendor's own docs and please open an issue so this can be
+corrected.
 
 > [!WARNING]
 > **No provider here has been validated against a live tenant.** The request
@@ -184,73 +189,102 @@ Entra behaviour worth knowing:
   it could not send.
 - The provisioning log in Entra is the first place to look, not your server log.
 
+Source: [Microsoft - use SCIM to provision users and groups](https://learn.microsoft.com/en-us/entra/identity/app-provisioning/use-scim-to-provision-users-and-groups).
+
 ## Okta
 
 A **free developer account** at `developer.okta.com` supports SCIM provisioning,
-which makes Okta the cheapest of the cloud engines to validate properly.
+which makes Okta the cheapest cloud engine to validate properly.
 
-1. **Admin → Applications → Create App Integration → SWA / API Services**, or
-   create a private SCIM-enabled app.
-2. Open the **Provisioning** tab → **Configure API Integration** → enable it.
-3. **SCIM connector base URL** = your SCIM endpoint.
-4. **Unique identifier field for users** = `userName`.
-5. Enable **Push New Users**, **Push Profile Updates** and **Push Groups**.
-6. **Authentication Mode** = HTTP Header, with the bearer token.
-7. **Test Connector Configuration**, then save.
-8. Under **To App**, enable **Create Users**, **Update User Attributes** and
-   **Deactivate Users**.
+Okta provisions to an *application*, and the simplest route for a custom
+endpoint is the catalog's generic SCIM template rather than building an
+integration from scratch:
+
+1. **Admin Console → Applications → Applications → Browse App Catalog**.
+2. Search for **SCIM 2.0 Test App (Header Auth)** and **Add Integration**.
+   (Header Auth is the variant matching this server's bearer token. There are
+   also Basic Auth and OAuth variants - do not pick those.)
+3. Complete **General Settings** and the sign-on step.
+4. Open the **Provisioning** tab → **Configure API Integration** → tick
+   **Enable API integration**.
+5. **SCIM connector base URL** = your SCIM endpoint.
+6. **Unique identifier field for users** = `userName`.
+7. Supported actions: enable **Push New Users**, **Push Profile Updates** and
+   **Push Groups**.
+8. Authentication: **HTTP Header**, with the bearer token.
+9. **Test API Credentials**, then save.
+10. Under **Provisioning → To App**, enable **Create Users**, **Update User
+    Attributes** and **Deactivate Users**.
+11. **Assignments** tab - assign the users and groups that should exist in
+    Vaultwarden.
 
 Okta behaviour worth knowing:
 
-- It deactivates with a **path-less** `replace` carrying a value object - the
-  same shape Entra uses. Both are accepted.
-- **Group Push** is configured separately from user assignment, under the
-  *Push Groups* tab. Assigning a group to the app is not the same as pushing it.
+- It deactivates with a **path-less** `replace` carrying a value object, the same
+  shape Entra uses. Both are accepted.
+- **Group Push is configured separately** on its own tab. Assigning a group under
+  *Assignments* controls who gets the app; it does **not** create the group here.
+  If groups are not appearing, that tab is why.
 - Reassignment reactivates the existing member rather than creating a new one,
   which is lossless here.
 
-## AWS IAM Identity Center
+Source: [Okta - connect a SCIM 2.0 application](https://developer.okta.com/docs/guides/scim-provisioning-integration-connect/main/).
 
-**Free with any AWS account** - there is no charge for Identity Center itself.
+## AWS IAM Identity Center - not usable as a source
 
-1. **IAM Identity Center console → Applications → Add application → Add a custom
-   SAML 2.0 application** (SCIM provisioning attaches to an application).
-2. Open the application's **Provisioning** tab → **Automatic provisioning**.
-3. AWS shows you a **SCIM endpoint** and an **access token** of its own - ignore
-   those. You want the reverse: enter *your* endpoint and *your* token in the
-   external provisioning configuration.
-4. Assign users and groups to the application.
+**Skip this one. It cannot provision into Vaultwarden.**
 
-AWS behaviour worth knowing:
+IAM Identity Center is a SCIM *server*, not a client: it receives provisioning
+*from* an IdP and has no outbound SCIM to third-party applications. AWS's own
+documentation is titled "Provision users and groups **from an external identity
+provider** using SCIM" and instructs you to configure the connection in your IdP
+using the endpoint and token that Identity Center generates.
 
-- It is the **narrowest** engine of the four. It sends only `eq` filters, and
-  only on `userName` for users and `displayName` for groups. Both are supported.
-- It issues **`DELETE`** on unassignment rather than `active: false`. That
-  revokes here rather than destroying, so the membership row and its key survive
-  and reassignment is still lossless - but it means step 4 above shows the user
-  as inactive after a *delete*, which is the intended behaviour, not a bug.
-- It does not read `/Schemas`.
+If your users live in Identity Center, they got there from Entra, Okta or Google
+- provision Vaultwarden from that IdP instead, using the section above or below.
+
+An earlier version of this guide had setup steps here. They were wrong, and the
+reason is worth keeping: AWS publishes a thorough SCIM implementation guide that
+describes everything Identity Center *accepts*, and it reads exactly like a
+description of what it *sends*. The first question to ask about any provider is
+**which direction does its SCIM run**.
 
 ## Google Workspace / Cloud Identity
 
-**Automated provisioning is not on the free tier.** A Workspace trial works.
+**Auto-provisioning is not on the free tier.** A Workspace trial works.
 
-1. **Admin console → Apps → Web and mobile apps → Add app → Add custom SAML
-   app**.
-2. Complete the SAML step, then open **Auto-provisioning** on the app.
-3. Enter the SCIM endpoint and bearer token.
-4. Map attributes - primary email to `userName` is the one that matters.
-5. Set the **deprovisioning** behaviour and the delay Google applies before
+1. **Admin console → Apps → Web and mobile apps → Add app → Add custom SAML app**.
+2. Complete the SAML step (Google requires a SAML app before it will offer
+   provisioning).
+3. Back on the app, open **Auto-provisioning** - or click the
+   *Provisioning available* text on the app, then **Configure auto-provisioning**
+   at the bottom of the page.
+4. Choose **SCIM** and continue.
+5. **Endpoint URL** = your SCIM endpoint. **App authorization token** = the
+   bearer token.
+6. Leave the default **attribute mappings**. The one that matters is primary
+   email to `userName`.
+7. Set the **deprovisioning** behaviour and the delay Google applies before
    acting on a suspension or deletion.
-6. Turn auto-provisioning on and assign organizational units or groups.
+8. Turn auto-provisioning on and assign organizational units or groups.
 
 Google behaviour worth knowing:
 
 - It sends `name.givenName` and `name.familyName` **without** `displayName` and
   expects the server to compose one. This server does.
-- Suspension maps to `active: false`; reinstatement is lossless.
-- Google applies its own **configurable delay** before deprovisioning. If step 4
-  seems not to work, check that delay before suspecting the endpoint.
+- **Group provisioning is limited.** AWS's own integration guide states that
+  Google Workspace does not support SCIM group provisioning, so expect users to
+  sync and groups not to. Verify this against your own tenant before relying on
+  group sync - if groups do not appear, this is the likely reason rather than a
+  fault in the endpoint.
+- **Both SAML and SCIM must use primaryEmail**, and syncs run every few hours
+  rather than immediately.
+- Google applies a **configurable delay** before deprovisioning. If step 4 of the
+  verification seems not to work, check that delay before suspecting the server.
+
+Sources: [Google - configure user provisioning](https://knowledge.workspace.google.com/admin/users/advanced/configure-amazon-web-services-user-provisioning),
+[AWS - Google Workspace and IAM Identity Center](https://docs.aws.amazon.com/singlesignon/latest/userguide/gs-gwp.html)
+(the AWS guide is the clearest published statement of Google's group limitation).
 
 ## Authentik (self-hosted)
 
