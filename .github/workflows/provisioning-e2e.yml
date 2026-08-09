@@ -4,10 +4,14 @@
 #
 # `owner-race` is cheap and guards a security invariant the in-process suite
 # provably cannot: Rocket's local client never achieves true request
-# concurrency, so the last-owner race is invisible to `cargo test`. Measured on
-# this implementation, the race fired on 25 of 25 trials with the mutex removed
-# and 0 of 50 with it. That is a regression worth catching, so this job runs on
+# concurrency, so the last-owner race is invisible to `cargo test`. It runs on
 # any change to the SCIM code.
+#
+# It runs TWICE, and the second run is the point. A harness that reports success
+# whatever happens is not a guard, so the job also builds a control binary with
+# the mutex compiled out (`--features scim-race-control`) and requires the same
+# harness to FAIL against it. Without that step, "0 races" is a statement about
+# the harness rather than about the code.
 #
 # `authentik` is the opposite trade. It pulls a ~1.8GB image, starts four
 # containers, and waits on a scheduler we do not control - Authentik syncs on
@@ -22,21 +26,40 @@ permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only cancel the cheap push-triggered runs. Cancelling a scheduled Authentik
+  # run costs a full week of coverage rather than a few minutes of runner time,
+  # and it is the one job here that cannot simply be re-triggered by the next
+  # push.
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 on:
   workflow_dispatch:
   schedule:
     # Weekly, Monday 04:17 UTC. Off the hour on purpose - scheduled jobs
     # cluster at :00 and get queued behind everyone else's.
+    #
+    # NOTE: GitHub fires `schedule:` only from the repository's DEFAULT branch.
+    # While this workflow lives on feature/scim-v2 and not on main, the weekly
+    # run does not happen at all - the Authentik job is dispatch-only until this
+    # branch merges. Do not read "runs weekly" as describing today.
     - cron: "17 4 * * 1"
   push:
     paths:
       - "src/api/scim/**"
       - "src/db/models/scim_api_key.rs"
+      - "src/db/models/organization.rs"
+      - "src/db/models/group.rs"
       - "tools/scim-owner-race.sh"
       - "tools/scim-authentik-e2e.sh"
+      - "tools/ci-seed-vaultwarden.sh"
       - ".github/workflows/provisioning-e2e.yml"
+      # The owner-race job asserts a property of tokio's Mutex under Rocket's
+      # real threading, which a toolchain or runtime-crate bump can change.
+      # Upstream's batched bumps arrive through sync-upstream and would
+      # otherwise never trigger it.
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
 
 defaults:
   run:
@@ -67,51 +90,41 @@ jobs:
       - name: "Build"
         run: cargo build --profile ci --features sqlite
 
-      - name: "Start Vaultwarden and seed an organisation"
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/vw/data"
-          cat > "$RUNNER_TEMP/vw/.env" <<EOF
-          DATA_FOLDER=$RUNNER_TEMP/vw/data
-          DATABASE_URL=sqlite://$RUNNER_TEMP/vw/data/db.sqlite3
-          ROCKET_PORT=8000
-          DOMAIN=http://localhost:8000
-          SCIM_ENABLED=true
-          ORG_GROUPS_ENABLED=true
-          ORG_EVENTS_ENABLED=true
-          WEB_VAULT_ENABLED=false
-          SIGNUPS_ALLOWED=true
-          EOF
-          cd "$RUNNER_TEMP/vw"
-          set -a; . ./.env; set +a
-          nohup "$GITHUB_WORKSPACE/target/ci/vaultwarden" > vw.log 2>&1 &
-          for _ in $(seq 1 60); do curl -sf -o /dev/null http://localhost:8000/alive && break; sleep 2; done
-          curl -sf -o /dev/null http://localhost:8000/alive || { echo "server never came up"; tail -30 vw.log; exit 1; }
+      # The control arm, built first so a failure here costs nothing. It
+      # compiles OUT the last-owner mutex, which is the only way to show the
+      # harness can detect its absence. Published race figures used to come from
+      # an uncommitted local edit; this makes them a build anyone can repeat.
+      - name: "Build the no-mutex control binary"
+        run: cargo build --profile ci --features sqlite,scim-race-control --target-dir target/control
 
-          # The SCIM guard needs only an organisation row and the sha256 of the
-          # secret, so this skips account registration and its E2EE crypto.
-          ORG=11111111-2222-3333-4444-555555555555
-          SECRET="ci-$(openssl rand -hex 16)"
-          HASH=$(printf '%s' "$SECRET" | sha256sum | cut -d' ' -f1)
-          sqlite3 "$RUNNER_TEMP/vw/data/db.sqlite3" "
-            INSERT OR REPLACE INTO organizations (uuid,name,billing_email)
-              VALUES ('$ORG','CI Org','ci@example.com');
-            INSERT OR REPLACE INTO scim_api_key (uuid,org_uuid,key_hash,enabled,created_at,revision_date)
-              VALUES ('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee','$ORG','$HASH',1,datetime('now'),datetime('now'));"
-          echo "$ORG" > "$RUNNER_TEMP/vw/org-id.txt"
-          echo "scim_v1.$ORG.$SECRET" > "$RUNNER_TEMP/vw/scim-token.txt"
-          curl -sf -o /dev/null -H "Authorization: Bearer scim_v1.$ORG.$SECRET" \
-            "http://localhost:8000/scim/v2/$ORG/ServiceProviderConfig" \
-            || { echo "seeded token does not authenticate"; exit 1; }
+      - name: "Start Vaultwarden and seed an organisation"
+        run: tools/ci-seed-vaultwarden.sh "$RUNNER_TEMP/vw" "$GITHUB_WORKSPACE/target/ci/vaultwarden"
 
       - name: "Race the last-owner guard"
+        run: SCIM_RACE_DIR="$RUNNER_TEMP/vw" tools/scim-owner-race.sh 40
+
+      # Negative control: the same harness against a binary with the mutex
+      # removed MUST fail. A guard whose absence the test cannot detect is not
+      # being tested, and this step is what stops "0 races" from being a
+      # statement about the harness rather than about the code.
+      - name: "Control: the same race must FAIL without the mutex"
         run: |
-          ln -sfn "$RUNNER_TEMP/vw/data" "$RUNNER_TEMP/vw/vw-data"
-          SCIM_RACE_DIR="$RUNNER_TEMP/vw" tools/scim-owner-race.sh 40
+          pkill -f 'target/ci/vaultwarden' || true
+          sleep 2
+          tools/ci-seed-vaultwarden.sh "$RUNNER_TEMP/vw-control" \
+            "$GITHUB_WORKSPACE/target/control/ci/vaultwarden"
+          if SCIM_RACE_DIR="$RUNNER_TEMP/vw-control" tools/scim-owner-race.sh 25; then
+            echo "::error::The race harness passed against a binary with NO last-owner mutex."
+            echo "::error::It cannot detect the regression it exists to catch. Fix the harness."
+            exit 1
+          fi
+          echo "Control behaved correctly: the harness fails when the mutex is absent."
 
       - name: "Server log on failure"
         if: failure()
-        run: tail -100 "$RUNNER_TEMP/vw/vw.log" || true
+        run: |
+          tail -100 "$RUNNER_TEMP/vw/vw.log" || true
+          tail -100 "$RUNNER_TEMP/vw-control/vw.log" || true
 
   # Heavy: pulls Authentik, starts four containers, waits on its scheduler.
   # Weekly and on demand only.
@@ -139,48 +152,34 @@ jobs:
       - name: "Build"
         run: cargo build --profile ci --features sqlite
 
+      # 0.0.0.0 so the Authentik containers can reach it across the docker0
+      # bridge; the owner-race job stays on loopback.
       - name: "Start Vaultwarden and seed an organisation"
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/vw/data"
-          cd "$RUNNER_TEMP/vw"
-          cat > .env <<EOF
-          DATA_FOLDER=$RUNNER_TEMP/vw/data
-          DATABASE_URL=sqlite://$RUNNER_TEMP/vw/data/db.sqlite3
-          ROCKET_ADDRESS=0.0.0.0
-          ROCKET_PORT=8000
-          DOMAIN=http://localhost:8000
-          SCIM_ENABLED=true
-          ORG_GROUPS_ENABLED=true
-          ORG_EVENTS_ENABLED=true
-          WEB_VAULT_ENABLED=false
-          SIGNUPS_ALLOWED=true
-          EOF
-          set -a; . ./.env; set +a
-          nohup "$GITHUB_WORKSPACE/target/ci/vaultwarden" > vw.log 2>&1 &
-          for _ in $(seq 1 60); do curl -sf -o /dev/null http://localhost:8000/alive && break; sleep 2; done
-          curl -sf -o /dev/null http://localhost:8000/alive || { echo "server never came up"; tail -30 vw.log; exit 1; }
-          ORG=11111111-2222-3333-4444-555555555555
-          SECRET="ci-$(openssl rand -hex 16)"
-          HASH=$(printf '%s' "$SECRET" | sha256sum | cut -d' ' -f1)
-          sqlite3 data/db.sqlite3 "
-            INSERT OR REPLACE INTO organizations (uuid,name,billing_email)
-              VALUES ('$ORG','CI Org','ci@example.com');
-            INSERT OR REPLACE INTO scim_api_key (uuid,org_uuid,key_hash,enabled,created_at,revision_date)
-              VALUES ('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee','$ORG','$HASH',1,datetime('now'),datetime('now'));"
-          echo "ORG=$ORG" >> "$GITHUB_ENV"
-          echo "TOKEN=scim_v1.$ORG.$SECRET" >> "$GITHUB_ENV"
+          tools/ci-seed-vaultwarden.sh "$RUNNER_TEMP/vw" \
+            "$GITHUB_WORKSPACE/target/ci/vaultwarden" 0.0.0.0 > "$RUNNER_TEMP/seed.env"
+          # Masked before it reaches $GITHUB_ENV, whose values are NOT masked by
+          # default and would otherwise appear verbatim in any later step that
+          # dumps the environment.
+          TOKEN_VALUE=$(sed -n 's/^TOKEN=//p' "$RUNNER_TEMP/seed.env")
+          echo "::add-mask::$TOKEN_VALUE"
+          cat "$RUNNER_TEMP/seed.env" >> "$GITHUB_ENV"
 
       # On GitHub's Linux runners containers reach the host through the docker0
       # bridge, not host.docker.internal - that name is Docker Desktop only.
+      #
+      # The token goes through the environment, not argv: anything else on the
+      # runner can read a command line out of ps(1). tools/scim-replay.sh made
+      # the same call and documents it.
       - name: "Run the full lifecycle through Authentik"
         run: |
           HOST_IP=$(ip -4 addr show docker0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
           echo "authentik will reach vaultwarden at $HOST_IP:8000"
-          tools/scim-authentik-e2e.sh \
+          SCIM_TOKEN="$TOKEN" tools/scim-authentik-e2e.sh \
             --domain "http://$HOST_IP:8000" \
-            --org "$ORG" --token "$TOKEN" \
-            --db "$RUNNER_TEMP/vw/data/db.sqlite3"
+            --org "$ORG" \
+            --db "$RUNNER_TEMP/vw/vw-data/db.sqlite3"
 
       - name: "Server log on failure"
         if: failure()

@@ -34,6 +34,18 @@ mysql = ["diesel/mysql", "diesel_migrations/mysql"]
 postgresql = ["diesel/postgres", "diesel_migrations/postgres"]
 sqlite_system = ["diesel/sqlite", "diesel_migrations/sqlite"] # Dynamically link SQLite
 sqlite = ["sqlite_system", "libsqlite3-sys/bundled"] # Statically link SQLite into the binary instead of dynamically.
+# FORK ADDITION (SCIM): compiles OUT the last-owner revocation mutex, so
+# tools/scim-owner-race.sh can measure the race it exists to prevent.
+#
+# A guard whose absence cannot be measured is a guard nobody can prove works.
+# The published control arm ("the race fired on every trial without the mutex")
+# previously came from an uncommitted local edit, which meant the single most
+# load-bearing number in the concurrency story was not reproducible by anyone,
+# including CI. This makes it a build.
+#
+# NEVER enable this in a shipping binary: it deliberately reintroduces a race
+# that can leave an organization with no Owner and no SCIM path back.
+scim-race-control = []
 # Enable to use a vendored and statically linked openssl
 vendored_openssl = ["openssl/vendored"]
 # Enable MiMalloc memory allocator to replace the default malloc

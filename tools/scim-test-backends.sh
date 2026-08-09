@@ -133,13 +133,34 @@ FAILED=0
 PASSED=()
 SKIPPED=()
 
+# Pinned to the same MINORS as .github/workflows/build.yml, which is the source
+# of truth. CLAUDE.md: "Container images are pinned to a minor so patch fixes
+# still arrive but a surprise minor cannot turn an unrelated commit red." These
+# floated on `mysql:8` / `postgres:16` while CI pinned 8.4 / 16.6, so the harness
+# a developer runs before pushing and the one CI runs were on different minors -
+# in the one tool whose entire purpose is verifying dialect differences.
+MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.4}"
+POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16.6}"
+
 run_suite() {
     local backend="$1" url="$2"
     section "Running SCIM suite against $backend"
+    # SCIM_TESTS_REQUIRE_DB turns "this backend has no database, so the guarded
+    # tests quietly skipped" into a hard failure. Both CI workflows set it; this
+    # script did not, which contradicted its own documented contract ("exit 0
+    # only if every selected backend actually ran and passed"). A container that
+    # starts but never accepts connections would skip all 124 guarded tests and
+    # report the backend as passing.
+    #
+    # No --test-threads=1: every test already serialises on TEST_LOCK in-process,
+    # so the flag only doubled local wall clock while implying an invariant that
+    # does not exist - and neither CI workflow passes it, so the two disagreed
+    # about something that turns out not to matter.
     if [ -n "$url" ]; then
-        DATABASE_URL="$url" cargo test --no-default-features --features "$backend" scim -- --test-threads=1
+        SCIM_TESTS_REQUIRE_DB=1 DATABASE_URL="$url" \
+            cargo test --no-default-features --features "$backend" scim
     else
-        cargo test --no-default-features --features "$backend" scim -- --test-threads=1
+        cargo test --no-default-features --features "$backend" scim
     fi
 }
 
@@ -162,7 +183,7 @@ for backend in "${BACKENDS[@]}"; do
                 -e MYSQL_ROOT_PASSWORD="$DB_TEST_PASSWORD" \
                 -e MYSQL_DATABASE=vaultwarden \
                 -p "$MYSQL_PORT:3306" \
-                mysql:8 >/dev/null || { c_bad "could not start MySQL"; FAILED=1; continue; }
+                "$MYSQL_IMAGE" >/dev/null || { c_bad "could not start MySQL"; FAILED=1; continue; }
             if ! wait_ready "$MYSQL_CONTAINER" 180 \
                 mysqladmin ping -h 127.0.0.1 -uroot -p"$DB_TEST_PASSWORD" --silent; then
                 FAILED=1; continue
@@ -183,7 +204,7 @@ for backend in "${BACKENDS[@]}"; do
                 -e POSTGRES_PASSWORD="$DB_TEST_PASSWORD" \
                 -e POSTGRES_DB=vaultwarden \
                 -p "$PG_PORT:5432" \
-                postgres:16 >/dev/null || { c_bad "could not start PostgreSQL"; FAILED=1; continue; }
+                "$POSTGRES_IMAGE" >/dev/null || { c_bad "could not start PostgreSQL"; FAILED=1; continue; }
             if ! wait_ready "$PG_CONTAINER" 180 pg_isready -U postgres -d vaultwarden -h 127.0.0.1; then
                 FAILED=1; continue
             fi

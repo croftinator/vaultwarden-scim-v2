@@ -50,7 +50,7 @@ for row in "${MATRIX[@]}"; do
     # `grep -q`: grep exits on its first match, which SIGPIPEs cargo mid-run, and
     # under `pipefail` that 141 is indistinguishable from a real test failure.
     # shellcheck disable=SC2086
-    env $envs cargo test --features "$FEATURES" -- --test-threads=1 "$filter" 2>&1 | tee "$LOGFILE"
+    env $envs cargo test --features "$FEATURES" "$filter" 2>&1 | tee "$LOGFILE"
 
     # A NON-ZERO pass count, not merely "ok". cargo prints
     # "test result: ok. 0 passed; 0 failed; N filtered out" when the filter
