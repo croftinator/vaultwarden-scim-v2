@@ -12,9 +12,23 @@ third green-path test and believe it bought something:
 Design rationale for individual decisions lives in
 [design.md](design.md#test-strategy).
 
-**There is no self-hostable Entra ID.** Microsoft ships no emulator, so you
-cannot run one in Docker. What you can do is test in rungs of increasing cost,
-and only the last one needs a tenant.
+**None of the three big providers can be run locally.** Entra ID, AWS IAM
+Identity Center and Google Workspace ship no container, no emulator and no local
+mode - the provisioning engine *is* the SaaS product, welded to their identity
+backends, so there is nothing to hand out. (LocalStack emulates much of AWS, but
+Identity Center's outbound SCIM is an enterprise SSO control plane rather than a
+data API; do not assume it is covered.) Microsoft's hosted
+[SCIM Validator](https://scimvalidator.microsoft.com) is the only vendor tool
+that helps, and it needs a public endpoint and an interactive sign-in, so it
+cannot run unattended either.
+
+That is why **Authentik** matters out of proportion to its market share: it is
+self-hostable, so it is the only real provisioning engine CI can drive. It will
+never reproduce Entra's quirks, but it is the one place where software nobody
+here wrote decides what to send. Full reasoning and the coverage table are in
+[providers.md](providers.md).
+
+So: test in rungs of increasing cost, and only the last one needs a tenant.
 
 ## What the suite contains
 

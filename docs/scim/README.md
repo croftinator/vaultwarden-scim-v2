@@ -37,7 +37,7 @@ Start at the top and work down; each assumes the one before.
 |---|---|---|
 | **[deployment.md](deployment.md)** | Cloud-agnostic containers, PostgreSQL, secrets, SSO, and the break-glass Owner | Building the environment |
 | **[setup.md](setup.md)** | Server config, minting the org token, the Entra enterprise application, choosing which users and groups sync | Standing it up for the first time |
-| **[providers.md](providers.md)** | Entra ID, Okta, AWS IAM Identity Center and Google Workspace: what each sends, and what "supported" is verified to mean | Using anything other than Entra |
+| **[providers.md](providers.md)** | Entra ID, Okta, AWS IAM Identity Center and Google Workspace: what each sends, what "supported" is verified to mean, and why only one provider can be tested in CI | Using anything other than Entra |
 | **[client-rollout.md](client-rollout.md)** | Pointing staff Bitwarden apps at your server, zero-touch via browser policy and MDM, manual fallback | Getting users onto it |
 | **[operations.md](operations.md)** | The member lifecycle and the troubleshooting table | Running it day to day |
 | **[reference.md](reference.md)** | Deliberate behaviours, deviations, and named RFC divergences | Something looks wrong but may be by design |

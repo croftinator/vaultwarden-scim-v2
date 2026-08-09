@@ -98,6 +98,34 @@ Configure automated provisioning for a custom SCIM app.
 - Suspension maps to `active: false`; reinstatement is lossless.
 - Google uses `PUT` for full-resource updates as well as `PATCH`.
 
+## Why only one of these can run in CI
+
+Entra ID, AWS IAM Identity Center and Google Workspace ship **no container, no
+emulator and no local mode**. That is not an oversight - the provisioning engine
+*is* the SaaS product, welded to their identity backends, so there is nothing to
+hand out. LocalStack emulates a great deal of AWS, but IAM Identity Center's
+outbound SCIM provisioning is an enterprise SSO control plane rather than a data
+API, and should not be assumed covered.
+
+Microsoft is the only one of the three offering anything, and it is hosted
+rather than local: the [SCIM Validator](https://scimvalidator.microsoft.com)
+checks SCIM 2.0 conformance from their servers, needs no tenant, and despite the
+name is useful for any provider - but it cannot run unattended in CI, because it
+needs a publicly reachable endpoint and an interactive sign-in.
+
+That constraint is the whole reason this repository is arranged the way it is:
+
+| Layer | Covers | Why it exists |
+|---|---|---|
+| In-process suite | All four vendors' **documented** request shapes | The only option for the three that cannot be run |
+| `tools/scim-authentik-e2e.sh` | One **real** engine, full lifecycle, unattended | Authentik is self-hostable, so it is the only engine CI can drive |
+| `tools/scim-replay.sh` | Any vendor's shapes over real HTTPS | Manual, against a live deployment |
+| A live tenant | Assignment scoping, sync cycles, nested groups | The only way to finish the job for the SaaS three |
+
+So Authentik is not a substitute for the other three. It is the only place where
+software we did not write gets to decide what to send, and that is worth having
+even though it will never reproduce Entra's quirks.
+
 ## Getting a tenant to validate against
 
 The support table says "not run against a live tenant" for every provider,

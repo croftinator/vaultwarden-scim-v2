@@ -1,0 +1,187 @@
+# FORK ADDITION (SCIM): end-to-end provisioning against a real engine.
+#
+# Deliberately NOT on every push, and the split matters.
+#
+# `owner-race` is cheap and guards a security invariant the in-process suite
+# provably cannot: Rocket's local client never achieves true request
+# concurrency, so the last-owner race is invisible to `cargo test`. Measured on
+# this implementation, the race fired on 25 of 25 trials with the mutex removed
+# and 0 of 50 with it. That is a regression worth catching, so this job runs on
+# any change to the SCIM code.
+#
+# `authentik` is the opposite trade. It pulls a ~1.8GB image, starts four
+# containers, and waits on a scheduler we do not control - Authentik syncs on
+# its own cadence and exposes no reliable trigger, so the script polls with a
+# generous timeout. Valuable, but too slow and too timing-dependent to gate a
+# push on. It runs weekly and on demand.
+#
+# What neither replaces: `build.yml` is still the merge gate.
+name: Provisioning E2E
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 04:17 UTC. Off the hour on purpose - scheduled jobs
+    # cluster at :00 and get queued behind everyone else's.
+    - cron: "17 4 * * 1"
+  push:
+    paths:
+      - "src/api/scim/**"
+      - "src/db/models/scim_api_key.rs"
+      - "tools/scim-owner-race.sh"
+      - "tools/scim-authentik-e2e.sh"
+      - ".github/workflows/provisioning-e2e.yml"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Fast, deterministic, no containers beyond the build. Runs on every SCIM change.
+  owner-race:
+    name: Last-owner concurrency race
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-Dwarnings"
+    steps:
+      - name: "Install dependencies"
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libssl-dev pkg-config sqlite3
+
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust Caching
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: "v2025.09-rust-e2e"
+
+      - name: "Build"
+        run: cargo build --profile ci --features sqlite
+
+      - name: "Start Vaultwarden and seed an organisation"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/vw/data"
+          cat > "$RUNNER_TEMP/vw/.env" <<EOF
+          DATA_FOLDER=$RUNNER_TEMP/vw/data
+          DATABASE_URL=sqlite://$RUNNER_TEMP/vw/data/db.sqlite3
+          ROCKET_PORT=8000
+          DOMAIN=http://localhost:8000
+          SCIM_ENABLED=true
+          ORG_GROUPS_ENABLED=true
+          ORG_EVENTS_ENABLED=true
+          WEB_VAULT_ENABLED=false
+          SIGNUPS_ALLOWED=true
+          EOF
+          cd "$RUNNER_TEMP/vw"
+          set -a; . ./.env; set +a
+          nohup "$GITHUB_WORKSPACE/target/ci/vaultwarden" > vw.log 2>&1 &
+          for _ in $(seq 1 60); do curl -sf -o /dev/null http://localhost:8000/alive && break; sleep 2; done
+          curl -sf -o /dev/null http://localhost:8000/alive || { echo "server never came up"; tail -30 vw.log; exit 1; }
+
+          # The SCIM guard needs only an organisation row and the sha256 of the
+          # secret, so this skips account registration and its E2EE crypto.
+          ORG=11111111-2222-3333-4444-555555555555
+          SECRET="ci-$(openssl rand -hex 16)"
+          HASH=$(printf '%s' "$SECRET" | sha256sum | cut -d' ' -f1)
+          sqlite3 "$RUNNER_TEMP/vw/data/db.sqlite3" "
+            INSERT OR REPLACE INTO organizations (uuid,name,billing_email)
+              VALUES ('$ORG','CI Org','ci@example.com');
+            INSERT OR REPLACE INTO scim_api_key (uuid,org_uuid,key_hash,enabled,created_at,revision_date)
+              VALUES ('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee','$ORG','$HASH',1,datetime('now'),datetime('now'));"
+          echo "$ORG" > "$RUNNER_TEMP/vw/org-id.txt"
+          echo "scim_v1.$ORG.$SECRET" > "$RUNNER_TEMP/vw/scim-token.txt"
+          curl -sf -o /dev/null -H "Authorization: Bearer scim_v1.$ORG.$SECRET" \
+            "http://localhost:8000/scim/v2/$ORG/ServiceProviderConfig" \
+            || { echo "seeded token does not authenticate"; exit 1; }
+
+      - name: "Race the last-owner guard"
+        run: |
+          ln -sfn "$RUNNER_TEMP/vw/data" "$RUNNER_TEMP/vw/vw-data"
+          SCIM_RACE_DIR="$RUNNER_TEMP/vw" tools/scim-owner-race.sh 40
+
+      - name: "Server log on failure"
+        if: failure()
+        run: tail -100 "$RUNNER_TEMP/vw/vw.log" || true
+
+  # Heavy: pulls Authentik, starts four containers, waits on its scheduler.
+  # Weekly and on demand only.
+  authentik:
+    name: Authentik full lifecycle
+    if: ${{ github.event_name != 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: "-Dwarnings"
+    steps:
+      - name: "Install dependencies"
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libssl-dev pkg-config sqlite3
+
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust Caching
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: "v2025.09-rust-e2e"
+
+      - name: "Build"
+        run: cargo build --profile ci --features sqlite
+
+      - name: "Start Vaultwarden and seed an organisation"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/vw/data"
+          cd "$RUNNER_TEMP/vw"
+          cat > .env <<EOF
+          DATA_FOLDER=$RUNNER_TEMP/vw/data
+          DATABASE_URL=sqlite://$RUNNER_TEMP/vw/data/db.sqlite3
+          ROCKET_ADDRESS=0.0.0.0
+          ROCKET_PORT=8000
+          DOMAIN=http://localhost:8000
+          SCIM_ENABLED=true
+          ORG_GROUPS_ENABLED=true
+          ORG_EVENTS_ENABLED=true
+          WEB_VAULT_ENABLED=false
+          SIGNUPS_ALLOWED=true
+          EOF
+          set -a; . ./.env; set +a
+          nohup "$GITHUB_WORKSPACE/target/ci/vaultwarden" > vw.log 2>&1 &
+          for _ in $(seq 1 60); do curl -sf -o /dev/null http://localhost:8000/alive && break; sleep 2; done
+          curl -sf -o /dev/null http://localhost:8000/alive || { echo "server never came up"; tail -30 vw.log; exit 1; }
+          ORG=11111111-2222-3333-4444-555555555555
+          SECRET="ci-$(openssl rand -hex 16)"
+          HASH=$(printf '%s' "$SECRET" | sha256sum | cut -d' ' -f1)
+          sqlite3 data/db.sqlite3 "
+            INSERT OR REPLACE INTO organizations (uuid,name,billing_email)
+              VALUES ('$ORG','CI Org','ci@example.com');
+            INSERT OR REPLACE INTO scim_api_key (uuid,org_uuid,key_hash,enabled,created_at,revision_date)
+              VALUES ('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee','$ORG','$HASH',1,datetime('now'),datetime('now'));"
+          echo "ORG=$ORG" >> "$GITHUB_ENV"
+          echo "TOKEN=scim_v1.$ORG.$SECRET" >> "$GITHUB_ENV"
+
+      # On GitHub's Linux runners containers reach the host through the docker0
+      # bridge, not host.docker.internal - that name is Docker Desktop only.
+      - name: "Run the full lifecycle through Authentik"
+        run: |
+          HOST_IP=$(ip -4 addr show docker0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+          echo "authentik will reach vaultwarden at $HOST_IP:8000"
+          tools/scim-authentik-e2e.sh \
+            --domain "http://$HOST_IP:8000" \
+            --org "$ORG" --token "$TOKEN" \
+            --db "$RUNNER_TEMP/vw/data/db.sqlite3"
+
+      - name: "Server log on failure"
+        if: failure()
+        run: tail -100 "$RUNNER_TEMP/vw/vw.log" || true
