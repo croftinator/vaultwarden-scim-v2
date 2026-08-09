@@ -66,19 +66,17 @@ fn check_scim_enabled() -> EmptyResult {
 // Records a SCIM token management action in the org event log under the acting
 // admin's own identity (this is an interactive, re-authenticated admin action,
 // not a SCIM-driven one, so it does not use the synthetic SCIM actor). The org
-// itself is the event source; OrganizationUpdated is the closest existing type,
-// matching how the admin panel logs org-level configuration changes.
-async fn log_scim_key_event(headers: &OwnerHeaders, org_id: &OrganizationId, conn: &DbConn) {
-    log_event(
-        EventType::OrganizationUpdated as i32,
-        org_id,
-        org_id,
-        &headers.user.uuid,
-        headers.device.atype,
-        &headers.ip.ip,
-        conn,
-    )
-    .await;
+// itself is the event source.
+//
+// The caller names the action. All four of these used to log as
+// OrganizationUpdated, which left the event stream unable to distinguish a
+// credential mint from any other configuration change - or from a revoke - for a
+// credential that can deprovision every member of the organization. Correlating
+// timestamps against the scim_api_key row was the only way to reconstruct the
+// lifecycle, and that row keeps no history. See EventType for why the numbers
+// sit outside Bitwarden's range.
+async fn log_scim_key_event(event_type: EventType, headers: &OwnerHeaders, org_id: &OrganizationId, conn: &DbConn) {
+    log_event(event_type as i32, org_id, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn).await;
 }
 
 // The single place a SCIM token is minted. Generates the secret, replaces any
@@ -119,7 +117,9 @@ async fn generate_scim_key(
     data.into_inner().validate(&headers.user, true, &conn).await?;
 
     let (token, scim_key) = mint_scim_token(&org_id, &conn).await?;
-    log_scim_key_event(&headers, &org_id, &conn).await;
+    // Covers rotation too: minting over an existing key replaces it, and the
+    // previous token stops working at that instant.
+    log_scim_key_event(EventType::ScimCredentialCreated, &headers, &org_id, &conn).await;
 
     Ok(Json(json!({
         "object": "scim-api-key",
@@ -142,7 +142,7 @@ async fn delete_scim_key(
     data.into_inner().validate(&headers.user, true, &conn).await?;
 
     ScimApiKey::delete_all_by_organization(&org_id, &conn).await?;
-    log_scim_key_event(&headers, &org_id, &conn).await;
+    log_scim_key_event(EventType::ScimCredentialRevoked, &headers, &org_id, &conn).await;
     Ok(())
 }
 
@@ -179,7 +179,14 @@ async fn set_scim_key_enabled(
         err!("No SCIM api key is configured for this organization");
     }
     ScimApiKey::set_enabled(&org_id, data.enabled, &conn).await?;
-    log_scim_key_event(&headers, &org_id, &conn).await;
+    // The kill switch is reversible, so which direction it was flipped is the
+    // whole content of the event.
+    let event_type = if data.enabled {
+        EventType::ScimCredentialEnabled
+    } else {
+        EventType::ScimCredentialDisabled
+    };
+    log_scim_key_event(event_type, &headers, &org_id, &conn).await;
 
     Ok(Json(json!({
         "object": "scim-api-key",

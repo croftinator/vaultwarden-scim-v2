@@ -13,7 +13,7 @@
 // and the user already has credentials). Confirmed requires an admin client
 // to wrap the org key for the member; no server-side path can do that.
 //
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 use rocket::Route;
 use serde_json::Value;
@@ -638,15 +638,10 @@ async fn precheck_active_change(
 // which refuses that legitimate revoke; the difference is deliberate, and the
 // reason SCIM does not simply reuse the upstream condition.
 //
-// KNOWN LIMITATION, tracked in TODOS.md: this is a check-then-act, and the
-// count and the write are separate statements. Two concurrent revokes of two
-// DIFFERENT Owners can each observe a count of 2 and both proceed, leaving the
-// organization with none. Closing it needs either SERIALIZABLE isolation, a lock
-// on a row both requests contend on, or a maintained counter column - and this
-// codebase uses no transactions or row locking anywhere, so the fix is an
-// architectural decision rather than a local one. A single conditional UPDATE
-// does NOT close it: the two requests target different rows, so their row locks
-// never conflict and both snapshots still read the pre-revoke count.
+// This is a check-then-act: the count and the write are separate statements, so
+// on its own it is not safe against concurrency. Callers that WRITE must hold
+// `OWNER_REVOKE_LOCK` across both - see `revoke_member`. Used bare only by
+// `precheck_active_change`, which performs no write and is advisory.
 async fn reject_last_owner_revoke(member: &Membership, token: &ScimToken, conn: &DbConn) -> Result<(), ScimError> {
     if member.atype == MembershipType::Owner
         && Membership::count_active_by_org_and_type(&token.org_uuid, MembershipType::Owner, conn).await <= 1
@@ -656,16 +651,56 @@ async fn reject_last_owner_revoke(member: &Membership, token: &ScimToken, conn: 
     Ok(())
 }
 
+// Serialises owner-revocations so the last-owner guard cannot be raced.
+//
+// The guard counts active Owners and then writes, as two separate statements.
+// Two concurrent requests revoking two DIFFERENT Owners each observed a count of
+// 2, each concluded it was not the last, and both committed - leaving the
+// organization with no Owner at all. SCIM cannot repair that itself, because
+// `reject_privileged_grant` refuses to restore a privileged membership.
+//
+// A conditional UPDATE does not fix this, which is why the lock exists: the two
+// requests target different rows, so their row locks never conflict and both
+// snapshots still read the pre-revoke count. Fixing it in the database needs
+// SERIALIZABLE isolation, a lock on a row both requests contend on, or a
+// maintained counter column - and this codebase uses no transactions or row
+// locking anywhere, so any of those is an architectural change rather than a
+// local one.
+//
+// What this DOES close: two requests in one process, which is how Vaultwarden is
+// overwhelmingly deployed. What it does NOT close: two replicas sharing one
+// database, where each holds its own lock. That residual is recorded in
+// TODOS.md; it needs the database-level fix above.
+//
+// One global lock rather than one per organization, deliberately. Owner
+// revocation is rare, the lock is taken only when `atype` is Owner - so ordinary
+// deprovisioning never touches it - and a per-organization map would grow
+// without bound and need eviction logic to solve a problem this does not have.
+static OWNER_REVOKE_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 async fn revoke_member(member: &mut Membership, token: &ScimToken, conn: &DbConn) -> Result<(), ScimError> {
     if !membership_active(member) {
         // Already revoked: deprovisioning is idempotent.
         return Ok(());
     }
 
+    // Held across BOTH the count and the write, which is the whole point: the
+    // guard below is a check-then-act and is only sound while this is held.
+    // Non-owners skip it entirely, so the common path is uncontended.
+    let _owner_guard = if member.atype == MembershipType::Owner {
+        Some(OWNER_REVOKE_LOCK.lock().await)
+    } else {
+        None
+    };
+
     // The same guard the PUT/PATCH precheck runs, kept here because delete_user
     // reaches this function without going through that precheck. One helper
     // rather than two copies: the condition and its 400 body were duplicated
     // verbatim, so a change to either could silently apply to one path only.
+    //
+    // This call is the authoritative one. The precheck runs the same test
+    // without the lock and is advisory - it exists to refuse before an
+    // externalId write commits, not to decide the outcome.
     reject_last_owner_revoke(member, token, conn).await?;
 
     member.revoke();

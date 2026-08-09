@@ -121,6 +121,29 @@ pub enum EventType {
     // OrganizationSponsorshipsSynced = 1608, // Not supported
     // OrganizationCollectionManagementUpdated = 1609, // Not supported
 
+    // FORK ADDITION (SCIM): the per-organization SCIM credential lifecycle.
+    //
+    // Numbered at 9100, far outside Bitwarden's 1000-1999 block, and that
+    // distance is the point. Every action below previously logged as
+    // OrganizationUpdated, so an auditor could not tell a credential mint from
+    // any other configuration change, nor a mint from a revoke - while the
+    // credential in question can deprovision every member of the organization.
+    //
+    // Unassigned numbers INSIDE Bitwarden's range were the obvious place and are
+    // the wrong one. Those numbers are theirs to allocate: if a future release
+    // assigns 1610 to something else, these historical records do not become
+    // unreadable, they become WRONG - a stored audit event that renders as a
+    // different action entirely. In records kept precisely to be trustworthy,
+    // an unknown label is a far better failure than a confident wrong one.
+    //
+    // The cost is that a client which maps event types by number shows these as
+    // unknown rather than by name. That is cosmetic, limited to these four, and
+    // does not affect an events export, which is how an audit consumes them.
+    ScimCredentialCreated = 9100,
+    ScimCredentialRevoked = 9101,
+    ScimCredentialEnabled = 9102,
+    ScimCredentialDisabled = 9103,
+
     // Policy
     PolicyUpdated = 1700,
     // Provider (Not yet supported)

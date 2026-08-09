@@ -6079,3 +6079,146 @@ async fn a_method_not_allowed_stays_in_the_scim_envelope() {
         "the response must carry the SCIM Error schema URN"
     );
 }
+
+/// Each SCIM credential action logs its OWN event type.
+///
+/// All four used to log as `OrganizationUpdated`, so the event stream could not
+/// distinguish a credential mint from any other configuration change, nor a mint
+/// from a revoke - for a credential that can deprovision every member of the
+/// organization. Reconstructing the lifecycle meant correlating timestamps
+/// against the `scim_api_key` row, which keeps no history.
+#[rocket::async_test]
+async fn each_scim_credential_action_logs_its_own_event_type() {
+    let _guard = scim_test_guard!();
+    let (manage, pool) = manage_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-key-events-org").await;
+    let owner = seed_admin_session(&conn, &org, "key.events.owner@example.com", MembershipType::Owner).await;
+    let before = chrono::Utc::now().naive_utc().checked_sub_signed(chrono::Duration::hours(1)).expect("start");
+
+    // Mint, disable, enable, delete - the whole lifecycle, in order.
+    let (ct, body) = password_body(&json!({"masterPasswordHash": ADMIN_PASSWORD}));
+    let response = manage
+        .post(format!("/api/organizations/{org}/scim/api-key"))
+        .header(owner.clone())
+        .header(ct)
+        .body(body)
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok, "mint");
+
+    for (enabled, label) in [(false, "disable"), (true, "enable")] {
+        let (ct, body) = password_body(&json!({"masterPasswordHash": ADMIN_PASSWORD, "enabled": enabled}));
+        let response = manage
+            .put(format!("/api/organizations/{org}/scim/api-key/enabled"))
+            .header(owner.clone())
+            .header(ct)
+            .body(body)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok, "{label}");
+    }
+
+    let (ct, body) = password_body(&json!({"masterPasswordHash": ADMIN_PASSWORD}));
+    let response = manage
+        .delete(format!("/api/organizations/{org}/scim/api-key"))
+        .header(owner)
+        .header(ct)
+        .body(body)
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok, "delete");
+
+    let events = Event::find_by_organization_uuid(
+        &org,
+        &before,
+        &chrono::Utc::now().naive_utc().checked_add_signed(chrono::Duration::hours(1)).expect("end"),
+        &conn,
+    )
+    .await;
+    let logged: Vec<i32> = events.iter().map(|e| e.event_type).collect();
+
+    for (expected, label) in [
+        (EventType::ScimCredentialCreated, "mint"),
+        (EventType::ScimCredentialDisabled, "disable"),
+        (EventType::ScimCredentialEnabled, "enable"),
+        (EventType::ScimCredentialRevoked, "delete"),
+    ] {
+        assert!(logged.contains(&(expected as i32)), "{label} must log its own event type, got {logged:?}");
+    }
+
+    // The point of the change: these are distinguishable from each other AND
+    // from the generic org-configuration event they used to share.
+    assert!(
+        !logged.contains(&(EventType::OrganizationUpdated as i32)),
+        "credential actions must no longer hide inside OrganizationUpdated, got {logged:?}"
+    );
+
+    // Numbered outside Bitwarden's 1000-1999 block so a future upstream
+    // definition cannot silently redefine a stored audit record.
+    for e in [
+        EventType::ScimCredentialCreated,
+        EventType::ScimCredentialRevoked,
+        EventType::ScimCredentialEnabled,
+        EventType::ScimCredentialDisabled,
+    ] {
+        assert!((e as i32) > 1999, "SCIM credential events must sit outside Bitwarden's reserved range");
+    }
+}
+
+/// Concurrent revokes cannot strip an organization of every Owner.
+///
+/// The last-owner guard counts active Owners and then writes, as two separate
+/// statements. Two requests revoking two DIFFERENT Owners each observed a count
+/// of 2, each concluded it was not the last, and both committed - leaving the
+/// organization with none, which SCIM cannot repair because
+/// `reject_privileged_grant` refuses to restore a privileged membership.
+///
+/// `OWNER_REVOKE_LOCK` serialises the count and the write, so the second request
+/// sees the first one's result.
+///
+/// WHAT THIS TEST DOES AND DOES NOT PROVE, measured rather than assumed:
+///
+/// - Delete the guard and this FAILS (both revokes commit, `revoked` is 2). So
+///   it is a real regression test for the invariant.
+/// - Delete the LOCK and this still PASSES. Rocket's local client does not
+///   achieve true request concurrency here, so the two dispatches do not
+///   actually interleave inside the count-then-write window.
+///
+/// The lock is therefore correct by construction, not by demonstration: it is
+/// held across both statements in `revoke_member`, which is a property you
+/// verify by reading it. Do not "improve" this test by asserting it covers the
+/// lock, and do not delete the lock because this test stays green without it.
+/// Two replicas sharing a database still race regardless - that needs a
+/// database-level fix and is recorded in TODOS.md.
+#[rocket::async_test]
+async fn concurrent_owner_revokes_cannot_leave_the_org_without_one() {
+    let _guard = scim_test_guard!();
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-owner-race-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    // Exactly two active Owners: the state where the race is reachable. With
+    // three, both revokes are legitimate and prove nothing.
+    let first = seed_member(&conn, &org, "race.owner.a@example.com", 2, MembershipType::Owner).await;
+    let second = seed_member(&conn, &org, "race.owner.b@example.com", 2, MembershipType::Owner).await;
+    assert_eq!(Membership::count_active_by_org_and_type(&org, MembershipType::Owner, &conn).await, 2);
+
+    // Fired together, each targeting a different Owner row - so row locks never
+    // collide and only the shared guard can order them.
+    let mut inflight = Vec::new();
+    for member in [&first, &second] {
+        let (auth, ct, _) = scim_body(&token, &json!({}));
+        inflight.push(client.delete(format!("/scim/v2/{org}/Users/{member}")).header(auth).header(ct).dispatch());
+    }
+    let responses = futures::future::join_all(inflight).await;
+    let revoked = responses.iter().filter(|r| r.status() == Status::NoContent).count();
+    let refused = responses.iter().filter(|r| r.status() == Status::BadRequest).count();
+
+    assert_eq!(revoked, 1, "exactly one revoke may succeed");
+    assert_eq!(refused, 1, "the other must be refused as the last owner");
+
+    let remaining = Membership::count_active_by_org_and_type(&org, MembershipType::Owner, &conn).await;
+    assert_eq!(remaining, 1, "the organization must never be left without an active Owner");
+}
