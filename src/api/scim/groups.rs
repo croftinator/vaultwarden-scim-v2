@@ -88,7 +88,6 @@ fn scim_group_body(group: &Group, token: &ScimToken, members: Option<&[Membershi
     let mut body = json!({
         "schemas": [crate::api::scim::discovery::GROUP_SCHEMA_URN],
         "id": group.uuid,
-        "externalId": group.external_id,
         "displayName": group.name,
         "meta": {
             "resourceType": "Group",
@@ -97,6 +96,12 @@ fn scim_group_body(group: &Group, token: &ScimToken, members: Option<&[Membershi
             "lastModified": crate::util::format_date(&group.revision_date),
         },
     });
+    // Omitted rather than null when unset; see to_scim_user for the reasoning.
+    // A group created in the web vault has no externalId, so this is the common
+    // case here rather than an edge one.
+    if let Some(external_id) = &group.external_id {
+        body["externalId"] = json!(external_id);
+    }
     if let Some(members) = members {
         body["members"] = json!(members.iter().map(|id| json!({"value": id})).collect::<Vec<Value>>());
     }

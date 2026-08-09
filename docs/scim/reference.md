@@ -4,8 +4,9 @@ Behaviour that is deliberate but surprising. If something here looks like a bug,
 read the reason before changing it - most of these are load-bearing under
 end-to-end encryption.
 
-- **DELETE = revoke.** Both Entra soft delete (`active: false`) and hard
-  DELETE revoke the membership. The row and its keys survive, so restoring a
+- **DELETE = revoke.** Both a soft delete (`active: false`, which Entra, Okta
+  and Google all use) and a hard DELETE (which AWS IAM Identity Center issues on
+  unassignment) revoke the membership. The row and its keys survive, so restoring a
   returning user needs no re-confirmation. No destructive operation is
   exposed to the IdP at all. This is a deliberate deviation from RFC 7644.
 - **Roles are not synced.** Everyone provisions as the User role;

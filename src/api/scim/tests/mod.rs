@@ -6222,3 +6222,291 @@ async fn concurrent_owner_revokes_cannot_leave_the_org_without_one() {
     let remaining = Membership::count_active_by_org_and_type(&org, MembershipType::Owner, &conn).await;
     assert_eq!(remaining, 1, "the organization must never be left without an active Owner");
 }
+
+// ---------------------------------------------------------------------------
+// Cross-provider compatibility.
+//
+// The endpoints are RFC 7643/7644 SCIM 2.0, not an Entra integration: nothing
+// in the request path branches on the client. The Entra-specific work is
+// TOLERANCE - accepting "Replace" casing, string booleans and path-less values
+// that a spec-correct client would never send - and tolerance cannot break a
+// client that does not need it.
+//
+// These tests hold that claim to account by replaying the documented request
+// shapes of the other major provisioning engines. They are written from each
+// vendor's published SCIM documentation, NOT from observed traffic against a
+// real tenant, which is the same limitation the Entra coverage carries and is
+// recorded for all four in TODOS.md.
+// ---------------------------------------------------------------------------
+
+/// Attributes that are unset must be OMITTED, not returned as null.
+///
+/// RFC 7643 section 2.5. Entra tolerates a null, so this is about every other
+/// client: a provisioning engine that round-trips the resource can read an
+/// explicit null as "clear this", and unlink the member from its directory
+/// object on the next write. Conformance validators check it directly.
+#[rocket::async_test]
+async fn an_unset_external_id_is_omitted_rather_than_null() {
+    let _guard = scim_test_guard!();
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-null-extid-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    // Created without an externalId, which is legal - RFC 7643 makes it optional.
+    let payload = json!({
+        "schemas": [scim::discovery::USER_SCHEMA_URN],
+        "userName": "no.extid@example.com",
+    });
+    let (auth, ct, body) = scim_body(&token, &payload);
+    let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+    let created = parse_json(&body_of(response).await);
+    assert!(!created.as_object().expect("object").contains_key("externalId"), "unset externalId must be absent");
+
+    // And on read, and in a list - the same rule applies to every representation.
+    let member_id = created["id"].as_str().expect("id").to_owned();
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response = client.get(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).dispatch().await;
+    let fetched = parse_json(&body_of(response).await);
+    assert!(!fetched.as_object().expect("object").contains_key("externalId"), "absent on GET too");
+
+    // A group created in the web vault has no externalId either, so this is the
+    // common case on that endpoint rather than an edge one.
+    let mut plain = Group::new(org.clone(), "No ExtId Group".to_owned(), false, None);
+    plain.save(&conn).await.expect("saving group");
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response = client.get(format!("/scim/v2/{org}/Groups/{}", plain.uuid)).header(auth).header(ct).dispatch().await;
+    let group = parse_json(&body_of(response).await);
+    assert!(!group.as_object().expect("object").contains_key("externalId"), "absent on Groups too");
+
+    // The control: when it IS set it must still be present and correct, or this
+    // test would pass just as happily against an endpoint that never emits it.
+    let payload = json!({
+        "schemas": [scim::discovery::USER_SCHEMA_URN],
+        "userName": "has.extid@example.com",
+        "externalId": "ext-present-1",
+    });
+    let (auth, ct, body) = scim_body(&token, &payload);
+    let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(parse_json(&body_of(response).await)["externalId"], json!("ext-present-1"));
+}
+
+/// Okta's documented provisioning cycle.
+///
+/// Okta imports by `userName eq`, creates with name/emails/active, deactivates
+/// with a PATH-LESS replace carrying a value object, and pushes group membership
+/// with `add`/`remove` on `members`. The path-less form is the one worth pinning:
+/// it is the same shape Entra sends, so a "fix" that made the parser stricter
+/// about requiring a path would break both engines at once.
+#[rocket::async_test]
+async fn the_okta_provisioning_cycle_works_end_to_end() {
+    let _guard = scim_test_guard!();
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-okta-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    // 1. Import probe for a user Okta has not created yet: empty 200, not 404.
+    let filter = url_escape("userName eq \"okta.user@example.com\"");
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response = client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(response.status(), Status::Ok, "an import probe must not 404");
+    assert_eq!(parse_json(&body_of(response).await)["totalResults"], json!(0));
+
+    // 2. Create, in Okta's documented payload shape.
+    let create = json!({
+        "schemas": [scim::discovery::USER_SCHEMA_URN],
+        "userName": "okta.user@example.com",
+        "name": {"givenName": "Okta", "familyName": "User"},
+        "emails": [{"primary": true, "value": "okta.user@example.com", "type": "work"}],
+        "displayName": "Okta User",
+        "active": true,
+        "externalId": "00u1okta",
+    });
+    let (auth, ct, body) = scim_body(&token, &create);
+    let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+    let member_id = parse_json(&body_of(response).await)["id"].as_str().expect("id").to_owned();
+
+    // 3. Group push: create then add the member.
+    let create_group = json!({
+        "schemas": [scim::discovery::GROUP_SCHEMA_URN],
+        "displayName": "Okta Pushed Group",
+        "externalId": "00g1okta",
+    });
+    let (auth, ct, body) = scim_body(&token, &create_group);
+    let response = client.post(format!("/scim/v2/{org}/Groups")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+    let group_id = parse_json(&body_of(response).await)["id"].as_str().expect("id").to_owned();
+
+    let add = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "add", "path": "members", "value": [{"value": member_id, "display": "Okta User"}]}],
+    });
+    let (auth, ct, body) = scim_body(&token, &add);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Ok, "Okta group push must be accepted");
+    assert_eq!(parse_json(&body_of(response).await)["members"].as_array().expect("members").len(), 1);
+
+    // 4. Deactivate with Okta's path-less replace.
+    let deactivate = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "value": {"active": false}}],
+    });
+    let (auth, ct, body) = scim_body(&token, &deactivate);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(parse_json(&body_of(response).await)["active"], json!(false), "path-less deactivate must apply");
+
+    // 5. Reactivate, because Okta reassignment is a reactivation not a re-create.
+    let reactivate = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "value": {"active": true}}],
+    });
+    let (auth, ct, body) = scim_body(&token, &reactivate);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(parse_json(&body_of(response).await)["active"], json!(true), "restore must be lossless");
+}
+
+/// AWS IAM Identity Center's documented provisioning cycle.
+///
+/// AWS is the narrowest of the engines: it sends only `eq` filters, and only on
+/// `userName` for Users and `displayName` for Groups - exactly the two this
+/// server implements. It deactivates with an explicit `path: "active"` and a
+/// real JSON boolean, which is the spec-correct form Entra's string "False"
+/// tolerance sits alongside rather than replaces.
+#[rocket::async_test]
+async fn the_aws_identity_center_provisioning_cycle_works_end_to_end() {
+    let _guard = scim_test_guard!();
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-aws-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    let create = json!({
+        "schemas": [scim::discovery::USER_SCHEMA_URN],
+        "userName": "aws.user@example.com",
+        "name": {"givenName": "Aws", "familyName": "User"},
+        "emails": [{"value": "aws.user@example.com", "type": "work", "primary": true}],
+        "displayName": "Aws User",
+        "active": true,
+        "externalId": "aws-ext-1",
+    });
+    let (auth, ct, body) = scim_body(&token, &create);
+    let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+    let member_id = parse_json(&body_of(response).await)["id"].as_str().expect("id").to_owned();
+
+    // The only two filters AWS emits.
+    let filter = url_escape("userName eq \"aws.user@example.com\"");
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response = client.get(format!("/scim/v2/{org}/Users?filter={filter}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(parse_json(&body_of(response).await)["totalResults"], json!(1), "AWS userName filter must match");
+
+    let create_group = json!({
+        "schemas": [scim::discovery::GROUP_SCHEMA_URN],
+        "displayName": "AWS Group",
+        "externalId": "aws-grp-1",
+        "members": [{"value": member_id}],
+    });
+    let (auth, ct, body) = scim_body(&token, &create_group);
+    let response = client.post(format!("/scim/v2/{org}/Groups")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+
+    let filter = url_escape("displayName eq \"AWS Group\"");
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response =
+        client.get(format!("/scim/v2/{org}/Groups?filter={filter}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(parse_json(&body_of(response).await)["totalResults"], json!(1), "AWS displayName filter must match");
+
+    // Deactivation: explicit path, real boolean.
+    let deactivate = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "active", "value": false}],
+    });
+    let (auth, ct, body) = scim_body(&token, &deactivate);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(parse_json(&body_of(response).await)["active"], json!(false));
+
+    // AWS also issues DELETE on unassignment; the row must survive as a revocation so
+    // the akey is preserved and reassignment is lossless.
+    let (auth, ct, _) = scim_body(&token, &json!({}));
+    let response = client.delete(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).dispatch().await;
+    assert_eq!(response.status(), Status::NoContent);
+    let member_uuid: MembershipId = member_id.clone().into();
+    assert!(
+        Membership::find_by_uuid_and_org(&member_uuid, &org, &conn).await.is_some(),
+        "DELETE must revoke, never destroy the membership"
+    );
+}
+
+/// Google Workspace's documented provisioning cycle.
+///
+/// Google sends spec-correct SCIM with lowercase ops and real booleans, and
+/// composes the display name from `name.givenName` and `name.familyName` rather
+/// than sending `displayName`. That composition is the part worth pinning: it is
+/// server-side behaviour, so a change to it would silently rename every member
+/// Google provisions.
+#[rocket::async_test]
+async fn the_google_workspace_provisioning_cycle_works_end_to_end() {
+    let _guard = scim_test_guard!();
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-google-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    // No displayName: Google supplies the name parts and expects the server to
+    // compose one.
+    let create = json!({
+        "schemas": [scim::discovery::USER_SCHEMA_URN],
+        "userName": "google.user@example.com",
+        "name": {"givenName": "Google", "familyName": "User"},
+        "emails": [{"value": "google.user@example.com", "type": "work", "primary": true}],
+        "active": true,
+        "externalId": "google-ext-1",
+    });
+    let (auth, ct, body) = scim_body(&token, &create);
+    let response = client.post(format!("/scim/v2/{org}/Users")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Created);
+    let created = parse_json(&body_of(response).await);
+    assert_eq!(created["displayName"], json!("Google User"), "givenName + familyName must compose a display name");
+    let member_id = created["id"].as_str().expect("id").to_owned();
+
+    // Suspension in Google is a deactivate, and reinstatement must be lossless.
+    for (active, label) in [(false, "suspend"), (true, "reinstate")] {
+        let patch = json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "active", "value": active}],
+        });
+        let (auth, ct, body) = scim_body(&token, &patch);
+        let response = client
+            .patch(format!("/scim/v2/{org}/Users/{member_id}"))
+            .header(auth)
+            .header(ct)
+            .body(body)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok, "{label}");
+        assert_eq!(parse_json(&body_of(response).await)["active"], json!(active), "{label}");
+    }
+
+    // A PUT carrying the whole resource, which Google uses for updates.
+    let replace = json!({
+        "schemas": [scim::discovery::USER_SCHEMA_URN],
+        "userName": "google.user@example.com",
+        "name": {"givenName": "Google", "familyName": "User"},
+        "active": true,
+        "externalId": "google-ext-1",
+    });
+    let (auth, ct, body) = scim_body(&token, &replace);
+    let response =
+        client.put(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Ok, "a full-resource PUT must be accepted");
+    assert_eq!(parse_json(&body_of(response).await)["externalId"], json!("google-ext-1"));
+}

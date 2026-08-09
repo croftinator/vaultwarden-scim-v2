@@ -89,10 +89,9 @@ fn reject_privileged_grant(member: &Membership) -> Result<(), ScimError> {
 
 fn to_scim_user(member: &Membership, user: &User, token: &ScimToken) -> Value {
     let location = crate::api::scim::resource_location(&token.org_uuid, "Users", &member.uuid);
-    json!({
+    let mut body = json!({
         "schemas": [crate::api::scim::discovery::USER_SCHEMA_URN],
         "id": member.uuid,
-        "externalId": member.external_id,
         "userName": user.email,
         "displayName": user.name,
         "active": membership_active(member),
@@ -101,7 +100,18 @@ fn to_scim_user(member: &Membership, user: &User, token: &ScimToken) -> Value {
             "resourceType": "User",
             "location": location,
         },
-    })
+    });
+    // Omitted when unset, not serialized as null. RFC 7643 section 2.5 says an
+    // unassigned attribute should be left out of the representation rather than
+    // returned with a null value, and strict clients and conformance validators
+    // do check it. Entra tolerates either, so this is about every OTHER client:
+    // a provisioning engine that round-trips the resource can read an explicit
+    // null as "clear this", which would unlink the member from its directory
+    // object on the next write.
+    if let Some(external_id) = &member.external_id {
+        body["externalId"] = json!(external_id);
+    }
+    body
 }
 
 async fn log_scim_event(event_type: EventType, member: &Membership, token: &ScimToken, conn: &DbConn) {

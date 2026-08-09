@@ -42,6 +42,19 @@ the other branch.
 **Effort:** -
 **Priority:** closed
 
+### Live tenant validation, all providers
+
+**Scope widened 2026-08-09.** The suite now covers the documented provisioning
+cycle for Okta, AWS IAM Identity Center and Google Workspace alongside Entra
+(`the_okta_provisioning_cycle_works_end_to_end` and siblings), all written from
+published vendor documentation rather than observed traffic. The item below
+therefore applies to each of them, not only Entra: no provider has been synced
+from a real tenant. docs/scim/providers.md says so in its support table, so
+"supported" is not read as "certified".
+
+The cheapest independent check remains Microsoft's hosted SCIM Validator, which
+tests SCIM 2.0 conformance generally despite the name and needs no tenant.
+
 ### Live Entra ID tenant validation
 
 **What:** Run the full lifecycle against a throwaway Entra tenant: Test

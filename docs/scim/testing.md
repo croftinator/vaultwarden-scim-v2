@@ -18,12 +18,12 @@ and only the last one needs a tenant.
 
 ## What the suite contains
 
-`cargo test --features sqlite` builds 187 tests. 158 are SCIM's; the other 29
+`cargo test --features sqlite` builds 193 tests. 164 are SCIM's; the other 29
 are upstream's and are unrelated to this feature.
 
 | Where | Count | What it covers |
 |---|---|---|
-| `src/api/scim/tests/mod.rs` | 121 | End-to-end over HTTP through the real Rocket router and a real database |
+| `src/api/scim/tests/mod.rs` | 127 | End-to-end over HTTP through the real Rocket router and a real database, including the documented provisioning cycle of all four major providers |
 | `src/api/scim/patch.rs` | 20 | The PATCH parser: op casing, string booleans, path-less values, member filters |
 | `src/api/scim/filter.rs` | 4 | The `eq` filter parser, including a 20,000-case fuzz pass |
 | `src/api/scim/error.rs` | 4 | Every error is a well-formed SCIM envelope with the RFC-sanctioned status |
@@ -201,6 +201,20 @@ inspection. Requires `curl` and `jq`.
 Mint the token first (Part B). The script cleans up after itself by revoking the
 member and deleting the test group; the shell account it creates remains, since
 SCIM never deletes accounts.
+
+## Other identity providers
+
+Rung 1 covers the documented provisioning cycle for Okta, AWS IAM Identity
+Center and Google Workspace as well as Entra: the import probe, the create
+payload each engine sends, its deactivation form, group membership, and the
+lossless reactivation. Those tests are written from published vendor
+documentation rather than observed traffic, which is the same caveat the Entra
+coverage carries. [providers.md](providers.md) states what "supported" is
+verified to mean for each.
+
+The replay script below is Entra-shaped, but most of what it fires is plain
+SCIM 2.0, so it is still a useful smoke test against a live server for any
+provider.
 
 ## Rung 3 - Microsoft SCIM Validator (no tenant needed)
 
