@@ -25,7 +25,7 @@ code path a strict client can take that a lenient one cannot.
 | **Microsoft Entra ID** | Primary target | Request shapes replayed in the suite and by `tools/scim-replay.sh`. No live tenant sync yet - see TODOS.md. |
 | **Okta** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live Okta org. |
 | **AWS IAM Identity Center** | **Not applicable - cannot drive this endpoint** | It is a SCIM *server*: it RECEIVES provisioning from an IdP and has no outbound SCIM to third-party applications. Corrected 2026-08-09 after checking AWS's documentation; an earlier version of this table wrongly listed it as supported. |
-| **Google Workspace / Cloud Identity** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live tenant. |
+| **Google Workspace / Cloud Identity** | Supported, on a paid tier | Documented provisioning cycle covered in the suite; not run against a live tenant. Cloud Identity **Free** has no outbound SCIM at all. Group provisioning is reportedly limited - verify against your tenant. |
 | **Authentik** (self-hosted) | **Verified working** | The only provider actually run against this implementation: a full lifecycle sync, 46 requests, no errors. See "Rung 2b" in [testing.md](testing.md). |
 | Any other SCIM 2.0 client | Should work | Only the standard surface is implemented. |
 
@@ -164,7 +164,7 @@ obtained free. Rough order of effort:
 |---|---|---|
 | **Microsoft SCIM Validator** | Free, no tenant | Only needs a Microsoft account and a publicly reachable HTTPS endpoint. Despite the name it checks SCIM 2.0 conformance generally, so it is the best first move for any provider. |
 | **Okta** | Free developer account | `developer.okta.com`. Create a private SCIM 2.0 app, enable provisioning, point it at your endpoint. Closest thing to a full engine at zero cost. |
-| **Google Workspace** | Needs a paid plan | Automated provisioning is not on the free tier. A trial works. |
+| **Google Workspace / Cloud Identity** | Needs a paid tier | Cloud Identity **Free** has no outbound SCIM - the default for many GCP-only orgs. Needs Cloud Identity Premium, or Workspace Business and above. |
 | **Microsoft Entra ID** | Needs P1/P2 | A free tenant will not offer *Automatic* provisioning at all. Use a P2 trial or a developer sandbox. |
 
 Your endpoint has to be publicly reachable over HTTPS for any of them - see

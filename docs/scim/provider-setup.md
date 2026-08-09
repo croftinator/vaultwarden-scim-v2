@@ -255,7 +255,19 @@ description of what it *sends*. The first question to ask about any provider is
 
 ## Google Workspace / Cloud Identity
 
-**Auto-provisioning is not on the free tier.** A Workspace trial works.
+**Check your tier first - this is where Google Cloud customers get caught.**
+
+| Product | SCIM outbound provisioning |
+|---|---|
+| **Cloud Identity Free** | **No.** This is the default for many GCP-only organisations, and it cannot provision at all |
+| Cloud Identity Premium | Yes |
+| Google Workspace Business and above | Yes |
+| Google Workspace free/legacy | No |
+
+If you are a Google Cloud customer using **Cloud Identity Free** as your identity
+layer - which is common, because it comes at no cost with GCP - you have no
+outbound SCIM and cannot drive this server from it. Your options are to upgrade
+to Cloud Identity Premium, or to provision from whatever other IdP you run.
 
 1. **Admin console → Apps → Web and mobile apps → Add app → Add custom SAML app**.
 2. Complete the SAML step (Google requires a SAML app before it will offer
