@@ -285,33 +285,44 @@ Two clarifications, because both numbers are easy to misread:
 For the second case only, two things make it destructive:
 
 1. **The migration drops and recreates a table.**
-   `migrations/*/2026-07-26-000000_add_scim_api_key/up.sql` begins with
-   `DROP TABLE IF EXISTS scim_api_key`. This supersedes an earlier migration of
-   the same name that was edited in place after being applied - diesel records
-   only a version with no checksum, so an edited migration never re-runs and any
-   database that took the old one would have kept the old schema silently
-   forever. Reissuing under a new version is the only change that reaches both
-   states, and the `DROP` is what makes it reachable from either.
+   `migrations/*/2026-08-09-000000_scim_v2/up.sql` begins with
+   `DROP TABLE IF EXISTS scim_api_key`. This supersedes earlier migrations of
+   that name, one of which was edited in place after being applied - diesel
+   records only a version with no checksum, so an edited migration never re-runs
+   and any database that took the old one would have kept the old schema
+   silently forever. Reissuing under a new version is the only change that
+   reaches both states, and the `DROP` is what makes it reachable from either.
 
 2. **Existing SCIM tokens are invalidated.** The table holds the token digests,
    so dropping it revokes every organization's SCIM credential.
 
-Five companion migrations follow it:
+The branch ships **one** migration per dialect. It was six
+(`2026-07-26-000000` through `-000005`), collapsed on 2026-08-09 while still
+unreleased, which is the only time collapsing is safe. What it contains:
 
-| Version | What it does |
+| Step | What it does |
 |---|---|
-| `2026-07-26-000001_unique_users_organizations_external_id` | Clears duplicate `external_id` values on `users_organizations`, then makes `(org_uuid, external_id)` UNIQUE |
-| `2026-07-26-000002_unique_groups_external_id` | The same for `groups` |
-| `2026-07-26-000003_add_scim_api_key_last_used` | `scim_api_key.last_used_at`, nullable. Additive |
-| `2026-07-26-000004_add_users_organizations_paging_index` | `(org_uuid, uuid)` on `users_organizations`. Additive |
-| `2026-07-26-000005_add_groups_paging_index` | `(organizations_uuid, uuid)` on `groups`. Additive |
+| `scim_api_key` | Dropped and recreated, `last_used_at` included. Destructive - see above |
+| Unique `external_id` on `users_organizations` | Clears duplicate `external_id` values, then makes `(org_uuid, external_id)` UNIQUE. **Destructive** |
+| Unique `external_id` on `groups` | The same for `groups`. **Destructive** |
+| Paging index on `users_organizations` | `(org_uuid, uuid)`. Additive |
+| Paging index on `groups` | `(organizations_uuid, uuid)`. Additive |
 
-### The two that are NOT additive - read this before upgrading
+Every step is re-runnable, so a migration that fails part-way can simply be
+retried. On MySQL that took explicit work: MySQL DDL is not transactional and
+MySQL 8 has no `CREATE INDEX ... IF NOT EXISTS`, so each index is created
+through an `information_schema` check and a prepared statement. Without that, a
+failure on the third of four `CREATE INDEX` statements would leave two indexes
+committed and the migration version unrecorded, and every retry would die on
+`Duplicate key name` - an unmigratable database and, because migrations run
+before Rocket listens, a server that will not start.
+
+### The two steps that are NOT additive - read this before upgrading
 
 > [!WARNING]
-> `000001` and `000002` make `external_id` UNIQUE per organization, and **each
-> one clears data to get there**. They are the only migrations on this branch
-> that destroy anything, and they run before the process serves, so there is no
+> The two `external_id` steps make it UNIQUE per organization, and **each one
+> clears data to get there**. They are the only part of this branch that
+> destroys anything, and they run before the process serves, so there is no
 > opportunity to intervene once it starts.
 
 **What gets cleared.** Where two rows in one organization claim the same

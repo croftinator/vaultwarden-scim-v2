@@ -392,7 +392,7 @@ async fn post_user(
     // registration bypass with it, on every retry.
     if let Err(e) = member.save_strict(&conn).await {
         // users_organizations carries UNIQUE (user_uuid, org_uuid) and, since
-        // 2026-07-26-000001, UNIQUE (org_uuid, external_id). A concurrent POST -
+        // 2026-08-09-000000, UNIQUE (org_uuid, external_id). A concurrent POST -
         // Entra retries hard enough to produce this - loses on one of them. The
         // winner's row is valid and must survive, so report the conflict instead
         // of rolling anything back.
@@ -607,7 +607,7 @@ async fn update_external_id(
     }
     member.set_external_id(Some(external_id.to_owned()));
     // The check above is no longer the only enforcement: a UNIQUE index now
-    // backs it (2026-07-26-000001), which is the point - the check alone was a
+    // backs it (2026-08-09-000000), which is the point - the check alone was a
     // check-then-write that two concurrent requests could both pass. The losing
     // request fails HERE instead, and a bare internal() would turn that into a
     // 500 - the one status Entra retries forever until it quarantines the

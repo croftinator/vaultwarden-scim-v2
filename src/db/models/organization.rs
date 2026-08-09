@@ -839,7 +839,7 @@ impl Membership {
 
     // FORK ADDITION (SCIM): hand a correlation key over from whoever holds it.
     //
-    // `(org_uuid, external_id)` became UNIQUE in 2026-07-26-000001, which the
+    // `(org_uuid, external_id)` became UNIQUE in 2026-08-09-000000, which the
     // SCIM endpoints want and upstream's Directory Connector import
     // (`ldap_import`) never asked for. That import legitimately REASSIGNS an
     // external_id between rows - a directory email change makes

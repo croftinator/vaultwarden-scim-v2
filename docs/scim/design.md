@@ -532,7 +532,7 @@ obvious from either function's name.
 conflict on **any** unique index by DELETING the conflicting row and then
 inserting. For the `uuid` primary key that is harmless - the row being replaced
 is the row being saved. For `(org_uuid, external_id)`, added as UNIQUE in
-`2026-07-26-000001`, it is not: the conflicting row belongs to a *different*
+`2026-08-09-000000`, it is not: the conflicting row belongs to a *different*
 member, and deleting it destroys their `akey` - their wrapped copy of the
 organization key. Under end-to-end encryption nobody can reconstruct that, the
 server least of all.

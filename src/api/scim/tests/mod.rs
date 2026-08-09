@@ -1851,7 +1851,7 @@ async fn concurrent_group_create_cannot_duplicate_an_external_id() {
         .filter(|g| g.external_id.as_deref() == Some("entra-race-grp-1"))
         .count();
     // Exactly one create wins now, and that is a database guarantee rather than
-    // a hopeful one: 2026-07-26-000002 made (organizations_uuid, external_id)
+    // a hopeful one: 2026-08-09-000000 made (organizations_uuid, external_id)
     // UNIQUE, and `save_group_with_external_id` answers the violation with 409.
     //
     // This assertion was deliberately weak (`created >= 1`) while the index was
@@ -1903,7 +1903,7 @@ async fn the_unique_index_refuses_a_duplicate_external_id_without_destroying_the
     second.set_external_id(Some(String::from("entra-index-1")));
     let outcome = second.save_strict(&conn).await;
 
-    assert!(outcome.is_err(), "2026-07-26-000001 must make a duplicate correlation key impossible");
+    assert!(outcome.is_err(), "2026-08-09-000000 must make a duplicate correlation key impossible");
     assert!(
         scim::is_unique_violation(&outcome.unwrap_err()),
         "the failure must be recognisable as a uniqueness violation, or the handlers answer it with a 500"
@@ -1923,11 +1923,11 @@ async fn the_unique_index_refuses_a_duplicate_external_id_without_destroying_the
         .await
         .expect("a NULL external_id must not collide");
 
-    // Same constraint, same hazard, on the Groups side (2026-07-26-000002).
+    // Same constraint, same hazard, on the Groups side (2026-08-09-000000).
     let mut group_one = Group::new(org.clone(), String::from("First"), false, Some(String::from("entra-grp-index")));
     group_one.save_strict(&conn).await.expect("the first group must store");
     let mut group_two = Group::new(org.clone(), String::from("Second"), false, Some(String::from("entra-grp-index")));
-    assert!(group_two.save_strict(&conn).await.is_err(), "2026-07-26-000002 must refuse a duplicate group externalId");
+    assert!(group_two.save_strict(&conn).await.is_err(), "2026-08-09-000000 must refuse a duplicate group externalId");
     assert!(
         Group::find_by_uuid_and_org(&group_one.uuid, &org, &conn).await.is_some(),
         "a refused group write must never delete the group that held the externalId"
@@ -6709,4 +6709,222 @@ async fn the_google_workspace_provisioning_cycle_works_end_to_end() {
         client.put(format!("/scim/v2/{org}/Users/{member_id}")).header(auth).header(ct).body(body).dispatch().await;
     assert_eq!(response.status(), Status::Ok, "a full-resource PUT must be accepted");
     assert_eq!(parse_json(&body_of(response).await)["externalId"], json!("google-ext-1"));
+}
+
+// ---------------------------------------------------------------------------
+// Coverage added by the 2026-08-09 /code-review pass. All three of these passed
+// against the buggy tree and were written because the 175 tests above did not.
+// ---------------------------------------------------------------------------
+
+/// Clearing the externalId of an access-granting group must be refused on EVERY
+/// write path, and the guard must survive being bundled with a member op.
+///
+/// The original guard asked `scim_may_add_members` about the group as loaded -
+/// which still carried its externalId, so the helper returned `true` on its
+/// `external_id.is_some()` line before it ever looked at collection grants. The
+/// guard therefore fired only for `access_all` groups and waved through exactly
+/// the collection-granting case it was written for. `put_group` had no clear
+/// guard at all.
+///
+/// The consequence is permanent: `reject_privileged_group_adoption` refuses to
+/// ever re-set an externalId on a collection-granting group, so one successful
+/// clear strands an administrator's group outside SCIM with no path back.
+#[rocket::async_test]
+async fn clearing_the_external_id_of_an_access_granting_group_is_refused_on_every_path() {
+    let _guard = scim_test_guard!();
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-abandon-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    let intruder = seed_member(&conn, &org, "abandon.intruder@example.com", 2, MembershipType::User).await;
+
+    // The intended workflow: an admin granted the group a collection, and SCIM
+    // owns its membership through an externalId. Correlated, and still
+    // access-granting - which is what the clear guard has to notice.
+    let mut correlated = Group::new(org.clone(), "Payroll Access".to_owned(), false, Some("entra-payroll".to_owned()));
+    correlated.save(&conn).await.expect("saving correlated group");
+    let group_id = correlated.uuid.clone();
+
+    let secret = Collection::new(org.clone(), "Payroll".to_owned(), None);
+    secret.save(&conn).await.expect("saving collection");
+    CollectionGroup::new(secret.uuid.clone(), group_id.clone(), false, false, false)
+        .save(&org, &conn)
+        .await
+        .expect("granting the group access to the collection");
+
+    let external_id_now = |gid: GroupId, org: OrganizationId| {
+        let conn = &conn;
+        async move { Group::find_by_uuid_and_org(&gid, &org, conn).await.expect("group").external_id }
+    };
+    let members_now = |gid: GroupId, org: OrganizationId| {
+        let conn = &conn;
+        async move { GroupUser::find_by_group(&gid, &org, conn).await.len() }
+    };
+
+    // Every shape that reaches `set_external_id(None)`. The whitespace cases
+    // matter because `set_external_id` stores a blank-but-present value as NULL,
+    // so a guard keyed on `is_empty()` alone lets "   " through and clears.
+    let patch_clears = [
+        ("PATCH replace \"\"", json!("")),
+        ("PATCH replace \"   \"", json!("   ")),
+    ];
+    for (label, value) in patch_clears {
+        let clear = json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "externalId", "value": value}],
+        });
+        let (auth, ct, body) = scim_body(&token, &clear);
+        let response = client
+            .patch(format!("/scim/v2/{org}/Groups/{group_id}"))
+            .header(auth)
+            .header(ct)
+            .body(body)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::BadRequest, "{label} must be refused");
+        assert_eq!(parse_json(&body_of(response).await)["scimType"], json!("mutability"), "{label}");
+        assert_eq!(
+            external_id_now(group_id.clone(), org.clone()).await,
+            Some("entra-payroll".to_owned()),
+            "{label} must not have cleared the correlation"
+        );
+    }
+
+    // The bundled form. This is the one that proves the guard runs before the
+    // save: the clear committed first, then the member add 400'd, and the
+    // handler returned through `?` before `log_group_event` - so the group was
+    // stranded with nothing in the audit log to say so.
+    let clear_and_add = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [
+            {"op": "replace", "path": "externalId", "value": ""},
+            {"op": "add", "path": "members", "value": [{"value": intruder.to_string()}]},
+        ],
+    });
+    let (auth, ct, body) = scim_body(&token, &clear_and_add);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "clear-and-add in one request must be refused");
+    assert_eq!(
+        external_id_now(group_id.clone(), org.clone()).await,
+        Some("entra-payroll".to_owned()),
+        "the clear must not have been committed before the member op failed"
+    );
+    assert_eq!(members_now(group_id.clone(), org.clone()).await, 0, "no member may have been added");
+
+    // PUT had no clear-side guard whatsoever.
+    let put = json!({
+        "schemas": [scim::discovery::GROUP_SCHEMA_URN],
+        "displayName": "Payroll Access",
+        "externalId": "",
+    });
+    let (auth, ct, body) = scim_body(&token, &put);
+    let response =
+        client.put(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "PUT must refuse the clear too");
+    assert_eq!(
+        external_id_now(group_id.clone(), org.clone()).await,
+        Some("entra-payroll".to_owned()),
+        "PUT must not have cleared the correlation"
+    );
+
+    // The control: a group that grants nothing confers nothing, so letting SCIM
+    // decorrelate it strands no access. Refusing this would break clients that
+    // legitimately drop a correlation, for no security gain.
+    let mut harmless = Group::new(org.clone(), "No Grants".to_owned(), false, Some("entra-harmless".to_owned()));
+    harmless.save(&conn).await.expect("saving harmless group");
+    let harmless_id = harmless.uuid.clone();
+
+    let clear = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "externalId", "value": ""}],
+    });
+    let (auth, ct, body) = scim_body(&token, &clear);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Groups/{harmless_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Ok, "a group that grants nothing must stay decorrelatable");
+    assert!(external_id_now(harmless_id, org.clone()).await.is_none(), "the control clear must have applied");
+}
+
+/// A PATCH whose LATER op adds to an unmanaged group must commit none of the
+/// earlier ops.
+///
+/// `precheck_member_ops` applied the ownership guard to `Add` but not to
+/// `Replace`, so [remove x, replace [a]] passed the precheck, committed the
+/// removal, and then 400'd inside `set_members` - returning through `?` before
+/// `log_group_event`. Access changed, audit trail silent, which is precisely
+/// the invariant the function's own comment claims to hold.
+#[rocket::async_test]
+async fn a_replace_that_adds_to_an_unmanaged_group_commits_no_earlier_op() {
+    let _guard = scim_test_guard!();
+    let (client, pool) = scim_client().await;
+    let conn = pool.get().await.expect("conn");
+    let org = seed_org(&conn, "scim-precheck-org").await;
+    let token = seed_scim_key(&conn, &org).await;
+
+    let sitting = seed_member(&conn, &org, "precheck.sitting@example.com", 2, MembershipType::User).await;
+    let intruder = seed_member(&conn, &org, "precheck.intruder@example.com", 2, MembershipType::User).await;
+
+    // Unmanaged: created in the web vault (no externalId) and granting a
+    // collection. Removals are allowed from it; additions are not.
+    let mut admin_group = Group::new(org.clone(), "Payroll Access".to_owned(), false, None);
+    admin_group.save(&conn).await.expect("saving admin group");
+    let group_id = admin_group.uuid.clone();
+
+    let secret = Collection::new(org.clone(), "Payroll".to_owned(), None);
+    secret.save(&conn).await.expect("saving collection");
+    CollectionGroup::new(secret.uuid.clone(), group_id.clone(), false, false, false)
+        .save(&org, &conn)
+        .await
+        .expect("granting the group access to the collection");
+
+    GroupUser::new(group_id.clone(), sitting.clone()).save(&conn).await.expect("seating the existing member");
+
+    let members_now = |gid: GroupId, org: OrganizationId| {
+        let conn = &conn;
+        async move {
+            let mut ids: Vec<String> = GroupUser::find_by_group(&gid, &org, conn)
+                .await
+                .into_iter()
+                .map(|group_user| group_user.users_organizations_uuid.to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+
+    // op 1 removes the sitting member (allowed on its own), op 2 replaces the
+    // member set with the intruder (an addition, so refused). The whole request
+    // must be refused with the sitting member still seated.
+    let remove_then_replace = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [
+            {"op": "remove", "path": "members", "value": [{"value": sitting.to_string()}]},
+            {"op": "replace", "path": "members", "value": [{"value": intruder.to_string()}]},
+        ],
+    });
+    let (auth, ct, body) = scim_body(&token, &remove_then_replace);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest, "a replace that adds to an unmanaged group must be refused");
+    assert_eq!(parse_json(&body_of(response).await)["scimType"], json!("mutability"));
+    assert_eq!(
+        members_now(group_id.clone(), org.clone()).await,
+        vec![sitting.to_string()],
+        "the earlier remove must not have committed"
+    );
+
+    // A replace that ONLY removes stays allowed on an unmanaged group. This is
+    // the deliberate asymmetry (deprovisioning must never be blocked), and the
+    // fix must not have turned every replace into an add.
+    let replace_empty = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "replace", "path": "members", "value": []}],
+    });
+    let (auth, ct, body) = scim_body(&token, &replace_empty);
+    let response =
+        client.patch(format!("/scim/v2/{org}/Groups/{group_id}")).header(auth).header(ct).body(body).dispatch().await;
+    assert_eq!(response.status(), Status::Ok, "a removal-only replace must still be allowed on an unmanaged group");
+    assert!(members_now(group_id.clone(), org.clone()).await.is_empty(), "the removal-only replace must have applied");
 }

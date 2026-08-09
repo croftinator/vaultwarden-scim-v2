@@ -163,7 +163,7 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                 let mut group =
                     Group::new(org_id.clone(), group_data.name.clone(), false, Some(group_data.external_id.clone()));
                 // Same constraint, same repair, on the Groups side
-                // (2026-07-26-000002).
+                // (2026-08-09-000000).
                 Group::release_external_id(&group_data.external_id, &org_id, &group.uuid, &conn).await?;
                 group.save_strict(&conn).await?;
                 group.uuid

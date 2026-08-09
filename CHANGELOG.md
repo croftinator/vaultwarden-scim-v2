@@ -37,10 +37,12 @@ long for one line, it links to the document that holds it.
   invariant the database should keep, not one application code re-checks on every
   write. **These migrations clear data: see Fixed, and read
   [docs/scim/upgrading.md](docs/scim/upgrading.md) before upgrading.**
-  Collapsed from six migrations to two while the branch is still unreleased -
-  the earlier arrangement created a non-unique index, added a UNIQUE one on the
-  identical key, then dropped the first. After merge such a change would have to
-  arrive as a new migration; see CLAUDE.md.
+  Collapsed while the branch is still unreleased: the whole SCIM schema is now a
+  single migration per dialect, `2026-08-09-000000_scim_v2`. Every statement in
+  it is re-runnable, including on MySQL, where each `CREATE INDEX` goes through
+  an `information_schema` check and a prepared statement because MySQL 8 offers
+  no `IF NOT EXISTS` for indexes. After merge such a change would have to arrive
+  as a new migration; see CLAUDE.md.
 - **Four distinct audit event types** for the SCIM credential lifecycle -
   `ScimCredentialCreated` (9100), `Revoked` (9101), `Enabled` (9102),
   `Disabled` (9103). Previously all four actions logged as
@@ -99,6 +101,29 @@ long for one line, it links to the document that holds it.
 Findings from a security review of the branch. Each is stated as the defect,
 because the defect is the thing worth not reintroducing.
 
+- **The guard against stranding a group outside SCIM never fired.** Clearing an
+  access-granting group's `externalId` is irreversible through the API -
+  `reject_privileged_group_adoption` refuses to ever set one back on such a group -
+  so one clear put an administrator's group permanently beyond SCIM's reach. The
+  PATCH guard asked `scim_may_add_members` about the group *as loaded*, which
+  still carried the `externalId` being removed, and that helper returns `true` on
+  `external_id.is_some()` before it looks at collection grants. It therefore fired
+  only for `access_all` groups and waved through the collection-granting case it
+  was written for; `put_group` had no clear-side guard at all. Both now ask
+  `group_confers_access`, which is the property actually being protected, and both
+  run before any write - so a bundled `[replace externalId "", add members]` can no
+  longer commit the clear and then 400 on the members with nothing in the audit
+  log. Whitespace-only values are treated as clears throughout, matching
+  `set_external_id`.
+- **A PATCH could commit a member removal and then refuse the rest.**
+  `precheck_member_ops` applied the unmanaged-group guard to `add` but not to
+  `replace`, so `[remove x, replace [a]]` on an admin-owned group passed the
+  precheck, committed the removal, and then failed inside `set_members` -
+  returning through `?` before `log_group_event`, leaving access changed with no
+  audit record. That is exactly the invariant the function exists to hold. It now
+  replays every op against the group's current member set, so it sees the same
+  additions the apply loop will. A replace that only removes is still allowed on
+  an unmanaged group; blocking deprovisioning would be the worse failure.
 - **An organization Admin could revoke Owners.** Minting the SCIM token was gated
   on `AdminHeaders`, which resolves for `membership_type >= Admin`. A SCIM token
   can revoke any member who is not the last confirmed Owner, while the web vault
@@ -198,15 +223,17 @@ because the defect is the thing worth not reintroducing.
 - **A migration had been edited in place after it was applied.** `diesel` records
   only a version with no checksum, so an edited migration never re-runs: any
   database that took the earlier version kept that schema permanently, with no
-  error. Reissued as `2026-07-26-000000_add_scim_api_key`, which drops and
+  error. Reissued as `2026-08-09-000000_scim_v2`, which drops and
   recreates the table so it is reachable from either state. **Existing SCIM
   tokens are invalidated - re-mint them.** See
   [upgrading.md](docs/scim/upgrading.md).
 - **MySQL: index DDL could leave the database unmigratable.** `groups` is a
   reserved word and was not quoted; because MySQL DDL is not transactional, the
   first index committed while the migration went unrecorded, so every retry died
-  on "Duplicate key name". Indexes moved to their own migration and the
-  identifier quoted. Found by running the suite against MySQL, not by reading it.
+  on "Duplicate key name". The identifier is quoted, and every `CREATE INDEX` now
+  runs behind an `information_schema` check and a prepared statement, so the file
+  is idempotent and a part-way failure can simply be retried. Found by running
+  the suite against MySQL, not by reading it.
 - **PostgreSQL: `scim_api_key.org_uuid` was narrower than its parent.** `CHAR(36)`
   against `organizations.uuid VARCHAR(40)`: a long organization id inserted fine
   on sqlite and MySQL and failed only here, and `bpchar` blank-padding made

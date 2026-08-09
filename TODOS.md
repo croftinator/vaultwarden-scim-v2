@@ -266,18 +266,21 @@ join per group.
   not per-org, so an unindexed `external_id` lookup scans every membership on
   the whole server once per provisioned user. That is a full scan of the
   largest table on the hottest path, not a self-host-scale rounding error.
-  Shipped as their own migrations rather than appended to the table migration,
-  because MySQL DDL is not transactional and a failure partway through left the
-  database unmigratable. **Split again on 2026-07-26 (second review pass)** to
-  ONE `CREATE INDEX` per migration
-  (`...000001_unique_users_organizations_external_id`,
-  `...000002_unique_groups_external_id`), because separating the indexes from
-  the *table* did not separate them from *each other*: two non-idempotent
-  statements still shared one non-transactional migration, so a failure on the
-  second left the first committed and unrecorded and every retry died on
-  "Duplicate key name". MySQL supports neither `CREATE INDEX IF NOT EXISTS` nor
-  `DROP INDEX IF EXISTS`, so one statement per migration is the only retryable
-  shape.
+  Shipped first as their own migrations, then split again on 2026-07-26 to ONE
+  `CREATE INDEX` per migration, because MySQL DDL is not transactional: two
+  non-idempotent statements in one migration meant a failure on the second left
+  the first committed and the version unrecorded, and every retry died on
+  "Duplicate key name" - an unmigratable database.
+
+  **Collapsed back into one migration on 2026-08-09** (`2026-08-09-000000_scim_v2`),
+  which is only defensible because the retryability was solved rather than
+  dodged. MySQL 8 supports neither `CREATE INDEX IF NOT EXISTS` nor `DROP INDEX
+  IF EXISTS`, so each index is created through an `information_schema` check and
+  a prepared statement. That makes the whole file idempotent, so a retry skips
+  what exists and finishes the rest - verified against a real MySQL container by
+  re-running the file, by dropping two of four indexes and re-running, and by a
+  full down/up round trip. One statement per migration is no longer the only
+  retryable shape; it was only the only *easy* one.
 - **Batched member resolution** (`Membership::find_by_uuids_and_org`, chunked
   at 500 for older SQLite's 999 bound-parameter cap). A 1000-member group
   write was ~2000 sequential round trips on one pooled connection.
@@ -460,7 +463,7 @@ dimension (`SSO_ONLY`); add rows as more appear.
 ### SCIM token lifecycle - PARTLY CLOSED 2026-07-26
 
 **Done:** `last_used_at` on `scim_api_key`
-(`2026-07-26-000003_add_scim_api_key_last_used`), written by the guard only
+(part of `2026-08-09-000000_scim_v2`), written by the guard only
 after the secret verifies and rate-limited to one write per hour per org so a
 full sync does not become thousands of UPDATE statements. Surfaced as `lastUsedAt` on
 `GET .../scim/status`, and reset on rotation so a new credential never inherits

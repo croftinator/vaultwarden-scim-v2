@@ -179,7 +179,7 @@ fn check_member_count(count: usize) -> Result<(), ScimError> {
 // uniqueness race into the same 409 the sequential case returns.
 //
 // The check-then-write in `check_external_id_available` is no longer the only
-// enforcement: a UNIQUE index now backs it (2026-07-26-000002), which is the
+// enforcement: a UNIQUE index now backs it (2026-08-09-000000), which is the
 // point - the check alone was one two concurrent requests could both pass. The
 // loser now fails at the write instead, and a bare internal() would make that a
 // 500, the one status Entra retries until it quarantines the application.
@@ -254,7 +254,20 @@ async fn scim_may_add_members(group: &Group, token: &ScimToken, conn: &DbConn) -
     if group.external_id.is_some() {
         return true;
     }
-    CollectionGroup::find_by_group(&group.uuid, &token.org_uuid, conn).await.is_empty()
+    !group_confers_access(group, token, conn).await
+}
+
+// Whether this group hands its members real collection access, independent of
+// whether SCIM has correlated it.
+//
+// This is the property every ownership guard here actually protects.
+// `scim_may_add_members` layers the externalId ownership signal on top of it,
+// which is right for "may SCIM add members" and WRONG for any question about
+// the externalId itself: a guard that asks `scim_may_add_members` about a group
+// that still carries its externalId gets `true` before it has looked at
+// anything, because carrying an externalId is the very thing being changed.
+async fn group_confers_access(group: &Group, token: &ScimToken, conn: &DbConn) -> bool {
+    group.access_all || !CollectionGroup::find_by_group(&group.uuid, &token.org_uuid, conn).await.is_empty()
 }
 
 // Refuses an addition to a group SCIM does not own.
@@ -302,14 +315,45 @@ async fn reject_privileged_group_adoption(
     token: &ScimToken,
     conn: &DbConn,
 ) -> Result<(), ScimError> {
-    if new_external_id.is_empty() || group.external_id.is_some() {
+    if new_external_id.trim().is_empty() || group.external_id.is_some() {
         return Ok(());
     }
-    if group.access_all || !CollectionGroup::find_by_group(&group.uuid, &token.org_uuid, conn).await.is_empty() {
+    if group_confers_access(group, token, conn).await {
         return Err(ScimError::bad_request(
             "mutability",
             "This group grants collection access and is not managed by SCIM; its externalId \
              cannot be set through SCIM. Correlate it in the web vault instead",
+        ));
+    }
+    Ok(())
+}
+
+// Refuses CLEARING the externalId of a group that confers collection access.
+//
+// The exact mirror of `reject_privileged_group_adoption`, and it exists because
+// that function is one-way. Adoption refuses to ever SET an externalId on a
+// collection-granting group, so clearing one is irreversible through the API: a
+// single write strands an administrator's group outside SCIM's reach forever,
+// with no path back short of the web vault.
+//
+// Asked of `group_confers_access`, NOT `scim_may_add_members`. The latter
+// returns `true` the moment `external_id.is_some()`, which is true of every
+// group that has an externalId to clear - so a guard built on it fires only for
+// `access_all` groups and silently waves through the collection-granting case
+// it was written for.
+async fn reject_privileged_group_abandonment(
+    group: &Group,
+    token: &ScimToken,
+    conn: &DbConn,
+) -> Result<(), ScimError> {
+    if group.external_id.is_none() {
+        return Ok(());
+    }
+    if group_confers_access(group, token, conn).await {
+        return Err(ScimError::bad_request(
+            "mutability",
+            "This group grants collection access and is not managed by SCIM; clearing its externalId \
+             would put it permanently out of SCIM's reach. Change it in the web vault",
         ));
     }
     Ok(())
@@ -387,23 +431,62 @@ async fn precheck_member_ops(
     token: &ScimToken,
     conn: &DbConn,
 ) -> Result<(), ScimError> {
+    if member_ops.is_empty() {
+        return Ok(());
+    }
+
+    // The ownership guard is decided by REPLAYING the ops against the group's
+    // current member set, not by asking "is any op an add".
+    //
+    // A `Replace` is an add whenever it names someone the group does not
+    // already have - `set_members` guards exactly that case, and lets a replace
+    // that only removes through on an unmanaged group. Checking the op's kind
+    // instead missed it entirely, so a PATCH of [remove x, replace [a]] on an
+    // unmanaged group committed the removal and then 400'd on the replace,
+    // returning through `?` before `log_group_event`: access changed, audit
+    // trail silent. That is the failure this whole function exists to prevent.
+    //
+    // Removes are projected too even though they can never fail here. Skipping
+    // them would leave a later `Replace` comparing against a member this PATCH
+    // has already taken out, so a re-add would not read as an addition and the
+    // guard would be laxer than the apply loop - the same hole, one op further
+    // along.
+    let mut projected: HashSet<MembershipId> = GroupUser::find_by_group(&group.uuid, &token.org_uuid, conn)
+        .await
+        .into_iter()
+        .map(|group_user| group_user.users_organizations_uuid)
+        .collect();
+    let mut needs_add_permission = false;
+
     for member_op in member_ops {
         match member_op {
             // Both resolve strictly: an unknown value is a 400 either way.
             MemberOp::Replace(values) => {
-                resolve_members(values, token, conn).await?;
+                let wanted: HashSet<MembershipId> = resolve_members(values, token, conn).await?.into_iter().collect();
+                needs_add_permission |= wanted.difference(&projected).next().is_some();
+                projected = wanted;
             }
             MemberOp::Add(values) => {
-                if !values.is_empty() {
-                    reject_unmanaged_group_add(group, token, conn).await?;
-                }
-                resolve_members(values, token, conn).await?;
+                // `apply_member_op` guards ANY non-empty add, including a
+                // redundant one, so mirror that rather than the narrower
+                // "introduces someone" test used for a replace. A precheck that
+                // is laxer than the apply loop is worse than no precheck.
+                needs_add_permission |= !values.is_empty();
+                projected.extend(resolve_members(values, token, conn).await?);
             }
             // Removes are deliberately tolerant of unknown values (Entra retries
             // removals, and "already gone" is the steady state), so there is no
-            // failure here to hoist.
-            MemberOp::Remove(_) => {}
+            // failure here to hoist - only the projection above to maintain.
+            MemberOp::Remove(values) => {
+                for value in values {
+                    projected.remove(&MembershipId::from(value.clone()));
+                }
+            }
         }
+    }
+
+    if needs_add_permission {
+        reject_unmanaged_group_add(group, token, conn).await?;
     }
     Ok(())
 }
@@ -602,12 +685,23 @@ async fn put_group(
         }
         None => None,
     };
+    // Guard the externalId WRITE, not just the member-add: setting an externalId
+    // is the group-adoption primitive and clearing one is irreversible through
+    // this API. Both are evaluated on the DB-loaded group, before any mutation
+    // below, and both run BEFORE the `set_members` call at the end of the
+    // handler - a PUT carrying `externalId: ""` and a member list must not
+    // commit the clear and then fail the members.
+    //
+    // `set_external_id` treats a whitespace-only value as NULL, so the clear
+    // branch has to test the same way or a PUT of `"   "` would slip past the
+    // adoption guard, past this one, and clear the correlation anyway.
     if let Some(external_id) = request.external_id.as_deref() {
-        check_external_id_available(&group, external_id, &token, &conn).await?;
-        // Guard the externalId WRITE, not just the member-add: setting an
-        // externalId is the group-adoption primitive. Evaluated on the
-        // DB-loaded group, before any mutation below.
-        reject_privileged_group_adoption(&group, external_id, &token, &conn).await?;
+        if external_id.trim().is_empty() {
+            reject_privileged_group_abandonment(&group, &token, &conn).await?;
+        } else {
+            check_external_id_available(&group, external_id, &token, &conn).await?;
+            reject_privileged_group_adoption(&group, external_id, &token, &conn).await?;
+        }
     }
 
     // Present-but-blank is an error, not a silent no-op, for the same reason as
@@ -652,12 +746,20 @@ async fn patch_group(
     check_member_op_count(patch.member_ops.len())?;
     check_member_count(patch.member_count())?;
 
-    let new_external_id = patch.external_id.as_deref().filter(|id| !id.is_empty());
+    // Filtered on `trim()`, matching `set_external_id`, which stores a
+    // whitespace-only value as NULL. Testing `is_empty()` alone routed `"   "`
+    // down the SET path while the write below cleared the row.
+    let new_external_id = patch.external_id.as_deref().filter(|id| !id.trim().is_empty());
     if let Some(external_id) = new_external_id {
         check_external_id_available(&group, external_id, &token, &conn).await?;
         // See put_group: the externalId write is the adoption primitive, so it
         // is guarded here on the DB-loaded group, before any mutation.
         reject_privileged_group_adoption(&group, external_id, &token, &conn).await?;
+    } else if patch.external_id.is_some() {
+        // The clear direction, guarded before `precheck_member_ops` so a PATCH
+        // of [replace externalId "", add members] cannot commit the clear and
+        // then 400 on the members.
+        reject_privileged_group_abandonment(&group, &token, &conn).await?;
     }
 
     // displayName is required on a Group (RFC 7643 section 4.2), so a PATCH
@@ -688,21 +790,9 @@ async fn patch_group(
     precheck_member_ops(&group, &patch.member_ops, &token, &conn).await?;
 
     // An empty externalId is a PATCH remove; set_external_id stores it as NULL.
-    //
-    // Refused on a group SCIM does not own, mirroring
-    // `reject_privileged_group_adoption` on the setting side. Clearing was the
-    // one unguarded direction: `reject_privileged_group_adoption` refuses to
-    // ever set an externalId on a collection-granting group, so a single clear
-    // stranded an administrator's group outside SCIM's reach permanently, with
-    // no path back through the API.
+    // Both directions were permitted above, on the group as the database has
+    // it, before `precheck_member_ops` and before any write.
     if let Some(external_id) = patch.external_id.clone() {
-        if external_id.trim().is_empty() && !scim_may_add_members(&group, &token, &conn).await {
-            return Err(ScimError::bad_request(
-                "mutability",
-                "This group grants collection access and is not managed by SCIM; clearing its externalId \
-                 would put it permanently out of SCIM's reach. Change it in the web vault",
-            ));
-        }
         group.set_external_id(Some(external_id));
     }
 

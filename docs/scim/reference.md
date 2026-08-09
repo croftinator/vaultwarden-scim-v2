@@ -198,7 +198,7 @@ Only relevant if you ran an earlier build of `feature/scim-v2`; it does not
 affect a first-time install.
 
 - **The `scim_api_key` migration was reissued** under a new version
-  (`2026-07-26-000000`). The earlier one was edited in place after it had
+  (`2026-08-09-000000_scim_v2`). The earlier one was edited in place after it had
   already been applied, and diesel records only a version with no checksum, so
   an edited migration never re-runs - any database that took the old one would
   have kept the old schema silently. The new migration drops and recreates the
