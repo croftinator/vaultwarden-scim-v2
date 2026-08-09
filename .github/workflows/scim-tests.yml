@@ -1,0 +1,99 @@
+# FORK ADDITION (SCIM): fast feedback.
+#
+# `build.yml` is the thorough gate - two toolchains, six feature combinations,
+# real MySQL and PostgreSQL containers - and it takes about 12 minutes. Almost
+# all of that is six sequential full recompiles: changing the feature set
+# changes codegen, so the cache cannot be reused between them. The tests
+# themselves run in about 14 seconds.
+#
+# This runs ONE feature set on SQLite and reports in roughly 3 minutes, so a
+# typo or a broken assertion surfaces while you are still holding the context
+# that produced it. It does not replace build.yml and deliberately proves less:
+# one toolchain, one backend, no clippy, no cross-dialect migration check. A
+# green run here means "worth waiting for the real gate", not "ready to merge".
+#
+# Kept as its own file rather than as steps inside build.yml on purpose. This
+# fork tracks upstream closely and merges from it regularly; every line added to
+# a file upstream also edits is a merge conflict on some future sync. Upstream
+# will never touch this file, so it costs nothing to carry.
+name: SCIM tests
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    paths:
+      - ".github/workflows/scim-tests.yml"
+      - "src/**"
+      - "migrations/**"
+      - "test-support/**"
+      - "macros/**"
+      - "Cargo.*"
+      - "build.rs"
+      - "rust-toolchain.toml"
+  pull_request:
+    paths:
+      - ".github/workflows/scim-tests.yml"
+      - "src/**"
+      - "migrations/**"
+      - "test-support/**"
+      - "macros/**"
+      - "Cargo.*"
+      - "build.rs"
+      - "rust-toolchain.toml"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  scim:
+    name: SCIM suite (sqlite)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: "-Dwarnings"
+      # SQLite needs no server, so a skip here would mean the guard itself
+      # broke. Fail rather than report a green run that verified nothing.
+      SCIM_TESTS_REQUIRE_DB: "1"
+
+    steps:
+      # Only the SQLite client library is needed; the MySQL and PostgreSQL
+      # headers exist in build.yml because it compiles those backends.
+      - name: "Install dependencies"
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libssl-dev pkg-config
+
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Uses the toolchain pinned in rust-toolchain.toml, which is the whole
+      # point of pinning it: this workflow never has to name a version.
+      - name: "Show environment"
+        run: |
+          rustc -vV
+          cargo -vV
+
+      - name: Rust Caching
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Distinct from build.yml's key on purpose. That job compiles six
+          # feature sets and this one compiles a single different set, so a
+          # shared cache would be evicted by whichever ran last and neither
+          # would hit.
+          prefix-key: "v2025.09-rust-scim-fast"
+
+      # The whole suite, not just `scim`: filtering saves a few seconds of test
+      # time and none of the compile time that actually dominates, and it would
+      # hide a SCIM change that broke an upstream test.
+      - name: "test features: sqlite"
+        run: cargo test --profile ci --features sqlite
+
+      - name: "check formatting"
+        if: ${{ !cancelled() }}
+        run: cargo fmt --all -- --check
