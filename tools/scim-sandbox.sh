@@ -253,6 +253,12 @@ DOMAIN=https://localhost:$PORT
 WEB_VAULT_ENABLED=true
 WEB_VAULT_FOLDER=$REPO_ROOT/web-vault
 SIGNUPS_ALLOWED=true
+# Suppresses the "get the browser extension" interstitial the web vault shows
+# after registration. Upstream's own Playwright env sets this for the same
+# reason: it is a modal between "account created" and the vault, so anything
+# automating the UI stops dead there, and in a demo it is an advert in the
+# middle of the story. Same knob upstream uses (config.rs:666).
+CLIENT_SUPPRESS_ONBOARDING=true
 
 SCIM_ENABLED=true
 ORG_GROUPS_ENABLED=true
