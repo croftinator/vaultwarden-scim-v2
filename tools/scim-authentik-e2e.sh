@@ -269,12 +269,25 @@ done
 [ "$SYNCED" -eq 1 ] && ok "all three users provisioned into Vaultwarden" \
                     || { printf '\n'; bad "users never appeared (waited 200s)"; }
 
-scim Groups | python3 -c "
+# Polled, not checked once. Authentik provisions users and groups in the same
+# task but not at the same instant, so the group lands a little after the third
+# user does - and the user poll above is what releases us. A single shot here
+# passed on a fast run and failed on a slow one, which is the definition of a
+# flaky assertion: it was reporting scheduler timing, not whether group sync
+# works. Every other wait in this script polls; this one did not.
+printf '  waiting for the group sync'
+GSYNCED=0
+for i in $(seq 1 40); do
+    n="$(scim Groups | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 g=[r for r in d.get('Resources',[]) if r.get('displayName')=='Engineering']
-raise SystemExit(0 if g and len(g[0].get('members',[]))==2 else 1)
-" 2>/dev/null && ok "group synced with both members" || bad "group or its members did not sync"
+print(len(g[0].get('members',[])) if g else -1)" 2>/dev/null || echo -1)"
+    [ "${n:-0}" -eq 2 ] && { GSYNCED=1; printf ' done (%ss)\n' "$((i*5))"; break; }
+    printf '.'; sleep 5
+done
+[ "$GSYNCED" -eq 1 ] && ok "group synced with both members" \
+                     || { printf '\n'; bad "group or its members did not sync (waited 200s)"; }
 
 # ---------------------------------------------------------------------------
 sect "4. Deprovision (the highest-value path)"
