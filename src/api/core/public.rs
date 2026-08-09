@@ -79,7 +79,11 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
 
                 let ext_modified = member.set_external_id(Some(user_data.external_id.clone()));
                 if revoked || ext_modified {
-                    member.save(&conn).await?;
+                    // (org_uuid, external_id) is UNIQUE on this fork; see
+                    // Membership::release_external_id for why a reassignment is
+                    // repaired rather than refused.
+                    Membership::release_external_id(&user_data.external_id, &org_id, &member.uuid, &conn).await?;
+                    member.save_strict(&conn).await?;
                 }
             }
         // If user is part of the organization, restore it
@@ -94,7 +98,8 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                 restored = false;
             }
             if restored || ext_modified {
-                member.save(&conn).await?;
+                Membership::release_external_id(&user_data.external_id, &org_id, &member.uuid, &conn).await?;
+                member.save_strict(&conn).await?;
             }
         } else {
             // If user is not part of the organization
@@ -129,7 +134,8 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             new_member.atype = MembershipType::User as i32;
             new_member.status = member_status;
 
-            new_member.save(&conn).await?;
+            Membership::release_external_id(&user_data.external_id, &org_id, &new_member.uuid, &conn).await?;
+            new_member.save_strict(&conn).await?;
 
             if CONFIG.mail_enabled()
                 && let Err(e) =
@@ -156,7 +162,10 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             } else {
                 let mut group =
                     Group::new(org_id.clone(), group_data.name.clone(), false, Some(group_data.external_id.clone()));
-                group.save(&conn).await?;
+                // Same constraint, same repair, on the Groups side
+                // (2026-08-08-000002).
+                Group::release_external_id(&group_data.external_id, &org_id, &group.uuid, &conn).await?;
+                group.save_strict(&conn).await?;
                 group.uuid
             };
 

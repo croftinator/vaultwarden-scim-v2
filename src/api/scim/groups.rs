@@ -21,7 +21,7 @@ use crate::{
     api::{
         core::log_event,
         scim::{
-            SCIM_ACTOR, SCIM_DEVICE_TYPE, SCIM_MAX_GROUP_MEMBERS, ScimJson, ScimResponse,
+            SCIM_ACTOR, SCIM_DEVICE_TYPE, SCIM_MAX_GROUP_MEMBER_OPS, SCIM_MAX_GROUP_MEMBERS, ScimJson, ScimResponse,
             error::ScimError,
             filter::parse_eq_filter,
             guard::ScimToken,
@@ -148,6 +148,19 @@ async fn resolve_members(values: &[String], token: &ScimToken, conn: &DbConn) ->
 // Every member value costs a database round trip, so an uncapped list turns one
 // legal request into tens of thousands of sequential queries holding a pooled
 // connection. Reject oversized sets before any of that work happens.
+// The operation count is bounded separately from the value count, because an
+// operation carrying an empty value list contributes nothing to the latter. See
+// SCIM_MAX_GROUP_MEMBER_OPS.
+fn check_member_op_count(ops: usize) -> Result<(), ScimError> {
+    if ops > SCIM_MAX_GROUP_MEMBER_OPS {
+        return Err(ScimError::bad_request(
+            "invalidValue",
+            "Too many member operations in one request; split the membership update across several requests",
+        ));
+    }
+    Ok(())
+}
+
 fn check_member_count(count: usize) -> Result<(), ScimError> {
     if count > SCIM_MAX_GROUP_MEMBERS {
         // invalidValue, not tooMany. RFC 7644 section 3.12 defines tooMany
@@ -170,18 +183,19 @@ fn check_member_count(count: usize) -> Result<(), ScimError> {
 // point - the check alone was one two concurrent requests could both pass. The
 // loser now fails at the write instead, and a bare internal() would make that a
 // 500, the one status Entra retries until it quarantines the application.
-async fn save_group_with_external_id(group: &mut Group, token: &ScimToken, conn: &DbConn) -> Result<(), ScimError> {
-    if group.save(conn).await.is_err() {
-        if let Some(external_id) = group.external_id.as_deref()
-            && Group::find_by_external_id_and_org(external_id, &token.org_uuid, conn)
-                .await
-                .is_some_and(|existing| existing.uuid != group.uuid)
-        {
-            return Err(ScimError::conflict("uniqueness", "A group with this externalId already exists"));
+//
+// `save_strict`, not `save`: the latter is a REPLACE on sqlite and mysql, so a
+// conflict on that index DELETES the other group - and its `collections_groups`
+// access grants with it - then reports success, which would leave this recovery
+// unreachable. See `Group::save_strict`.
+pub(super) async fn save_group_with_external_id(group: &mut Group, conn: &DbConn) -> Result<(), ScimError> {
+    match group.save_strict(conn).await {
+        Ok(()) => Ok(()),
+        Err(e) if crate::api::scim::is_unique_violation(&e) => {
+            Err(ScimError::conflict("uniqueness", "A group with this externalId already exists"))
         }
-        return Err(ScimError::internal());
+        Err(_) => Err(ScimError::internal()),
     }
-    Ok(())
 }
 
 // The externalId is the correlation key: enforce uniqueness within the org on
@@ -551,7 +565,7 @@ async fn post_group(
     let member_ids = resolve_members(&values, &token, &conn).await?;
 
     let mut group = Group::new(token.org_uuid.clone(), display_name.to_owned(), false, request.external_id.clone());
-    save_group_with_external_id(&mut group, &token, &conn).await?;
+    save_group_with_external_id(&mut group, &conn).await?;
     set_members(&group, member_ids, &AddPolicy::NewGroup, &token, &conn).await?;
 
     log_group_event(EventType::GroupCreated, &group.uuid, &token, &conn).await;
@@ -612,7 +626,7 @@ async fn put_group(
     if request.external_id.is_some() {
         group.set_external_id(request.external_id.clone());
     }
-    save_group_with_external_id(&mut group, &token, &conn).await?;
+    save_group_with_external_id(&mut group, &conn).await?;
     if let Some(member_ids) = member_ids {
         set_members(&group, member_ids, &AddPolicy::Enforce, &token, &conn).await?;
     }
@@ -635,6 +649,7 @@ async fn patch_group(
     };
 
     let patch = parse_group_patch(&data?.0)?;
+    check_member_op_count(patch.member_ops.len())?;
     check_member_count(patch.member_count())?;
 
     let new_external_id = patch.external_id.as_deref().filter(|id| !id.is_empty());
@@ -657,18 +672,43 @@ async fn patch_group(
         crate::api::scim::check_attribute_len("displayName", display_name, crate::api::scim::SCIM_MAX_GROUP_NAME_LEN)?;
         group.name = display_name.to_owned();
     }
-    // An empty externalId is a PATCH remove; set_external_id stores it as NULL.
-    if let Some(external_id) = patch.external_id.clone() {
-        group.set_external_id(Some(external_id));
-    }
     // Every member op's resolvable-and-permitted check runs before the first
     // write of this request, so a later op cannot fail after an earlier one has
     // already committed an access grant that the audit log never records.
+    //
+    // Deliberately BEFORE the in-memory externalId change below, and that order
+    // is load-bearing. `scim_may_add_members` branches on
+    // `group.external_id.is_some()`, so mutating the struct first meant a single
+    // PATCH of [remove externalId, add members] evaluated the ownership guard
+    // against a group this request had just made look unmanaged - and rejected
+    // its own member-add with a 400 the client could never satisfy. A
+    // provisioning engine retries a failing write every cycle until it
+    // quarantines the application, which is the failure this module is built to
+    // avoid. The guards belong on the group as the database has it.
     precheck_member_ops(&group, &patch.member_ops, &token, &conn).await?;
+
+    // An empty externalId is a PATCH remove; set_external_id stores it as NULL.
+    //
+    // Refused on a group SCIM does not own, mirroring
+    // `reject_privileged_group_adoption` on the setting side. Clearing was the
+    // one unguarded direction: `reject_privileged_group_adoption` refuses to
+    // ever set an externalId on a collection-granting group, so a single clear
+    // stranded an administrator's group outside SCIM's reach permanently, with
+    // no path back through the API.
+    if let Some(external_id) = patch.external_id.clone() {
+        if external_id.trim().is_empty() && !scim_may_add_members(&group, &token, &conn).await {
+            return Err(ScimError::bad_request(
+                "mutability",
+                "This group grants collection access and is not managed by SCIM; clearing its externalId \
+                 would put it permanently out of SCIM's reach. Change it in the web vault",
+            ));
+        }
+        group.set_external_id(Some(external_id));
+    }
 
     // One save covers both owned attributes; skip the write for member-only patches.
     if new_name.is_some() || patch.external_id.is_some() {
-        save_group_with_external_id(&mut group, &token, &conn).await?;
+        save_group_with_external_id(&mut group, &conn).await?;
     }
 
     // In the order the client sent them, per RFC 7644 section 3.5.2. Applying

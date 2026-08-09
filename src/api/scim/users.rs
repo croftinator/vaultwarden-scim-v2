@@ -13,7 +13,9 @@
 // and the user already has credentials). Confirmed requires an admin client
 // to wrap the org key for the member; no server-side path can do that.
 //
-use std::{collections::HashMap, sync::LazyLock};
+use std::collections::HashMap;
+#[cfg(not(feature = "scim-race-control"))]
+use std::sync::LazyLock;
 
 use rocket::Route;
 use serde_json::Value;
@@ -112,6 +114,34 @@ fn to_scim_user(member: &Membership, user: &User, token: &ScimToken) -> Value {
         body["externalId"] = json!(external_id);
     }
     body
+}
+
+// Every SCIM membership write goes through here, and none go through `save`.
+//
+// `Membership::save` is a REPLACE on sqlite and mysql, so a conflict on the
+// `(org_uuid, external_id)` unique index DELETES the member who held that value
+// - destroying the `akey` that wraps their copy of the organization key, which
+// under E2EE nobody can reconstruct - and returns success. `save_strict` makes
+// the database raise the violation instead, and this turns it into the 409 the
+// sequential duplicate already returned.
+//
+// Both unique indexes on `users_organizations` land here and both are correctly
+// a 409: `(user_uuid, org_uuid)` means this person is already a member, and
+// `(org_uuid, external_id)` means this correlation key is already taken. The
+// message names the more specific one when the request carried an externalId.
+pub(super) async fn save_member(member: &Membership, conn: &DbConn) -> Result<(), ScimError> {
+    match member.save_strict(conn).await {
+        Ok(()) => Ok(()),
+        Err(e) if crate::api::scim::is_unique_violation(&e) => {
+            let detail = if member.external_id.is_some() {
+                "A member with this userName or externalId already exists"
+            } else {
+                "A member with this userName already exists"
+            };
+            Err(ScimError::conflict("uniqueness", detail))
+        }
+        Err(_) => Err(ScimError::internal()),
+    }
 }
 
 async fn log_scim_event(event_type: EventType, member: &Membership, token: &ScimToken, conn: &DbConn) {
@@ -360,13 +390,25 @@ async fn post_user(
     // can leave a user (and possibly an Invitation) behind with nothing to
     // reference it. Roll that back rather than leaking a shell account, and a
     // registration bypass with it, on every retry.
-    if member.save(&conn).await.is_err() {
-        // users_organizations carries UNIQUE (user_uuid, org_uuid), so a
-        // concurrent POST for the same person - Entra retries hard enough to
-        // produce this - loses the insert here. The winner's row is valid and
-        // must survive, so report the conflict instead of rolling anything back.
-        if Membership::find_by_user_and_org(&user.uuid, &token.org_uuid, &conn).await.is_some() {
-            return Err(ScimError::conflict("uniqueness", "A member with this userName already exists"));
+    if let Err(e) = member.save_strict(&conn).await {
+        // users_organizations carries UNIQUE (user_uuid, org_uuid) and, since
+        // 2026-08-08-000001, UNIQUE (org_uuid, external_id). A concurrent POST -
+        // Entra retries hard enough to produce this - loses on one of them. The
+        // winner's row is valid and must survive, so report the conflict instead
+        // of rolling anything back.
+        //
+        // Asked of the error rather than by re-reading, because a re-read cannot
+        // see a mysql prefix collision (the index covers 150 characters, the
+        // lookup compares all 300) and would answer a genuine duplicate with a
+        // 500. It also no longer needs to distinguish WHICH index objected: both
+        // are 409 uniqueness.
+        if crate::api::scim::is_unique_violation(&e) {
+            let detail = if request.external_id.is_some() {
+                "A member with this userName or externalId already exists"
+            } else {
+                "A member with this userName already exists"
+            };
+            return Err(ScimError::conflict("uniqueness", detail));
         }
         rollback_provisioning(user, member, user_created, invitation_created_for_existing_user, &conn).await;
         return Err(ScimError::internal());
@@ -524,6 +566,17 @@ async fn update_external_id(
     token: &ScimToken,
     conn: &DbConn,
 ) -> Result<(), ScimError> {
+    // Trimmed here, in SCIM's own code, rather than in the two upstream models.
+    //
+    // `Membership::set_external_id` treats a value as present when it is
+    // non-EMPTY; `Group::set_external_id` treats it as present when it is
+    // non-BLANK after trimming. So `externalId: " "` was stored verbatim on a
+    // member and normalised to NULL on a group, and the same PATCH meant "set"
+    // on one endpoint and "clear" on the other. Harmless today, and precisely
+    // the kind of asymmetry that becomes a correlation-key mismatch later.
+    // Normalising at this boundary makes both endpoints agree without touching
+    // upstream code the fork has to keep merging.
+    let external_id = external_id.trim();
     if member.external_id.as_deref() == Some(external_id) {
         return Ok(());
     }
@@ -555,20 +608,17 @@ async fn update_external_id(
     member.set_external_id(Some(external_id.to_owned()));
     // The check above is no longer the only enforcement: a UNIQUE index now
     // backs it (2026-08-08-000001), which is the point - the check alone was a
-    // check-then-write that two concurrent requests could both pass. That makes
-    // the losing request fail HERE instead, and a bare internal() would turn it
-    // into a 500 - the one status Entra retries forever until it quarantines the
-    // application. Re-read to tell the two causes apart and answer the race with
-    // the same 409 the sequential case gets.
-    if member.save(conn).await.is_err() {
-        if Membership::find_by_external_id_and_org(external_id, &token.org_uuid, conn)
-            .await
-            .is_some_and(|existing| existing.uuid != member.uuid)
-        {
-            return Err(ScimError::conflict("uniqueness", "A member with this externalId already exists"));
-        }
-        return Err(ScimError::internal());
-    }
+    // check-then-write that two concurrent requests could both pass. The losing
+    // request fails HERE instead, and a bare internal() would turn that into a
+    // 500 - the one status Entra retries forever until it quarantines the
+    // application. Answer the lost race with the same 409 the sequential case
+    // gets.
+    //
+    // `save_strict`, not `save`: the latter is a REPLACE on sqlite and mysql,
+    // which resolves a unique conflict by DELETING the member who held the value
+    // and their `akey` with it, then reporting success - so this recovery would
+    // never run and the data would be gone. See `Membership::save_strict`.
+    save_member(member, conn).await?;
     log_scim_event(EventType::OrganizationUserUpdated, member, token, conn).await;
     Ok(())
 }
@@ -686,6 +736,7 @@ async fn reject_last_owner_revoke(member: &Membership, token: &ScimToken, conn: 
 // revocation is rare, the lock is taken only when `atype` is Owner - so ordinary
 // deprovisioning never touches it - and a per-organization map would grow
 // without bound and need eviction logic to solve a problem this does not have.
+#[cfg(not(feature = "scim-race-control"))]
 static OWNER_REVOKE_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 async fn revoke_member(member: &mut Membership, token: &ScimToken, conn: &DbConn) -> Result<(), ScimError> {
@@ -697,11 +748,20 @@ async fn revoke_member(member: &mut Membership, token: &ScimToken, conn: &DbConn
     // Held across BOTH the count and the write, which is the whole point: the
     // guard below is a check-then-act and is only sound while this is held.
     // Non-owners skip it entirely, so the common path is uncontended.
-    let _owner_guard = if member.atype == MembershipType::Owner {
+    //
+    // The `scim-race-control` feature compiles this out, and exists for exactly
+    // one purpose: letting tools/scim-owner-race.sh measure the race with the
+    // mutex absent. Without a way to build the unguarded binary, the control arm
+    // of that experiment is an anecdote. Never enable it in a shipping build.
+    #[cfg(not(feature = "scim-race-control"))]
+    let owner_guard = if member.atype == MembershipType::Owner {
         Some(OWNER_REVOKE_LOCK.lock().await)
     } else {
         None
     };
+    // A no-op stand-in so the `drop` below stays one line rather than two cfgs.
+    #[cfg(feature = "scim-race-control")]
+    let owner_guard = Some(std::sync::Mutex::new(()));
 
     // The same guard the PUT/PATCH precheck runs, kept here because delete_user
     // reaches this function without going through that precheck. One helper
@@ -714,7 +774,14 @@ async fn revoke_member(member: &mut Membership, token: &ScimToken, conn: &DbConn
     reject_last_owner_revoke(member, token, conn).await?;
 
     member.revoke();
-    member.save(conn).await.map_err(|_| ScimError::internal())?;
+    save_member(member, conn).await?;
+    // Released before the audit write, which needs no mutual exclusion. The lock
+    // is process-global across all organizations, and each waiter is already
+    // holding a pooled connection (Rocket resolves `DbConn` before the handler
+    // body), so every round trip inside the critical section is one the whole
+    // server's connection pool waits behind. Only the count and the write need
+    // to be atomic with respect to each other.
+    drop(owner_guard);
     log_scim_event(EventType::OrganizationUserRevoked, member, token, conn).await;
     Ok(())
 }
@@ -739,7 +806,7 @@ async fn restore_member(member: &mut Membership, token: &ScimToken, conn: &DbCon
         );
         return Err(ScimError::bad_request("invalidValue", "Restore is blocked by an organization policy"));
     }
-    member.save(conn).await.map_err(|_| ScimError::internal())?;
+    save_member(member, conn).await?;
 
     // A member restored to Invited has never joined the org. The original
     // invite may never have been sent (created active:false) or have expired,

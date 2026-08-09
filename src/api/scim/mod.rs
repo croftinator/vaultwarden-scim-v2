@@ -1,5 +1,5 @@
 //
-// SCIM v2 provisioning endpoints (RFC 7643 / RFC 7644), Entra ID first.
+// SCIM v2 provisioning endpoints (RFC 7643 / RFC 7644).
 //
 // Mounted at /scim (see main.rs). Authentication is the per-organization
 // static bearer token checked by guard::ScimToken. Management of that token
@@ -74,6 +74,24 @@ const _: () = assert!(
 // queries while holding a pooled connection.
 pub(crate) const SCIM_MAX_GROUP_MEMBERS: usize = 1000;
 
+// Upper bound on the number of member OPERATIONS in one PATCH, which is a
+// different quantity from the number of member values above and needs its own
+// cap.
+//
+// `GroupPatch::member_count` sums `op.values().len()`, so an operation carrying
+// an EMPTY value list counts as zero. `{"op":"replace","path":"members",
+// "value":[]}` is about 44 bytes, so roughly 11,900 of them fit inside
+// SCIM_BODY_LIMIT while summing to a member count of 0 - and every one still
+// reaches `set_members`, whose first statement is a `GroupUser::find_by_group`
+// three-table join. One authenticated request drove ~11,900 sequential queries
+// on a single pooled connection, which is exactly what the member cap above was
+// written to prevent.
+//
+// 100 rather than 1000: a real client sends one or two member ops per request
+// (Entra sends one add or one remove; a full replace is a single op), so this is
+// two orders of magnitude above observed traffic and still bounds the work.
+pub(crate) const SCIM_MAX_GROUP_MEMBER_OPS: usize = 100;
+
 // Upper bound on the two free-text attributes SCIM writes to the database.
 //
 // 300 because that is the narrowest column any of them lands in:
@@ -125,6 +143,26 @@ pub(crate) fn check_attribute_len(name: &str, value: &str, max: usize) -> Result
         return Err(ScimError::bad_request("invalidValue", &format!("{name} must be at most {max} characters")));
     }
     Ok(())
+}
+
+// Did this write lose a race for a unique key, whichever backend raised it?
+//
+// Detected by inspecting the error rather than by re-reading the row, and the
+// difference matters on mysql. There the `(org_uuid, external_id)` index covers
+// only the first 150 characters while `find_by_external_id_and_org` compares the
+// whole value, so a genuine collision between two externalIds sharing a prefix
+// is invisible to an exact-match re-read: the query misses, and the handler used
+// to conclude "not a uniqueness problem" and return a 500 - the one status a
+// provisioning engine retries until it quarantines the application. Asking the
+// database what it objected to has no such blind spot.
+//
+// `crate::Error` keeps the diesel error as its `source`, so the downcast reaches
+// it without widening the error type's public surface.
+pub(crate) fn is_unique_violation(err: &crate::Error) -> bool {
+    use std::error::Error as _;
+    err.source().and_then(|source| source.downcast_ref::<diesel::result::Error>()).is_some_and(|e| {
+        matches!(e, diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::UniqueViolation, _))
+    })
 }
 
 // The "scim" data limit: registered in main.rs and used as the fallback when

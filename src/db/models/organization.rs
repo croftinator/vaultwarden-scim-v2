@@ -837,6 +837,94 @@ impl Membership {
         }
     }
 
+    // FORK ADDITION (SCIM): hand a correlation key over from whoever holds it.
+    //
+    // `(org_uuid, external_id)` became UNIQUE in 2026-08-08-000001, which the
+    // SCIM endpoints want and upstream's Directory Connector import
+    // (`ldap_import`) never asked for. That import legitimately REASSIGNS an
+    // external_id between rows - a directory email change makes
+    // `find_by_email_and_org` miss and build a new membership carrying the same
+    // correlation key - and before the index that was a harmless duplicate.
+    //
+    // Under the constraint it becomes an error mid-loop, which aborts the whole
+    // sync with earlier members already written and repeats on every cycle until
+    // an operator finds the stale row by hand. Clearing the loser's key first is
+    // the same repair the migration performs on pre-existing duplicates, and for
+    // the same reason: two memberships claiming one directory object is already
+    // broken state, and there is no reading in which both are correct. The row
+    // itself, its akey and its access are untouched - only the correlation hint,
+    // which the next sync re-establishes for whichever member still has it.
+    pub async fn release_external_id(
+        external_id: &str,
+        org_uuid: &OrganizationId,
+        keep: &MembershipId,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        let Some(holder) = Self::find_by_external_id_and_org(external_id, org_uuid, conn).await else {
+            return Ok(());
+        };
+        if &holder.uuid == keep {
+            return Ok(());
+        }
+        warn!(
+            "external_id {external_id} moved from membership {} to {keep} in org {org_uuid}; \
+             clearing the old correlation so the import can proceed",
+            holder.uuid
+        );
+        db_run! { conn: {
+            diesel::update(users_organizations::table)
+                .filter(users_organizations::uuid.eq(&holder.uuid))
+                .set(users_organizations::external_id.eq::<Option<String>>(None))
+                .execute(conn)
+                .map_res("Error releasing external_id")
+        }}
+    }
+
+    // FORK ADDITION (SCIM): like `save`, but a unique-constraint violation is an
+    // ERROR rather than the silent deletion of whoever else held the value.
+    //
+    // `save` uses `replace_into` on sqlite and mysql, and REPLACE resolves a
+    // conflict on ANY unique index by DELETING the conflicting row before
+    // inserting. That is harmless for the `uuid` primary key - the row being
+    // replaced is the row being saved - and it was harmless for
+    // `UNIQUE (user_uuid, org_uuid)` only because nothing wrote a membership for
+    // a user who already had one. It is NOT harmless for the
+    // `(org_uuid, external_id)` unique index: a conflict there deletes a
+    // DIFFERENT member, taking their `akey` - their wrapped copy of the
+    // organization key - with it. Under end-to-end encryption that cannot be
+    // reconstructed by anyone, including the server.
+    //
+    // SCIM writes an IdP-supplied `external_id` on every provisioning cycle, so
+    // it is the one caller that reaches that conflict with ordinary traffic.
+    // Verified against the shipped index: a REPLACE carrying a duplicate
+    // `(org_uuid, external_id)` removed the other membership row and returned
+    // success, so the handlers' uniqueness recovery never ran.
+    //
+    // UPDATE-then-INSERT touches exactly one row and lets the database raise the
+    // violation, which the SCIM handlers turn into a 409. Not a race: `uuid` is a
+    // v4 generated per row, so two concurrent callers never contend on the
+    // INSERT. Where they DO contend - the same external_id - the loser now gets
+    // an error instead of destroying the winner.
+    pub async fn save_strict(&self, conn: &DbConn) -> EmptyResult {
+        User::update_uuid_revision(&self.user_uuid, conn).await;
+
+        db_run! { conn: {
+            match diesel::update(users_organizations::table)
+                .filter(users_organizations::uuid.eq(&self.uuid))
+                .set(self)
+                .execute(conn)
+            {
+                // No row carries this uuid yet, so this is the initial insert.
+                Ok(0) => diesel::insert_into(users_organizations::table)
+                    .values(self)
+                    .execute(conn)
+                    .map_res("Error adding user to organization"),
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }}
+    }
+
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
         User::update_uuid_revision(&self.user_uuid, conn).await;
 
