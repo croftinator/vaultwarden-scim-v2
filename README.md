@@ -28,7 +28,9 @@ stays a manual admin action - the docs explain why.
 > end to end - but it is not one of the major cloud providers.
 >
 > Before any rollout: run the full lifecycle against a **throwaway** tenant and
-> a test organisation. Never against production. Create, update, add to a group,
+> a test organisation - never production. Step-by-step setup and a six-step
+> verification procedure for each provider are in
+> [provider-setup.md](docs/scim/provider-setup.md). Create, update, add to a group,
 > deprovision, and re-provision, and confirm each one landed. The rungs in
 > [testing.md](docs/scim/testing.md) get you most of the way for free - the
 > hosted Microsoft SCIM Validator needs no tenant at all.
@@ -41,7 +43,8 @@ Start at **[docs/scim/](docs/scim/README.md)** - it indexes the rest.
 |---|---|
 | [deployment.md](docs/scim/deployment.md) | Cloud-agnostic containers, PostgreSQL, secrets, SSO, break-glass Owner |
 | [setup.md](docs/scim/setup.md) | Server config, org token, and the Entra ID walkthrough |
-| [providers.md](docs/scim/providers.md) | Entra ID, Okta, AWS Identity Center, Google Workspace and Authentik: what each sends, and what is actually verified |
+| [provider-setup.md](docs/scim/provider-setup.md) | Setting up **and verifying** each IdP: Entra ID, Okta, AWS Identity Center, Google Workspace, Authentik |
+| [providers.md](docs/scim/providers.md) | What each provider sends, and what is actually verified |
 | [client-rollout.md](docs/scim/client-rollout.md) | Pointing staff Bitwarden apps at your server, zero-touch and manual |
 | [operations.md](docs/scim/operations.md) | Member lifecycle and troubleshooting |
 | [reference.md](docs/scim/reference.md) | Deliberate behaviours and named RFC divergences |

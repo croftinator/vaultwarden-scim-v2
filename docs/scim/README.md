@@ -18,6 +18,7 @@ means without a live tenant.
 > traffic. Authentik is the one exception, verified end to end, but it is not one
 > of the major cloud providers. Run the full lifecycle against a **throwaway**
 > tenant and a test organisation before any rollout - never against production.
+> [provider-setup.md](provider-setup.md) has the steps for each provider.
 > See [providers.md](providers.md) for what is verified per provider, and
 > [testing.md](testing.md) for the free rungs that get you most of the way.
 
@@ -49,7 +50,8 @@ Start at the top and work down; each assumes the one before.
 |---|---|---|
 | **[deployment.md](deployment.md)** | Cloud-agnostic containers, PostgreSQL, secrets, SSO, and the break-glass Owner | Building the environment |
 | **[setup.md](setup.md)** | Server config, minting the org token, the Entra enterprise application, choosing which users and groups sync | Standing it up for the first time |
-| **[providers.md](providers.md)** | Entra ID, Okta, AWS IAM Identity Center and Google Workspace: what each sends, what "supported" is verified to mean, and why only one provider can be tested in CI | Using anything other than Entra |
+| **[provider-setup.md](provider-setup.md)** | Step-by-step setup for Entra ID, Okta, AWS Identity Center, Google Workspace and Authentik, plus the six-step verification every admin should run before rollout | Configuring and proving your IdP |
+| **[providers.md](providers.md)** | What each provider sends, what "supported" is verified to mean, and why only one can be tested in CI | Understanding compatibility |
 | **[client-rollout.md](client-rollout.md)** | Pointing staff Bitwarden apps at your server, zero-touch via browser policy and MDM, manual fallback | Getting users onto it |
 | **[operations.md](operations.md)** | The member lifecycle and the troubleshooting table | Running it day to day |
 | **[reference.md](reference.md)** | Deliberate behaviours, deviations, and named RFC divergences | Something looks wrong but may be by design |

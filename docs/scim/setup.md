@@ -191,6 +191,7 @@ restore the rest from the web vault.
 > traffic. Authentik is the one exception, verified end to end, but it is not one
 > of the major cloud providers. Run the full lifecycle against a **throwaway**
 > tenant and a test organisation before any rollout - never against production.
+> [provider-setup.md](provider-setup.md) has the steps for each provider.
 > See [providers.md](providers.md) for what is verified per provider, and
 > [testing.md](testing.md) for the free rungs that get you most of the way.
 
