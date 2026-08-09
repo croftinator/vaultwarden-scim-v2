@@ -36,7 +36,7 @@ long for one line, it links to the document that holds it.
 - Operator documentation: deployment, setup, client rollout, operations,
   reference, upgrading, testing, and design with diagrams.
 - Verification tooling: `tools/scim-test-backends.sh` (all three backends),
-  `tools/scim-test-config-matrix.sh`, `tools/scim-entra-replay.sh`,
+  `tools/scim-test-config-matrix.sh`, `tools/scim-replay.sh`,
   `tools/check-mermaid.sh`.
 
 ### Security

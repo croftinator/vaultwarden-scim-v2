@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
-# Replay Microsoft Entra ID's SCIM request shapes against a running Vaultwarden
-# instance from this fork.
+# Replay a real identity provider's SCIM request shapes against a running
+# Vaultwarden instance from this fork.
 #
-# There is no self-hostable Entra ID, so this script stands in for it: it fires
-# the exact payload shapes Entra sends - including the quirks a spec-correct
-# SCIM client would never produce ("Replace" op casing, string booleans,
-# path-less value objects, members[value eq "..."] removal paths) - and asserts
-# the response status and body.
+# None of the major provisioning engines is self-hostable, so this script stands
+# in for them: it fires the exact payload shapes each one sends - including the
+# quirks a spec-correct SCIM client would never produce, such as Entra's
+# "Replace" op casing, string booleans, path-less value objects and
+# members[value eq "..."] removal paths - and asserts the response status and
+# body. Pick the engine with --profile; see "Profiles" below.
 #
 # It exercises a REAL server over HTTP, which the in-process integration tests
 # (cargo test --features sqlite) deliberately do not: TLS/proxy setup, the
@@ -25,13 +26,13 @@
 #   --profile google  name parts with no displayName, server composes it
 #
 # Usage:
-#   tools/scim-entra-replay.sh --domain https://vault.example.com \
+#   tools/scim-replay.sh --domain https://vault.example.com \
 #                              --org  <org_uuid> \
 #                              --token scim_v1.<org_uuid>.<secret> \
 #                              [--profile entra|okta|aws|google]
 #
 #   Or via environment:
-#     DOMAIN=... ORG_ID=... SCIM_TOKEN=... tools/scim-entra-replay.sh
+#     DOMAIN=... ORG_ID=... SCIM_TOKEN=... tools/scim-replay.sh
 #
 # Mint the token first - see docs/scim/README.md Part B.
 #
@@ -151,7 +152,7 @@ echo "Entra SCIM replay against $BASE"
 echo "Test identity: $USER_EMAIL / externalId $EXT_ID"
 
 # ---------------------------------------------------------------------------
-section "1. Discovery (other SCIM clients read these; Entra tolerates them)"
+section "1. Discovery (Okta and validators read these; Entra tolerates them)"
 # ---------------------------------------------------------------------------
 status=$(req GET "$BASE/ServiceProviderConfig")
 expect "ServiceProviderConfig advertises patch support" "$status" 200 '.patch.supported' 'true'
@@ -183,7 +184,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "3. Entra 'Test Connection' + initial sync probe"
+section "3. Existence probe (Entra calls it Test Connection; Okta imports)"
 # ---------------------------------------------------------------------------
 # Entra probes with a userName filter for a user that does not exist and
 # requires an empty 200 ListResponse, NOT a 404.
@@ -192,7 +193,7 @@ status=$(req GET "$BASE/Users?filter=$filter_q")
 expect "unknown-user filter returns empty list, not 404" "$status" 200 '.totalResults' '0'
 
 # ---------------------------------------------------------------------------
-section "4. Provision a user (Entra POST shape, unknown attrs included)"
+section "4. Provision a user ($PROFILE POST shape)"
 # ---------------------------------------------------------------------------
 # Entra sends the enterprise extension and attributes this server ignores.
 # RFC 7643 s2.1 requires unknown attributes to be ignored, not rejected.
@@ -246,7 +247,7 @@ status=$(req POST "$BASE/Users" "$create_body")
 expect "duplicate POST is 409 uniqueness" "$status" 409 '.scimType' 'uniqueness'
 
 # ---------------------------------------------------------------------------
-section "5. Entra PATCH quirks"
+section "5. PATCH shapes ($PROFILE deactivate form, plus tolerated quirks)"
 # ---------------------------------------------------------------------------
 # Quirk 1: capital-R "Replace" and a STRING boolean "False".
 case "$PROFILE" in

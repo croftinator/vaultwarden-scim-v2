@@ -248,7 +248,7 @@ the whole path being broken.
 ## Rung 2 - replay Entra's requests at a running server
 
 ```bash
-tools/scim-entra-replay.sh \
+tools/scim-replay.sh \
   --domain https://vault.example.com \
   --org    <org_uuid> \
   --token  scim_v1.<org_uuid>.<secret>

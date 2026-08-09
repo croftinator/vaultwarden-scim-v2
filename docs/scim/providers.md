@@ -22,7 +22,7 @@ code path a strict client can take that a lenient one cannot.
 
 | Provider | Status | Verified how |
 |---|---|---|
-| **Microsoft Entra ID** | Primary target | Request shapes replayed in the suite and by `tools/scim-entra-replay.sh`. No live tenant sync yet - see TODOS.md. |
+| **Microsoft Entra ID** | Primary target | Request shapes replayed in the suite and by `tools/scim-replay.sh`. No live tenant sync yet - see TODOS.md. |
 | **Okta** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live Okta org. |
 | **AWS IAM Identity Center** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live AWS instance. |
 | **Google Workspace / Cloud Identity** | Supported | Documented provisioning cycle covered end to end in the suite. Not run against a live tenant. |
@@ -120,7 +120,7 @@ Rungs 1 to 3 in [testing.md](testing.md) need no tenant at all:
 
 1. `cargo test --features sqlite` runs the documented cycle for all four
    providers plus the Entra quirk corpus.
-2. `tools/scim-entra-replay.sh` fires the shapes at a **running** server over
+2. `tools/scim-replay.sh` fires the shapes at a **running** server over
    real HTTPS, so TLS, your reverse proxy, the rate limiter and the error
    catchers all participate. It takes `--profile entra|okta|aws|google`, which
    swaps the create payload and the deactivation form for that engine's
@@ -129,7 +129,7 @@ Rungs 1 to 3 in [testing.md](testing.md) need no tenant at all:
 
    ```bash
    for p in entra okta aws google; do
-     tools/scim-entra-replay.sh --domain https://vault.example.com \
+     tools/scim-replay.sh --domain https://vault.example.com \
        --org <org_uuid> --token scim_v1.<org_uuid>.<secret> --profile "$p"
    done
    ```

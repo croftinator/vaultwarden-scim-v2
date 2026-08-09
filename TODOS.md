@@ -55,7 +55,7 @@ from a real tenant. docs/scim/providers.md says so in its support table, so
 The cheapest independent check remains Microsoft's hosted SCIM Validator, which
 tests SCIM 2.0 conformance generally despite the name and needs no tenant.
 
-**Made cheaper 2026-08-09.** `tools/scim-entra-replay.sh` now takes
+**Made cheaper 2026-08-09.** `tools/scim-replay.sh` now takes
 `--profile entra|okta|aws|google`, swapping the create payload and deactivation
 form for that engine's documented shape, so one deployment can be validated
 against all four in about a minute. docs/scim/providers.md now also lists what
@@ -79,7 +79,7 @@ keys on `IP_HEADER` (`X-Real-IP`) - the deployment in front must set it.
 Note that Entra automatic provisioning needs an Entra ID P1/P2 licence, so a
 free tenant will not offer it.
 
-**Cheaper rungs first** (see docs/scim/testing.md): `tools/scim-entra-replay.sh` replays Entra's exact
+**Cheaper rungs first** (see docs/scim/testing.md): `tools/scim-replay.sh` replays Entra's exact
 request shapes at a running server, and Microsoft's hosted SCIM Validator
 checks Entra compatibility without any tenant. Only assignment scoping, sync
 cycles, and nested-group behaviour genuinely require a tenant.
