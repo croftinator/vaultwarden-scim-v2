@@ -88,10 +88,14 @@ entries:
       groups:
         - !KeyOf group-engineering
 
-  # Katherine is the deprovisioning subject. She starts active and in
-  # Engineering; the walkthrough deactivates her and watches Vaultwarden revoke
-  # her membership without destroying it, then reactivates her to show the
-  # restore is lossless.
+  # Katherine stays INVITED throughout, as the contrast case: revoking her
+  # yields status -128 (0 minus the 128 offset) rather than -126.
+  #
+  # She is deliberately NOT the subject of the lossless-restore demonstration.
+  # An Invited member has an empty akey, so "the wrapped key survived revocation"
+  # would be trivially true of a row that never held one - an assertion that
+  # looks green and proves nothing. The walkthrough deprovisions Ada instead,
+  # after she has been confirmed and actually has a key to preserve.
   - model: authentik_core.user
     id: user-katherine
     identifiers:
