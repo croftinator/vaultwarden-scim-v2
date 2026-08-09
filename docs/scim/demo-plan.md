@@ -1,6 +1,6 @@
 # Plan: a self-contained SCIM + SSO demo
 
-**Status: phases 1-2 built and verified, 3-7 unwritten.** This is a design
+**Status: phases 0-6 built and verified. Phase 7 (optional) not started.** This is a design
 document for `tools/scim-demo.sh` and its supporting pieces. Update the status
 line as phases land.
 
@@ -9,11 +9,11 @@ line as phases land.
 | 0 - manual sandbox | **Done** - `tools/scim-sandbox.sh` |
 | 1 - persistent Authentik | **Done** - both blueprints apply, 5 users in 2 groups |
 | 2 - SSO wiring | **Done** - `/identity/sso/prevalidate` returns a signed token |
-| 3 - Playwright seeder | Not started |
-| 4 - SCIM cycle | Not started |
-| 5 - guided demo flow | Not started |
-| 6 - reset | Not started |
-| 7 - animated walkthroughs | Not started |
+| 3 - seeding | **Done** - Playwright registers, `bw` CLI fills the vault |
+| 4 - SCIM cycle | **Done** - 4 Engineering users provisioned, Contractors correctly excluded |
+| 5 - guided demo flow | **Done** - `docs/demo/index.html`, dependency-free |
+| 6 - reset | **Done** - `tools/scim-demo.sh --reset`, verified reproducing the seeded state |
+| 7 - animated walkthroughs | Not started. Slots exist in the page; recording is a human task |
 
 ## What it is for
 

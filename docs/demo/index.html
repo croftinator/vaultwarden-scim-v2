@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vaultwarden SCIM + SSO demo</title>
+<style>
+  /* Deliberately one file with no external anything. A demo page that needs a
+     CDN is a demo page that fails on the conference wifi. */
+  :root {
+    --bg:#fbfbfd; --fg:#1c1c1e; --muted:#5b5b66; --line:#e2e2e8;
+    --accent:#175ddc; --ok:#1a7f451a; --ok-line:#1a7f45; --warn:#8a5a001a;
+    --warn-line:#8a5a00; --code-bg:#f4f4f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141417; --fg:#ececf1; --muted:#a1a1ad; --line:#2c2c33;
+            --accent:#7aa5ff; --ok:#1a7f4526; --warn:#8a5a0026; --code-bg:#1d1d22; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  .wrap { max-width:860px; margin:0 auto; padding:2.5rem 1.25rem 6rem; }
+  h1 { font-size:2rem; margin:0 0 .3rem; letter-spacing:-.02em; }
+  h2 { font-size:1.25rem; margin:2.75rem 0 .75rem; letter-spacing:-.01em; }
+  .sub { color:var(--muted); margin:0 0 2rem; }
+  ol.steps { list-style:none; counter-reset:s; padding:0; margin:0; }
+  ol.steps > li { counter-increment:s; position:relative; padding:1.1rem 0 1.1rem 3.2rem; border-top:1px solid var(--line); }
+  ol.steps > li::before {
+    content:counter(s); position:absolute; left:0; top:1.15rem; width:2.1rem; height:2.1rem;
+    border-radius:50%; background:var(--accent); color:#fff; display:grid; place-items:center;
+    font-size:.9rem; font-weight:600;
+  }
+  .where { display:inline-block; font-size:.75rem; text-transform:uppercase; letter-spacing:.06em;
+           color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:.1rem .55rem; margin-bottom:.35rem; }
+  .do { font-weight:600; margin:.15rem 0 .35rem; }
+  .why { color:var(--muted); margin:.35rem 0 0; }
+  pre, code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  pre { background:var(--code-bg); border:1px solid var(--line); border-radius:8px;
+        padding:.7rem .85rem; overflow-x:auto; font-size:.82rem; margin:.6rem 0 0; }
+  code { background:var(--code-bg); padding:.1rem .3rem; border-radius:4px; font-size:.86em; }
+  pre code { background:none; padding:0; }
+  .note { border-left:3px solid var(--ok-line); background:var(--ok); padding:.7rem .9rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  .warn { border-left:3px solid var(--warn-line); background:var(--warn); padding:.7rem .9rem; border-radius:0 6px 6px 0; margin:1rem 0; }
+  table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:.9rem; }
+  th,td { text-align:left; padding:.45rem .6rem; border-bottom:1px solid var(--line); }
+  th { font-size:.78rem; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  a { color:var(--accent); }
+  .pill { font-size:.78rem; border-radius:4px; padding:.1rem .4rem; background:var(--code-bg); border:1px solid var(--line); }
+  footer { margin-top:3rem; padding-top:1.25rem; border-top:1px solid var(--line); color:var(--muted); font-size:.85rem; }
+  /* Slot for phase 7 clips. Absent media must not break the layout, because the
+     written steps are the source of truth and the clips only illustrate them. */
+  .clip { margin:.7rem 0 0; }
+  .clip video, .clip img { max-width:100%; border:1px solid var(--line); border-radius:8px; display:block; }
+  .clip:empty { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Vaultwarden SCIM + SSO demo</h1>
+<p class="sub">Fifteen minutes, entirely local. One identity provider handles both
+sign-in and provisioning - the same shape as Microsoft Entra in a real deployment.</p>
+
+<div class="note">
+<strong>Before you start.</strong> Run <code>tools/scim-demo.sh</code> and wait for
+<em>Ready</em>. Open four things: the web vault
+(<a href="https://localhost:8000">https://localhost:8000</a>), Authentik
+(<a href="http://localhost:9000">http://localhost:9000</a>), Mailpit
+(<a href="http://localhost:8025">http://localhost:8025</a>), and a database client
+pointed at <code>127.0.0.1:15433</code>. You also need a <strong>second browser
+profile</strong> for step 7 - one browser cannot hold two Bitwarden sessions.
+</div>
+
+<h2>What you are looking at</h2>
+<table>
+  <tr><th>Piece</th><th>Role</th></tr>
+  <tr><td>Vaultwarden</td><td>The password manager. This fork, PostgreSQL-backed.</td></tr>
+  <tr><td>Authentik</td><td>The identity provider. Pushes users in over SCIM, authenticates over OIDC.</td></tr>
+  <tr><td>Mailpit</td><td>Catches every email, so invites work with fictional addresses.</td></tr>
+</table>
+<p>The directory contains five people. Four are in <strong>Engineering</strong> and
+are synced. One, Charles Babbage, is a <strong>Contractor</strong> and is deliberately
+not - proving SCIM syncs what it is scoped to and leaves the rest alone.</p>
+
+<h2>The walkthrough</h2>
+<ol class="steps">
+
+  <li>
+    <span class="where">Web vault</span>
+    <p class="do">Sign in as the Owner with a master password.</p>
+    <p><code>owner@example.com</code> / <code>demo-master-password-1</code></p>
+    <p class="why">The starting point: an ordinary encrypted vault, no SSO involved yet.</p>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Web vault</span>
+    <p class="do">Look at the vault items and the Acme Corp organization.</p>
+    <p class="why">Real encrypted data, written by a real client. None of it could have
+    been inserted with SQL - the server never holds the key that would let it.</p>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Web vault</span>
+    <p class="do">Log out. Log back in using <em>Enterprise single sign-on</em>.</p>
+    <p class="why">Authentik authenticates you and Vaultwarden never sees the password.
+    Note what did <em>not</em> happen: SSO proved who you are, but your vault still
+    unlocked from a key derived in your browser. Authentication and decryption are
+    separate, which is the point people most often assume away.</p>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Authentik</span>
+    <p class="do">Open Directory &rarr; Users and Groups.</p>
+    <p class="why">One directory owns identity. Engineering has four members;
+    Contractors has one who will never appear in Vaultwarden.</p>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Terminal</span>
+    <p class="do">Force a provisioning cycle.</p>
+    <pre><code>tools/scim-demo.sh --sync</code></pre>
+    <p class="why">Authentik otherwise syncs on its own schedule. The commonest reason a
+    demo looks broken is impatience, not breakage.</p>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Web vault &rarr; Admin Console &rarr; Members</span>
+    <p class="do">Four new members. Every one of them says <strong>Invited</strong>.</p>
+    <p class="why">This is the honest part of the demo, and the most important. SCIM
+    created the accounts and the memberships, and then stopped. It cannot go further,
+    and neither can any amount of server-side code.</p>
+    <pre><code>SELECT u.email, uo.status, LEFT(uo.akey, 24) AS akey
+FROM users_organizations uo JOIN users u ON u.uuid = uo.user_uuid
+ORDER BY u.email;</code></pre>
+    <p class="why"><code>status = 0</code>, and <code>akey</code> is empty.</p>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Mailpit + second browser profile</span>
+    <p class="do">Open Ada's invite, accept it as Ada, set a master password.</p>
+    <p><code>ada.lovelace@example.com</code> / <code>demo-master-password-2</code></p>
+    <p class="why">Only Ada can do this. Her status moves to <strong>Accepted</strong>
+    (<code>1</code>) - still no organization key, because she has not been given one.</p>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Web vault, as Owner</span>
+    <p class="do">Confirm Ada.</p>
+    <p class="why">Watch what just happened: your browser fetched Ada's public key,
+    encrypted the organization's symmetric key under it, and sent the result. The
+    server stored a blob it cannot read. <code>status = 2</code> and <code>akey</code>
+    is now populated.</p>
+    <div class="note">This step is why the demo installs real clients. There is no
+    server-side path that can produce a valid <code>akey</code>, so "fully automatic
+    provisioning" is not a feature anyone can honestly ship on an end-to-end encrypted
+    vault. What <em>is</em> automated is everything either side of it.</div>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Authentik</span>
+    <p class="do">Deactivate Katherine Johnson, then <code>tools/scim-demo.sh --sync</code>.</p>
+    <p class="why">The offboarding path, and the highest-value one: it needs no keys, so
+    it is fully automatic and immediate.</p>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Database</span>
+    <p class="do">Check what deactivation actually did.</p>
+    <pre><code>SELECT u.email, uo.status, LEFT(uo.akey, 24) AS akey
+FROM users_organizations uo JOIN users u ON u.uuid = uo.user_uuid
+WHERE u.email LIKE 'katherine%';</code></pre>
+    <p class="why">The row is <strong>still there</strong> and <code>akey</code> is
+    untouched. Revocation is an <em>offset of 128</em> applied to the previous status,
+    not a distinct value - so a revoked-confirmed member reads <code>-126</code>.</p>
+    <table>
+      <tr><th>State</th><th>Stored</th></tr>
+      <tr><td>Invited</td><td><span class="pill">0</span></td></tr>
+      <tr><td>Accepted</td><td><span class="pill">1</span></td></tr>
+      <tr><td>Confirmed</td><td><span class="pill">2</span></td></tr>
+      <tr><td>Revoked-invited</td><td><span class="pill">-128</span></td></tr>
+      <tr><td>Revoked-confirmed</td><td><span class="pill">-126</span></td></tr>
+    </table>
+    <div class="warn"><code>MembershipStatus::Revoked = -1</code> is a comparison
+    sentinel that is <strong>never stored</strong>. Code testing
+    <code>status == -1</code> is wrong for every real row; test
+    <code>status &lt;= -1</code>.</div>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Authentik</span>
+    <p class="do">Reactivate Katherine and sync again.</p>
+    <p class="why">She returns to exactly her prior state. Nobody re-confirms her,
+    because her wrapped key was never destroyed. A returning employee is restored,
+    not re-onboarded - which is the difference between revocation and deletion, and
+    the reason this design keeps the row.</p>
+    <div class="clip"></div>
+  </li>
+
+  <li>
+    <span class="where">Desktop app / browser extension</span>
+    <p class="do">Unlock the same account in another client.</p>
+    <p class="why">Same vault, same organization, same membership state. Set the
+    server to <code>https://localhost:8000</code> <em>before</em> logging in - it cannot
+    be changed afterwards.</p>
+    <div class="clip"></div>
+  </li>
+</ol>
+
+<h2>If something looks stuck</h2>
+<table>
+  <tr><th>Symptom</th><th>Cause</th></tr>
+  <tr><td>Members do not appear</td><td>Authentik syncs on a schedule. Run <code>tools/scim-demo.sh --sync</code>.</td></tr>
+  <tr><td>A client rejects the certificate</td><td>Run <code>mkcert -install</code>, then restart the client - it reads the trust store at startup.</td></tr>
+  <tr><td>The desktop app refuses the URL</td><td>It requires HTTPS with no localhost exemption. Use <code>https://</code>.</td></tr>
+  <tr><td><code>bw</code> rejects the certificate</td><td>Node ignores the system trust store: <code>export NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem"</code></td></tr>
+  <tr><td>Everything is confused</td><td><code>tools/scim-demo.sh --reset</code> returns to the seeded state without a rebuild.</td></tr>
+</table>
+
+<footer>
+Architecture, diagrams and the reasoning behind each choice:
+<code>docs/scim/demo.md</code>. Build status and remaining phases:
+<code>docs/scim/demo-plan.md</code>. This page is intentionally dependency-free -
+no CDN, no fonts, no scripts.
+</footer>
+
+</div>
+</body>
+</html>

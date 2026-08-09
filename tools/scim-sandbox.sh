@@ -186,8 +186,15 @@ say "4. TLS"
 # ---------------------------------------------------------------------------
 CAROOT="$(mkcert -CAROOT)"
 if [ ! -f "$SANDBOX_DIR/tls-cert.pem" ]; then
+    # host.docker.internal is NOT optional padding. Containers cannot resolve
+    # "localhost" to the host, so anything in Docker that must call back into
+    # this server - Authentik pushing SCIM, for one - connects by that name. A
+    # certificate covering only localhost then fails with a hostname mismatch,
+    # which Authentik reports merely as a failed sync, several layers away from
+    # the actual cause.
     ( cd "$SANDBOX_DIR" && mkcert -cert-file tls-cert.pem -key-file tls-key.pem \
-        localhost 127.0.0.1 ::1 >/dev/null 2>&1 ) || die "mkcert could not issue a certificate"
+        localhost 127.0.0.1 ::1 host.docker.internal >/dev/null 2>&1 ) \
+        || die "mkcert could not issue a certificate"
     ok "certificate issued for localhost"
 else
     ok "certificate already present"

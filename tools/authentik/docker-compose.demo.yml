@@ -60,6 +60,8 @@ services:
       AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
       AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
       AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?}
+      REQUESTS_CA_BUNDLE: /certs/rootCA.pem
+      SSL_CERT_FILE: /certs/rootCA.pem
     env_file:
       - .env
     ports:
@@ -69,6 +71,11 @@ services:
       # Read-only: the demo's configuration is version-controlled here, and a
       # container writing back into the repository would make it not so.
       - ./blueprints:/blueprints/custom:ro
+      # Authentik must TRUST the sandbox's certificate to push SCIM to it. The
+      # sandbox uses mkcert, whose CA is trusted on the host but means nothing
+      # inside a container. Without this every SCIM request fails TLS
+      # verification, which Authentik surfaces only as a failed sync task.
+      - ${MKCERT_ROOT_CA:?set MKCERT_ROOT_CA to $(mkcert -CAROOT)/rootCA.pem}:/certs/rootCA.pem:ro
     depends_on:
       postgresql:
         condition: service_healthy
@@ -85,12 +92,17 @@ services:
       AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
       AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
       AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?}
+      REQUESTS_CA_BUNDLE: /certs/rootCA.pem
+      SSL_CERT_FILE: /certs/rootCA.pem
     env_file:
       - .env
     volumes:
       # The WORKER is what actually applies blueprints; the server only needs
       # them for the UI listing. Mounting into both keeps the two consistent.
       - ./blueprints:/blueprints/custom:ro
+      # The WORKER is what actually performs the outbound SCIM calls, so this
+      # mount matters more here than on the server.
+      - ${MKCERT_ROOT_CA:?set MKCERT_ROOT_CA to $(mkcert -CAROOT)/rootCA.pem}:/certs/rootCA.pem:ro
     depends_on:
       postgresql:
         condition: service_healthy

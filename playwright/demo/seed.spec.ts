@@ -11,7 +11,18 @@ import { test, expect, type Page } from '@playwright/test';
 // that navigate rather than assert are still worth reusing.
 // (no upstream helpers left in use here - see the note above)
 
-// Seeds the demo organization with data that CANNOT be seeded any other way.
+// Registers the Owner and creates the organization. NOTHING ELSE.
+//
+// This file used to seed vault items too, and that was the wrong tool: the same
+// six items take minutes here and 18 seconds through the Bitwarden CLI
+// (tools/scim-demo-seed-items.sh). Both are real clients doing identical
+// crypto, but only one has an interface that survives a web-vault release.
+//
+// What is left is what the CLI genuinely cannot do - `bw` has no register
+// command, and account creation derives a master key in the client, so it
+// cannot be faked server-side either.
+//
+// Seeds data that CANNOT be seeded any other way.
 //
 // Everything here needs client-side cryptography, which is exactly why it is a
 // browser automation rather than a SQL script:
@@ -38,27 +49,10 @@ const OWNER = {
 };
 const ORG = process.env.DEMO_ORG_NAME!;
 
-// Realistic-looking, entirely fictional. Nothing here resolves to a real
-// service, and no value is a credential for anything - a demo that shipped a
-// plausible-looking real secret would be a liability the first time someone
-// screenshotted it.
-// Trimmable for a fast edit loop: DEMO_ITEM_COUNT=1 turns a ten-minute run
-// into a two-minute one when only the item step is in question. The demo uses
-// all of them.
-const ITEM_COUNT = Number(process.env.DEMO_ITEM_COUNT ?? '0') || undefined;
-const ALL_ITEMS = [
-    { name: 'Acme AWS root', username: 'root@acme.example', password: 'Aa1!demo-not-real-0001' },
-    { name: 'Acme GitHub org', username: 'acme-bot', password: 'Aa1!demo-not-real-0002' },
-    { name: 'Acme Grafana', username: 'admin', password: 'Aa1!demo-not-real-0003' },
-    { name: 'Acme Jira', username: 'svc-jira', password: 'Aa1!demo-not-real-0004' },
-    { name: 'Acme Postgres (prod)', username: 'acme_app', password: 'Aa1!demo-not-real-0005' },
-    { name: 'Acme SMTP relay', username: 'mailer', password: 'Aa1!demo-not-real-0006' },
-];
-const ITEMS = ITEM_COUNT ? ALL_ITEMS.slice(0, ITEM_COUNT) : ALL_ITEMS;
 
 test.describe.configure({ mode: 'serial' });
 
-test('seed the demo organization', async ({ page }) => {
+test('register the Owner and create the organization', async ({ page }) => {
     // NOT test.slow(): it TRIPLES the configured timeout, so `--timeout=170000`
     // silently became 510s and every diagnostic run overshot the budget I set
     // for it. The config's own timeout is already generous; set it there where
@@ -72,24 +66,7 @@ test('seed the demo organization', async ({ page }) => {
         await createOrg(page, ORG);
     });
 
-    await test.step('add vault items', async () => {
-        for (const item of ITEMS) {
-            await addLogin(page, item);
-        }
-    });
 
-    // Proves the seed produced something a client can actually read back,
-    // rather than that the clicks did not throw. A vault that looks right in
-    // the DOM immediately after writing is not the same as one that decrypts
-    // on a fresh load.
-    await test.step('verify the items survive a reload', async () => {
-        await page.goto('/#/vault');
-        for (const item of ITEMS) {
-            // .first(): the name renders in both the list row and the detail
-            // pane, and Playwright's strict mode rejects a two-element match.
-            await expect(page.getByText(item.name, { exact: true }).first()).toBeVisible();
-        }
-    });
 });
 
 async function registerOwner(page: Page, user: { email: string, name: string, password: string }) {
@@ -141,36 +118,3 @@ async function createOrg(page: Page, name: string) {
     await expect(page.locator('org-switcher').filter({ hasText: name })).toBeVisible();
 }
 
-// Kept small and separate from the helpers in tests/setups/ on purpose: those
-// belong to upstream's suite and upstream maintains them. Anything the demo
-// needs that they do not already provide lives here, so a sync-upstream never
-// has to merge demo requirements into a shared file.
-async function addLogin(page: Page, item: { name: string, username: string, password: string }) {
-    await test.step(`add "${item.name}"`, async () => {
-        await page.goto('/#/vault');
-        // "New item" opens the Login form DIRECTLY in web vault 2026.7.0 -
-        // there is no type-picker menu. An earlier version of this waited for
-        // a `menuitem` named "Login" that never appears, and since a missing
-        // locator only fails on timeout, it looked like a hang rather than a
-        // wrong selector. Assert the form is open instead.
-        await page.getByRole('button', { name: 'New item' }).click();
-        await expect(page.getByRole('heading', { name: 'New Login' })).toBeVisible();
-
-        await page.getByRole('textbox', { name: 'Item name * (required)' }).fill(item.name);
-        await page.getByRole('textbox', { name: 'Username', exact: true }).fill(item.username);
-        await page.getByRole('textbox', { name: 'Password', exact: true }).fill(item.password);
-
-        await page.getByRole('button', { name: 'Save' }).click();
-
-        // Saving does NOT return you to the list: it opens a "View Login"
-        // dialog for the item just created. `page.goto('/#/vault')` on the next
-        // iteration is only a hash change in an Angular SPA, so it neither
-        // reloads nor dismisses that modal - and "New item" then sits behind it
-        // forever. Close it explicitly and wait for it to go.
-        const dialog = page.getByRole('dialog');
-        await expect(dialog).toBeVisible();
-        await expect(dialog.getByText(item.name, { exact: true }).first()).toBeVisible();
-        await dialog.getByRole('button', { name: 'Close' }).click();
-        await expect(dialog).toHaveCount(0);
-    });
-}
