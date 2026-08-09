@@ -480,6 +480,107 @@ Mailpit catches every invite at <http://localhost:8025>, so provisioned users
 can be fake addresses with no real mailboxes - the same trick the tunnel section
 above uses, just wired in by default here.
 
+## The manual sandbox - real clients, real mail, real TLS
+
+Every rung above answers "does the endpoint behave correctly". None of them can
+answer "is this usable", and for this feature that gap is not cosmetic: the step
+SCIM cannot perform - a member accepting an invite and an Owner confirming them -
+is precisely the step that needs a real client holding real key material. You
+cannot see it from a test suite, because no test suite can do it.
+
+```bash
+tools/scim-sandbox.sh              # bring it up (idempotent)
+tools/scim-sandbox.sh --status
+tools/scim-sandbox.sh --down       # stop, keep the data
+tools/scim-sandbox.sh --purge      # destroy everything including the database
+```
+
+It brings up PostgreSQL and Mailpit, extracts the web vault, issues a TLS
+certificate, writes a config with a fresh `ADMIN_TOKEN`, and starts the server.
+Everything it generates lives in `$SANDBOX_DIR` (default `~/vaultwarden-sandbox`),
+**outside the repository**, so no generated credential can be committed.
+
+| | |
+|---|---|
+| Web vault | `https://localhost:8000` |
+| Admin panel | `https://localhost:8000/admin` |
+| Mail | `http://localhost:8025` - every invite lands here |
+| PostgreSQL | `127.0.0.1:15433` |
+
+### TLS is mandatory, not a nicety
+
+The **web vault** works over plain HTTP on localhost, because browsers treat
+`localhost` as a secure context and WebCrypto is therefore available. The
+**desktop app and browser extension do not** - they reject any `http://` server
+URL outright, with no localhost exemption. That is why the sandbox issues a
+certificate rather than offering TLS as an option: without it you can only test
+one of the four clients.
+
+`mkcert` is the prerequisite, and trusting its CA writes to a system trust store,
+so it needs elevation and cannot be scripted unattended:
+
+| | Install | Trust the CA |
+|---|---|---|
+| macOS | `brew install mkcert nss` | `mkcert -install`, prompts for your password |
+| Debian/Ubuntu | `apt install libnss3-tools`, mkcert from its GitHub releases | `mkcert -install`, prompts via sudo |
+| Fedora | `dnf install mkcert nss-tools` | `mkcert -install`, prompts via sudo |
+| Arch | `pacman -S mkcert nss` | `mkcert -install`, prompts via sudo |
+| Windows | `choco install mkcert` | `mkcert -install` in an **elevated** shell |
+
+`nss`/`nss-tools`/`libnss3-tools` is only for Firefox, which keeps its own trust
+store and ignores the system one. Undo everything with `mkcert -uninstall`.
+
+**Restart the desktop app after trusting the CA** - it reads the trust store at
+startup and keeps rejecting the certificate until it does.
+
+On **Windows**, run the script under WSL2 with Docker Desktop's WSL integration;
+it is bash, like the rest of `tools/`. If you want the Windows-side clients to
+work you must run `mkcert -install` **twice** - once inside WSL, once in an
+elevated PowerShell. They are separate trust stores and neither sees the other.
+
+### Pointing the clients at it
+
+- **Web vault** - just open it.
+- **Desktop app** - on the login screen choose *Self-hosted* and set the server
+  to `https://localhost:8000` **before** logging in. It cannot be changed while
+  an account is logged in.
+- **Browser extension** - same, under Settings before login.
+- **CLI** - `bw config server https://localhost:8000`. The CLI is Node-based and
+  Node does **not** read the macOS keychain, so even a system-trusted CA may be
+  refused; `export NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem"` fixes it.
+
+### The walkthrough that only a real client can complete
+
+This is the sequence worth doing by hand at least once, because it is the whole
+E2EE argument in five minutes.
+
+1. Register an account in the web vault and create an organization.
+2. Mint a SCIM token via Part B of [setup.md](setup.md). The one-time code it
+   emails arrives in Mailpit.
+3. Provision a user - either through Authentik (see Rung 2b) or by hand:
+   `POST /scim/v2/<org>/Users`.
+4. Look at the member in the web vault: **Invited**. No server-side path can
+   move it further, which is the design, not a gap.
+5. Open the invite from Mailpit, accept it as that user (a second browser
+   profile, or the desktop app): **Accepted**.
+6. Back as Owner, confirm them: **Confirmed**. That step wrapped the org key
+   under the member's public key, in the client. The server only stored the blob.
+7. Now deactivate them at the source (`PATCH active:false`) and watch access
+   vanish - then reactivate, and note that nobody had to re-confirm.
+
+Check each transition in the database rather than trusting the UI:
+
+```sql
+SELECT u.email, uo.status, LEFT(uo.akey, 24) AS akey, uo.external_id
+FROM users_organizations uo JOIN users u ON u.uuid = uo.user_uuid
+ORDER BY u.email;
+```
+
+`status` runs `0` Invited, `1` Accepted, `2` Confirmed, and revocation is an
+**offset** of 128 rather than a distinct value - a revoked-confirmed member is
+`-126`, not `-1`. Step 7 is lossless precisely because `akey` is unchanged
+throughout.
+
 ## Rung 2c - concurrency stress (the races the suite cannot reach)
 
 Two guards in this implementation are check-then-act: the last-owner revoke and
