@@ -376,6 +376,28 @@ making the database unmigratable. Since migrations run before the process
 serves, that is a server that permanently refuses to start. If you add a SCIM
 index later, keep the one-statement-per-migration rule.
 
+**Never edit a migration that has shipped.** Diesel records the migration
+VERSION - the timestamp prefix - in `__diesel_schema_migrations`, and will never
+re-run a version it has already applied. Editing a released migration is
+therefore not a change: it is a silent no-op on every database that already ran
+it, and a different schema on every database that has not, with nothing to
+detect the divergence. Every change to a shipped migration arrives as a NEW
+migration, including one that only looks cosmetic - the file is the record of
+what that version did.
+
+The exception is a migration that has never been released, which can be edited or
+collapsed freely. The two `external_id` migrations above were collapsed exactly
+that way: an earlier arrangement created a non-unique index, added a UNIQUE one
+on the identical key in a second migration, and dropped the first in a third.
+Six migrations became two while nothing had been deployed. That window closes the
+moment this branch merges.
+
+One consequence for developers: collapsing invalidates existing development
+databases. The recorded version is already applied, so the rewritten file never
+runs and you silently end up without the constraint. Recreate the database. The
+SCIM suite fails loudly in that state rather than passing quietly, which is the
+only reason collapsing is tolerable at all.
+
 The two paging indexes back the `ORDER BY uuid` that the list endpoints depend
 on for a stable page order. Without them the database sorts the organization's
 entire membership once per page, and a full Entra sync of a large org issues
