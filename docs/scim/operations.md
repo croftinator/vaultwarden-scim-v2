@@ -56,7 +56,7 @@ Two things change, and neither is obvious from a health check:
   and the shared-state requirements, in
   [upgrading.md](upgrading.md#step-4-the-multi-instance-rolling-upgrade).
 
-## Pausing provisioning without re-configuring Entra
+## Pausing provisioning without re-configuring the IdP
 
 `PUT /api/organizations/<org_id>/scim/api-key/enabled` with `{"enabled": false}`
 plus password/OTP re-auth, as an **Owner**. Every SCIM request then gets the

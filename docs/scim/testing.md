@@ -259,7 +259,7 @@ Where a test asserts a refusal, add the matching control that proves the
 operation succeeds when it should - otherwise "refused" is equally explained by
 the whole path being broken.
 
-## Rung 2 - replay Entra's requests at a running server
+## Rung 2 - replay a provider's requests at a running server
 
 ```bash
 tools/scim-replay.sh \
@@ -307,7 +307,7 @@ app**. Your endpoint must be publicly reachable over HTTPS.
 This is the cheapest way to check Entra compatibility before committing to a
 tenant.
 
-## Rung 4 - a throwaway Entra tenant
+## Rung 4 - a throwaway tenant with a real provider
 
 Only a real tenant can validate the things that live in Entra rather than in
 your endpoint: **assignment scoping** (Part D), initial versus incremental sync

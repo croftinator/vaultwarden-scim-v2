@@ -9,6 +9,18 @@ their documented request cycle covered end to end by the test suite - see
 [providers.md](providers.md), including the honest limits of what "covered"
 means without a live tenant.
 
+> [!WARNING]
+> **No identity provider has been validated against a live tenant yet. Do not
+> roll this out to production without testing it yourself first.**
+>
+> Entra ID, Okta, AWS IAM Identity Center and Google Workspace are covered by
+> tests written from each vendor's *published documentation*, not from observed
+> traffic. Authentik is the one exception, verified end to end, but it is not one
+> of the major cloud providers. Run the full lifecycle against a **throwaway**
+> tenant and a test organisation before any rollout - never against production.
+> See [providers.md](providers.md) for what is verified per provider, and
+> [testing.md](testing.md) for the free rungs that get you most of the way.
+
 ## What it does, honestly
 
 It automates **invite**, **update**, **group sync**, and **deprovision**. It does
