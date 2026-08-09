@@ -5,6 +5,22 @@ provisioning endpoints this fork adds. Every value is a parameter, and the
 companion workflow supplies them from GitHub repository variables and secrets -
 so nothing about your deployment lives in this repository.
 
+> [!NOTE]
+> **This lives on its own branch (`deploy/azure-bicep`), deliberately.**
+>
+> It is deployment tooling, not a change to Vaultwarden. Upstream ships a
+> Dockerfile and nothing cloud-specific: deployment recipes live in the
+> community wiki, so the maintainers do not carry Azure API drift, Azure bug
+> reports, or the "why not AWS and GCP too" that follows the first vendor
+> template into a repository. Nothing here is proposed for upstream.
+>
+> Keeping it off the SCIM branch means each can be taken on its own. The SCIM
+> work stays a single-purpose diff someone can review without wading through
+> infrastructure, and this stays usable without adopting SCIM at all - it
+> deploys stock Vaultwarden when `scimEnabled` is false, which is the default.
+>
+> Branch off `main`, not off the SCIM branch, so it carries no SCIM commits.
+
 What gets created:
 
 | Resource | Why |
