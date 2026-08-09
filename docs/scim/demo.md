@@ -178,6 +178,32 @@ an opaque blob computed by a client.
 
 This is why the demo installs real Bitwarden clients rather than mocking them.
 
+### SSO does not accept the invite
+
+Worth knowing before you assume signing in is enough. When an SSO user reaches
+the "Join organization" screen and sets a master password, the client sends
+`org_identifier = FAKE_SSO_IDENTIFIER` (`src/sso.rs:20`) - a placeholder meaning
+"no specific organization". `post_set_password` therefore skips
+`accept_org_invite` (`src/api/core/accounts.rs:481`), and the fallback that would
+accept every pending invitation runs **only when mail is disabled**:
+
+```rust
+if CONFIG.mail_enabled() {
+    mail::send_welcome(...)
+} else {
+    Membership::accept_user_invitations(...)
+}
+```
+
+With SMTP configured - as any realistic deployment and this demo both are - the
+emailed invite link is the proof of address ownership and remains required. So
+SSO and the invite are **sequential, not alternatives**: SSO creates the account
+and its client-side keys, the emailed link joins the organization.
+
+This is upstream behaviour and not something SCIM changes. It is worth stating
+because the SSO screen says "Finish joining this organization", which reasonably
+reads as though it does.
+
 ---
 
 ## Member state, including deprovisioning
