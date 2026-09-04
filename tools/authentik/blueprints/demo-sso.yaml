@@ -1,0 +1,69 @@
+# The OIDC provider Vaultwarden signs in against.
+#
+# Vaultwarden derives its callback from DOMAIN and does not let you set it
+# independently: `sso_callback_path` is a GENERATED setting,
+# `{domain}/identity/connect/oidc-signin` (src/config.rs:1388). So the redirect
+# URI below is not a free choice - it must be exactly that, and if the demo's
+# DOMAIN changes this has to change with it.
+#
+# The client secret comes from the environment rather than being written here.
+# It is a local throwaway, but a credential committed to a public fork is a
+# credential committed to a public fork, and CLAUDE.md rule 4 does not carve out
+# an exception for unimportant ones. tools/scim-demo.sh generates it and passes
+# it in through the compose .env.
+version: 1
+metadata:
+  name: SCIM demo SSO provider
+  labels:
+    blueprints.goauthentik.io/description: |
+      OAuth2/OIDC provider and application for Vaultwarden SSO.
+
+entries:
+  # The signing key. Authentik ships a self-signed certificate on first start
+  # and this finds it by name rather than creating one, so the demo does not
+  # accumulate a new keypair every time the blueprint is re-applied.
+  - model: authentik_crypto.certificatekeypair
+    id: demo-signing-key
+    identifiers:
+      name: authentik Self-signed Certificate
+    state: created
+
+  - model: authentik_providers_oauth2.oauth2provider
+    id: demo-oidc-provider
+    identifiers:
+      name: Vaultwarden SSO
+    state: present
+    attrs:
+      client_type: confidential
+      client_id: !Env [DEMO_OIDC_CLIENT_ID, vaultwarden-demo]
+      client_secret: !Env DEMO_OIDC_CLIENT_SECRET
+      # Implicit consent: this is a demo, and a consent screen between "click
+      # sign in" and "you are signed in" teaches nothing about SCIM while adding
+      # a step that people misread as an error.
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      signing_key: !KeyOf demo-signing-key
+      # Vaultwarden requires the `openid` scope implicitly and asks for
+      # `email profile` by default (SSO_SCOPES). Offline access is what gets a
+      # refresh token, without which the session ends when the access token does.
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, email]]
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, profile]]
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, offline_access]]
+      redirect_uris:
+        - matching_mode: strict
+          url: !Env [DEMO_VW_REDIRECT_URI, "https://localhost:8000/identity/connect/oidc-signin"]
+      sub_mode: user_email
+      include_claims_in_id_token: true
+
+  - model: authentik_core.application
+    id: demo-oidc-application
+    identifiers:
+      slug: vaultwarden-sso
+    state: present
+    attrs:
+      name: Vaultwarden (SSO)
+      provider: !KeyOf demo-oidc-provider
+      meta_description: Sign in to the Vaultwarden SCIM demo.
+      open_in_new_tab: false

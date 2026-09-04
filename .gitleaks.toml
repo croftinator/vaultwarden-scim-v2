@@ -1,0 +1,78 @@
+# Gitleaks configuration.
+#
+# Purpose: keep `gitleaks detect` clean so that a NEW leak is visible instead
+# of being lost among ten known-benign findings inherited from upstream
+# history. Everything allowlisted below was assessed individually; the
+# reasoning is in TODOS.md under "gitleaks: upstream historical findings".
+#
+# This file does not weaken scanning of anything this fork writes. The
+# allowlist is scoped to specific upstream paths and patterns, all dating from
+# 2018-2021, none of which are live credentials.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+description = "Generic API Key"
+regex = '''(?i)(?:key|api|token|secret|client|passwd|password|auth|access)(?:[0-9a-z\-_\t .]{0,20})(?:[\s|']|[\s|"]){0,3}(?:=|>|:{1,3}=|\|\||:|<=|=>|:=|\?=)(?:'|\"|\s|=|\x60){0,5}([0-9a-z\-_.=]{10,150})(?:['|\"|\n|\r|\s|\x60|;]|$)'''
+entropy = 3.5
+keywords = ["key", "api", "token", "secret", "client", "passwd", "password", "auth", "access"]
+
+  [rules.allowlist]
+  # Android APK signing key hashes published in FIDO/U2F app-id facets. An APK
+  # key hash is a public fingerprint by design - it exists so relying parties
+  # can identify the app. Not a secret in any threat model.
+  regexTarget = "line"
+  regexes = ['''apk-key-hash:''']
+
+# Each allowlist below is deliberately narrow. gitleaks ORs `paths` and
+# `regexes` WITHIN one allowlist block unless `condition = "AND"` is set, so a
+# single block carrying both would suppress the regex everywhere in the repo,
+# not only in the paths listed. That is how an unscoped '''"password": "..."'''
+# rule ends up silently exempting every future JSON fixture, docs snippet and
+# SCIM test payload from the one control CLAUDE.md hard rule 4 relies on - and
+# the failure is invisible, because the scan still reports clean. Separate
+# blocks, and `condition = "AND"` wherever a regex is meant to be path-bound.
+
+[[allowlists]]
+description = "Vendored web vault build artifacts, removed from HEAD"
+# Contained a Stripe PUBLISHABLE key (public by design) and APK key hashes.
+# Path-only, so no regex leaks out of this block.
+paths = [
+  '''web-vault/js/app\.min\.js''',
+  '''web-vault/app-id\.json''',
+]
+
+[[allowlists]]
+description = "Commented-out ADMIN_TOKEN examples upstream ships as documentation"
+# Real-looking but inert Argon2 PHC verifier strings in .env.template and
+# README.md. An Argon2 hash is not itself a credential. Flagged upstream as a
+# copy-paste footgun in TODOS.md rather than fixed here. Left path-unscoped
+# because the pattern is specific enough to stand alone.
+regexes = [
+  '''\$argon2id\$v=19\$m=65540,t=3,p=4\$''',
+]
+
+# REMOVED, deliberately: a '''"password"\s*:\s*"[^"]*"''' allowlist entry that was
+# here to excuse the example login bodies in src/api/identity.rs doc comments.
+#
+# It suppressed nothing, and it never had. A gitleaks allowlist regex matches the
+# CAPTURED SECRET by default, not the line, so that pattern could never match
+# generic-api-key's capture group. Measured three ways over the full 2277-commit
+# history: with the entry, without it, and with `regexTarget = "line"` added -
+# all three report zero leaks, while a bare `[extend] useDefault = true` reports
+# ten. The two allowlists above account for all ten on their own.
+#
+# It is removed rather than kept "just in case" because a rule that looks
+# load-bearing and is not is worse than no rule: the next person to touch this
+# file would reason about a constraint that does not exist. If the identity.rs
+# examples ever DO start tripping the scanner, add the entry back WITH
+# `regexTarget = "line"` and `condition = "AND"`, and re-run the three-way
+# measurement above to prove it earns its place.
+
+# NOTE for whoever revisits this: `.env` (which once carried a real-looking
+# ADMIN_TOKEN) no longer exists at HEAD and is now in .gitignore, so the live
+# exposure is already remediated. The 2018 commit remains in history and is
+# deliberately NOT rewritten - doing so would break the fork relationship and
+# every merge from upstream. See CLAUDE.md branch discipline.

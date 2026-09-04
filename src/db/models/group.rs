@@ -195,6 +195,63 @@ impl Group {
         }
     }
 
+    // FORK ADDITION (SCIM): see `Membership::release_external_id`. Same
+    // constraint (2026-08-09-000000), same reassignment case in ldap_import,
+    // same repair.
+    pub async fn release_external_id(
+        external_id: &str,
+        org_uuid: &OrganizationId,
+        keep: &GroupId,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        let Some(holder) = Self::find_by_external_id_and_org(external_id, org_uuid, conn).await else {
+            return Ok(());
+        };
+        if &holder.uuid == keep {
+            return Ok(());
+        }
+        warn!(
+            "external_id {external_id} moved from group {} to {keep} in org {org_uuid}; \
+             clearing the old correlation so the import can proceed",
+            holder.uuid
+        );
+        db_run! { conn: {
+            diesel::update(groups::table)
+                .filter(groups::uuid.eq(&holder.uuid))
+                .set(groups::external_id.eq::<Option<String>>(None))
+                .execute(conn)
+                .map_res("Error releasing external_id")
+        }}
+    }
+
+    // FORK ADDITION (SCIM): see `Membership::save_strict` for the full reasoning.
+    //
+    // Same hazard, same shape: `save` uses `replace_into` on sqlite and mysql, so
+    // a conflict on the `(organizations_uuid, external_id)` unique index deletes
+    // the other group rather than failing. That destroys its
+    // `collections_groups` rows and every access grant they carry. Recoverable
+    // (unlike a membership's `akey`), but still a silent deletion of an
+    // administrator's configuration in response to a write to a different row.
+    pub async fn save_strict(&mut self, conn: &DbConn) -> EmptyResult {
+        self.revision_date = Utc::now().naive_utc();
+
+        db_run! { conn: {
+            match diesel::update(groups::table)
+                .filter(groups::uuid.eq(&self.uuid))
+                .set(&*self)
+                .execute(conn)
+            {
+                // No row carries this uuid yet, so this is the initial insert.
+                Ok(0) => diesel::insert_into(groups::table)
+                    .values(&*self)
+                    .execute(conn)
+                    .map_res("Error saving group"),
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }}
+    }
+
     pub async fn delete_all_by_organization(org_uuid: &OrganizationId, conn: &DbConn) -> EmptyResult {
         for group in Self::find_by_organization(org_uuid, conn).await {
             group.delete(org_uuid, conn).await?;
@@ -206,6 +263,29 @@ impl Group {
         conn.run(move |conn| {
             groups::table
                 .filter(groups::organizations_uuid.eq(org_uuid))
+                .load::<Self>(conn)
+                .expect("Error loading groups")
+        })
+        .await
+    }
+
+    /// One ordered page of an organization's groups.
+    ///
+    /// Same reasoning as `Membership::find_by_org_paged`: the SCIM list endpoint
+    /// pages across separate requests, so the order has to be total and stable
+    /// or a group can land on two pages or on none.
+    pub async fn find_by_organization_paged(
+        org_uuid: &OrganizationId,
+        limit: i64,
+        offset: i64,
+        conn: &DbConn,
+    ) -> Vec<Self> {
+        conn.run(move |conn| {
+            groups::table
+                .filter(groups::organizations_uuid.eq(org_uuid))
+                .order(groups::uuid.asc())
+                .limit(limit)
+                .offset(offset)
                 .load::<Self>(conn)
                 .expect("Error loading groups")
         })
@@ -554,6 +634,30 @@ impl GroupUser {
                 .select(groups_users::all_columns)
                 .load::<Self>(conn)
                 .expect("Error loading group users")
+        })
+        .await
+    }
+
+    /// Same scoping as `find_by_group`, for several groups in one query.
+    ///
+    /// Serializing a page of groups otherwise costs one three-table join per
+    /// group; at the default SCIM page size that is 100 sequential queries on a
+    /// single pooled connection for one request.
+    pub async fn find_by_groups(group_uuids: &[GroupId], org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
+        let group_uuids = group_uuids.to_vec();
+        conn.run(move |conn| {
+            groups_users::table
+                .inner_join(groups::table.on(groups::uuid.eq(groups_users::groups_uuid)))
+                .inner_join(
+                    users_organizations::table.on(users_organizations::uuid
+                        .eq(groups_users::users_organizations_uuid)
+                        .and(users_organizations::org_uuid.eq(groups::organizations_uuid))),
+                )
+                .filter(groups_users::groups_uuid.eq_any(group_uuids))
+                .filter(groups::organizations_uuid.eq(org_uuid))
+                .select(groups_users::all_columns)
+                .load::<Self>(conn)
+                .unwrap_or_default()
         })
         .await
     }

@@ -210,7 +210,30 @@ impl Organization {
             "useGroups": CONFIG.org_groups_enabled(),
             "useTotp": true,
             "usePolicies": true,
-            "useScim": false, // Not supported (Not AGPLv3 Licensed)
+            // Left false even though this fork DOES implement SCIM, because the
+            // flag drives the web vault's UI and not its own endpoints.
+            //
+            // Verified against the pinned web-vault build (the digest in
+            // Dockerfile), not assumed: `canManageScim` is
+            // `(isAdmin || permissions.manageScim) && useScim`, and it gates a
+            // side-nav item pointing at `settings/scim`. That route is NOT
+            // registered in the bundle - zero occurrences of `{path:"scim"}` -
+            // because upstream hardcodes the flag false, so the page is dead
+            // code the build strips while the nav entry survives in shared
+            // library code. Setting this true therefore adds a "SCIM" link that
+            // leads nowhere.
+            //
+            // Even with the page present it could not work: the vault builds its
+            // SCIM URL from `urls.scim`, which is set to null for the SelfHosted
+            // region, and the only SCIM hosts it knows are scim.bitwarden.com
+            // and its EU/gov siblings. It has no way to reach this fork's
+            // /api/organizations/<id>/scim/api-key.
+            //
+            // Provisioning is driven by the documented flow in
+            // docs/scim/setup.md Part B instead. Precedent is one line up:
+            // `useDirectory` is likewise reported false while being supported.
+            // Revisit if the web vault ever ships a self-hosted SCIM page.
+            "useScim": false,
             "useSso": false, // Not supported
             "useKeyConnector": false, // Not supported
             "usePasswordManager": true,
@@ -258,6 +281,14 @@ impl Organization {
 // The same goes for the database where we only use INTEGER (the same as an i32)
 // It should also provide enough room for 100+ types, which i doubt will ever happen.
 const ACTIVATE_REVOKE_DIFF: i32 = 128;
+
+/// Largest number of values bound into one `eq_any` here.
+///
+/// Each element of an `eq_any` is a bound parameter, and older SQLite builds
+/// cap `SQLITE_MAX_VARIABLE_NUMBER` at 999 - right where a maximum-size SCIM
+/// group member list (`SCIM_MAX_GROUP_MEMBERS` = 1000) lands. Named rather than
+/// inlined so the value and the constraint that produced it stay together.
+const SQLITE_SAFE_BIND_CHUNK: usize = 500;
 
 impl Membership {
     pub fn new(user_uuid: UserId, org_uuid: OrganizationId, invited_by_email: Option<String>) -> Self {
@@ -390,6 +421,7 @@ impl Organization {
         OrgPolicy::delete_all_by_organization(&self.uuid, conn).await?;
         Group::delete_all_by_organization(&self.uuid, conn).await?;
         OrganizationApiKey::delete_all_by_organization(&self.uuid, conn).await?;
+        super::ScimApiKey::delete_all_by_organization(&self.uuid, conn).await?;
 
         conn.run(move |conn| {
             diesel::delete(organizations::table.filter(organizations::uuid.eq(self.uuid)))
@@ -486,7 +518,30 @@ impl Membership {
             "useEvents": CONFIG.org_events_enabled(),
             "useGroups": CONFIG.org_groups_enabled(),
             "useTotp": true,
-            "useScim": false, // Not supported (Not AGPLv3 Licensed)
+            // Left false even though this fork DOES implement SCIM, because the
+            // flag drives the web vault's UI and not its own endpoints.
+            //
+            // Verified against the pinned web-vault build (the digest in
+            // Dockerfile), not assumed: `canManageScim` is
+            // `(isAdmin || permissions.manageScim) && useScim`, and it gates a
+            // side-nav item pointing at `settings/scim`. That route is NOT
+            // registered in the bundle - zero occurrences of `{path:"scim"}` -
+            // because upstream hardcodes the flag false, so the page is dead
+            // code the build strips while the nav entry survives in shared
+            // library code. Setting this true therefore adds a "SCIM" link that
+            // leads nowhere.
+            //
+            // Even with the page present it could not work: the vault builds its
+            // SCIM URL from `urls.scim`, which is set to null for the SelfHosted
+            // region, and the only SCIM hosts it knows are scim.bitwarden.com
+            // and its EU/gov siblings. It has no way to reach this fork's
+            // /api/organizations/<id>/scim/api-key.
+            //
+            // Provisioning is driven by the documented flow in
+            // docs/scim/setup.md Part B instead. Precedent is one line up:
+            // `useDirectory` is likewise reported false while being supported.
+            // Revisit if the web vault ever ships a self-hosted SCIM page.
+            "useScim": false,
             "usePolicies": true,
             "useApi": true,
             "selfHost": true,
@@ -782,6 +837,94 @@ impl Membership {
         }
     }
 
+    // FORK ADDITION (SCIM): hand a correlation key over from whoever holds it.
+    //
+    // `(org_uuid, external_id)` became UNIQUE in 2026-08-09-000000, which the
+    // SCIM endpoints want and upstream's Directory Connector import
+    // (`ldap_import`) never asked for. That import legitimately REASSIGNS an
+    // external_id between rows - a directory email change makes
+    // `find_by_email_and_org` miss and build a new membership carrying the same
+    // correlation key - and before the index that was a harmless duplicate.
+    //
+    // Under the constraint it becomes an error mid-loop, which aborts the whole
+    // sync with earlier members already written and repeats on every cycle until
+    // an operator finds the stale row by hand. Clearing the loser's key first is
+    // the same repair the migration performs on pre-existing duplicates, and for
+    // the same reason: two memberships claiming one directory object is already
+    // broken state, and there is no reading in which both are correct. The row
+    // itself, its akey and its access are untouched - only the correlation hint,
+    // which the next sync re-establishes for whichever member still has it.
+    pub async fn release_external_id(
+        external_id: &str,
+        org_uuid: &OrganizationId,
+        keep: &MembershipId,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        let Some(holder) = Self::find_by_external_id_and_org(external_id, org_uuid, conn).await else {
+            return Ok(());
+        };
+        if &holder.uuid == keep {
+            return Ok(());
+        }
+        warn!(
+            "external_id {external_id} moved from membership {} to {keep} in org {org_uuid}; \
+             clearing the old correlation so the import can proceed",
+            holder.uuid
+        );
+        db_run! { conn: {
+            diesel::update(users_organizations::table)
+                .filter(users_organizations::uuid.eq(&holder.uuid))
+                .set(users_organizations::external_id.eq::<Option<String>>(None))
+                .execute(conn)
+                .map_res("Error releasing external_id")
+        }}
+    }
+
+    // FORK ADDITION (SCIM): like `save`, but a unique-constraint violation is an
+    // ERROR rather than the silent deletion of whoever else held the value.
+    //
+    // `save` uses `replace_into` on sqlite and mysql, and REPLACE resolves a
+    // conflict on ANY unique index by DELETING the conflicting row before
+    // inserting. That is harmless for the `uuid` primary key - the row being
+    // replaced is the row being saved - and it was harmless for
+    // `UNIQUE (user_uuid, org_uuid)` only because nothing wrote a membership for
+    // a user who already had one. It is NOT harmless for the
+    // `(org_uuid, external_id)` unique index: a conflict there deletes a
+    // DIFFERENT member, taking their `akey` - their wrapped copy of the
+    // organization key - with it. Under end-to-end encryption that cannot be
+    // reconstructed by anyone, including the server.
+    //
+    // SCIM writes an IdP-supplied `external_id` on every provisioning cycle, so
+    // it is the one caller that reaches that conflict with ordinary traffic.
+    // Verified against the shipped index: a REPLACE carrying a duplicate
+    // `(org_uuid, external_id)` removed the other membership row and returned
+    // success, so the handlers' uniqueness recovery never ran.
+    //
+    // UPDATE-then-INSERT touches exactly one row and lets the database raise the
+    // violation, which the SCIM handlers turn into a 409. Not a race: `uuid` is a
+    // v4 generated per row, so two concurrent callers never contend on the
+    // INSERT. Where they DO contend - the same external_id - the loser now gets
+    // an error instead of destroying the winner.
+    pub async fn save_strict(&self, conn: &DbConn) -> EmptyResult {
+        User::update_uuid_revision(&self.user_uuid, conn).await;
+
+        db_run! { conn: {
+            match diesel::update(users_organizations::table)
+                .filter(users_organizations::uuid.eq(&self.uuid))
+                .set(self)
+                .execute(conn)
+            {
+                // No row carries this uuid yet, so this is the initial insert.
+                Ok(0) => diesel::insert_into(users_organizations::table)
+                    .values(self)
+                    .execute(conn)
+                    .map_res("Error adding user to organization"),
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }}
+    }
+
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
         User::update_uuid_revision(&self.user_uuid, conn).await;
 
@@ -927,6 +1070,32 @@ impl Membership {
         .await
     }
 
+    /// One ordered page of an organization's memberships.
+    ///
+    /// Added for the SCIM list endpoint, where both halves matter. The LIMIT
+    /// keeps a full directory sync from loading every row once per page: Entra
+    /// pages at 100, so a 20k-member organization would otherwise deserialize
+    /// 20k rows 200 times per cycle on a single pooled connection.
+    ///
+    /// The ORDER BY is the correctness half. A client pages by issuing separate
+    /// requests, so each page is its own query; without a total order the
+    /// database is free to return rows differently between them. On PostgreSQL
+    /// an UPDATE relocates a row in the heap and changes sequential-scan order,
+    /// and a concurrent revoke is an UPDATE - so a member could appear on two
+    /// pages or on none, and a sync would silently skip them.
+    pub async fn find_by_org_paged(org_uuid: &OrganizationId, limit: i64, offset: i64, conn: &DbConn) -> Vec<Self> {
+        conn.run(move |conn| {
+            users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .order(users_organizations::uuid.asc())
+                .limit(limit)
+                .offset(offset)
+                .load::<Self>(conn)
+                .expect("Error loading user organizations")
+        })
+        .await
+    }
+
     pub async fn find_confirmed_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
             users_organizations::table
@@ -990,6 +1159,83 @@ impl Membership {
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .filter(users_organizations::atype.eq(atype as i32))
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+                .count()
+                .first::<i64>(conn)
+                .unwrap_or(0)
+        })
+        .await
+    }
+
+    /// Members of `atype` that are not revoked, in any status.
+    ///
+    /// Revocation is stored as an offset (`status - ACTIVATE_REVOKE_DIFF`), so
+    /// every revoked row is `<= MembershipStatus::Revoked`; `Revoked` itself is
+    /// a sentinel that is never written. Comparing `> Revoked` is therefore the
+    /// only correct active test, and `.ne(Revoked)` would match every row.
+    ///
+    /// Used by the SCIM last-owner guard, which has to know whether an
+    /// organization would be left with no administrator at all - not merely
+    /// with no *confirmed* one.
+    pub async fn count_active_by_org_and_type(org_uuid: &OrganizationId, atype: MembershipType, conn: &DbConn) -> i64 {
+        conn.run(move |conn| {
+            users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(users_organizations::atype.eq(atype as i32))
+                .filter(users_organizations::status.gt(MembershipStatus::Revoked as i32))
+                .count()
+                .first::<i64>(conn)
+                .unwrap_or(0)
+        })
+        .await
+    }
+
+    /// The subset of `member_uuids` that really are memberships of this org.
+    ///
+    /// One query per chunk instead of one per value. The SCIM Group write paths
+    /// resolve an entire member list before touching anything, so at
+    /// `SCIM_MAX_GROUP_MEMBERS` = 1000 a single legal request would otherwise
+    /// drive 1000 sequential round trips while holding one pooled connection.
+    ///
+    /// Chunked rather than one `eq_any`, because each element is a bound
+    /// parameter and older SQLite builds cap `SQLITE_MAX_VARIABLE_NUMBER` at
+    /// 999 - right where a maximum-size member list lands.
+    pub async fn find_by_uuids_and_org(
+        member_uuids: &[MembershipId],
+        org_uuid: &OrganizationId,
+        conn: &DbConn,
+    ) -> Vec<Self> {
+        let mut found: Vec<Self> = Vec::with_capacity(member_uuids.len());
+        for chunk in member_uuids.chunks(SQLITE_SAFE_BIND_CHUNK) {
+            let chunk = chunk.to_vec();
+            let mut rows = conn
+                .run(move |conn| {
+                    users_organizations::table
+                        .filter(users_organizations::uuid.eq_any(chunk))
+                        .filter(users_organizations::org_uuid.eq(org_uuid))
+                        .load::<Self>(conn)
+                        .unwrap_or_default()
+                })
+                .await;
+            found.append(&mut rows);
+        }
+        found
+    }
+
+    /// Confirmed members of `atype` that carry a SCIM externalId, i.e. that are
+    /// linked to a directory object. Counted in the database rather than by
+    /// loading every membership, because the SCIM status endpoint only needs
+    /// the two numbers.
+    pub async fn count_confirmed_directory_linked_by_org_and_type(
+        org_uuid: &OrganizationId,
+        atype: MembershipType,
+        conn: &DbConn,
+    ) -> i64 {
+        conn.run(move |conn| {
+            users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(users_organizations::atype.eq(atype as i32))
+                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+                .filter(users_organizations::external_id.is_not_null())
                 .count()
                 .first::<i64>(conn)
                 .unwrap_or(0)

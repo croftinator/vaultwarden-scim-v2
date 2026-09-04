@@ -1,0 +1,28 @@
+[package]
+name = "test-support"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Dependency policy for this fork: upstream owns crate versions.
+#
+# The SCIM feature adds NO runtime dependencies - `src/api/scim/` is built
+# entirely from crates the upstream workspace already pins. This crate is the
+# only place the fork brings anything of its own, it is dev-only, and it exists
+# solely to set up a hermetic test environment before main.
+#
+# So nothing here may pin a version upstream also pins. `rustls` was declared
+# here as an exact "0.23.35" while the workspace pinned "0.23.43": harmless
+# while both resolved to one version, but it is a second opinion about a crate
+# that is not ours to have one about, and it would have diverged silently the
+# first time upstream moved. Tracking the minor series instead means the
+# workspace decides and this follows. If upstream ever moves to 0.24 the build
+# fails at sync time, which is the loud failure we want - `sync-upstream` runs
+# the full suite for exactly this reason.
+[dependencies]
+# Fork-owned: upstream does not use ctor. Ours to update, dev-only.
+ctor = "1.0.9"
+# Upstream-owned: follows whatever the workspace resolves within 0.23.x.
+rustls = { version = "0.23", features = ["ring"], default-features = false }

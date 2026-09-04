@@ -575,7 +575,8 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
     config.limits = Limits::new()
         .limit("json", 20.megabytes()) // 20MB should be enough for very large imports, something like 5000+ vault entries
         .limit("data-form", 525.megabytes()) // This needs to match the maximum allowed file size for Send
-        .limit("file", 525.megabytes()); // This needs to match the maximum allowed file size for attachments
+        .limit("file", 525.megabytes()) // This needs to match the maximum allowed file size for attachments
+        .limit("scim", api::scim::SCIM_BODY_LIMIT); // SCIM bodies are small; a tight cap limits abuse of the machine-auth endpoint
 
     // If adding more paths here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
@@ -587,9 +588,11 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .mount([basepath, "/identity"].concat(), api::identity_routes())
         .mount([basepath, "/icons"].concat(), api::icons_routes())
         .mount([basepath, "/notifications"].concat(), api::notifications_routes())
+        .mount([basepath, "/scim"].concat(), api::scim_routes())
         .register([basepath, "/"].concat(), api::web_catchers())
         .register([basepath, "/api"].concat(), api::core_catchers())
         .register([basepath, "/admin"].concat(), api::admin_catchers())
+        .register([basepath, "/scim"].concat(), api::scim_catchers())
         .manage(pool)
         .manage(Arc::clone(&WS_USERS))
         .manage(Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS))
@@ -733,6 +736,20 @@ fn schedule_jobs(pool: db::DbPool) {
             {
                 sched.add(Job::new(CONFIG.event_cleanup_schedule().parse().unwrap(), || {
                     runtime.spawn(api::event_cleanup_job(pool.clone()));
+                }));
+            }
+
+            // Drop fully replenished rate-limiter buckets. The keyed stores
+            // never evict on their own, and they are keyed on a client IP that
+            // is caller-supplied when IP_HEADER is honoured.
+            if !CONFIG.ratelimit_prune_schedule().is_empty() {
+                // spawn_blocking, not inline: DashMap::retain takes a write
+                // lock on every shard while it iterates, and every other job
+                // in this block hands its work to the runtime too. Running it
+                // on the scheduler thread would stall the tick loop - and so
+                // every job registered after it - for the length of the sweep.
+                sched.add(Job::new(CONFIG.ratelimit_prune_schedule().parse().unwrap(), || {
+                    runtime.spawn_blocking(ratelimit::prune_limiters);
                 }));
             }
 

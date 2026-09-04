@@ -1,0 +1,186 @@
+# FORK ADDITION (SCIM): end-to-end provisioning against a real engine.
+#
+# Deliberately NOT on every push, and the split matters.
+#
+# `owner-race` is cheap and guards a security invariant the in-process suite
+# provably cannot: Rocket's local client never achieves true request
+# concurrency, so the last-owner race is invisible to `cargo test`. It runs on
+# any change to the SCIM code.
+#
+# It runs TWICE, and the second run is the point. A harness that reports success
+# whatever happens is not a guard, so the job also builds a control binary with
+# the mutex compiled out (`--features scim-race-control`) and requires the same
+# harness to FAIL against it. Without that step, "0 races" is a statement about
+# the harness rather than about the code.
+#
+# `authentik` is the opposite trade. It pulls a ~1.8GB image, starts four
+# containers, and waits on a scheduler we do not control - Authentik syncs on
+# its own cadence and exposes no reliable trigger, so the script polls with a
+# generous timeout. Valuable, but too slow and too timing-dependent to gate a
+# push on. It runs weekly and on demand.
+#
+# What neither replaces: `build.yml` is still the merge gate.
+name: Provisioning E2E
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Only cancel the cheap push-triggered runs. Cancelling a scheduled Authentik
+  # run costs a full week of coverage rather than a few minutes of runner time,
+  # and it is the one job here that cannot simply be re-triggered by the next
+  # push.
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 04:17 UTC. Off the hour on purpose - scheduled jobs
+    # cluster at :00 and get queued behind everyone else's.
+    #
+    # NOTE: GitHub fires `schedule:` only from the repository's DEFAULT branch.
+    # While this workflow lives on feature/scim-v2 and not on main, the weekly
+    # run does not happen at all - the Authentik job is dispatch-only until this
+    # branch merges. Do not read "runs weekly" as describing today.
+    - cron: "17 4 * * 1"
+  push:
+    paths:
+      - "src/api/scim/**"
+      - "src/db/models/scim_api_key.rs"
+      - "src/db/models/organization.rs"
+      - "src/db/models/group.rs"
+      - "tools/scim-owner-race.sh"
+      - "tools/scim-authentik-e2e.sh"
+      - "tools/ci-seed-vaultwarden.sh"
+      - ".github/workflows/provisioning-e2e.yml"
+      # The owner-race job asserts a property of tokio's Mutex under Rocket's
+      # real threading, which a toolchain or runtime-crate bump can change.
+      # Upstream's batched bumps arrive through sync-upstream and would
+      # otherwise never trigger it.
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Fast, deterministic, no containers beyond the build. Runs on every SCIM change.
+  owner-race:
+    name: Last-owner concurrency race
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-Dwarnings"
+    steps:
+      - name: "Install dependencies"
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libssl-dev pkg-config sqlite3
+
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust Caching
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: "v2025.09-rust-e2e"
+
+      - name: "Build"
+        run: cargo build --profile ci --features sqlite
+
+      # The control arm, built first so a failure here costs nothing. It
+      # compiles OUT the last-owner mutex, which is the only way to show the
+      # harness can detect its absence. Published race figures used to come from
+      # an uncommitted local edit; this makes them a build anyone can repeat.
+      - name: "Build the no-mutex control binary"
+        run: cargo build --profile ci --features sqlite,scim-race-control --target-dir target/control
+
+      - name: "Start Vaultwarden and seed an organisation"
+        run: tools/ci-seed-vaultwarden.sh "$RUNNER_TEMP/vw" "$GITHUB_WORKSPACE/target/ci/vaultwarden"
+
+      - name: "Race the last-owner guard"
+        run: SCIM_RACE_DIR="$RUNNER_TEMP/vw" tools/scim-owner-race.sh 40
+
+      # Negative control: the same harness against a binary with the mutex
+      # removed MUST fail. A guard whose absence the test cannot detect is not
+      # being tested, and this step is what stops "0 races" from being a
+      # statement about the harness rather than about the code.
+      - name: "Control: the same race must FAIL without the mutex"
+        run: |
+          pkill -f 'target/ci/vaultwarden' || true
+          sleep 2
+          tools/ci-seed-vaultwarden.sh "$RUNNER_TEMP/vw-control" \
+            "$GITHUB_WORKSPACE/target/control/ci/vaultwarden"
+          if SCIM_RACE_DIR="$RUNNER_TEMP/vw-control" tools/scim-owner-race.sh 25; then
+            echo "::error::The race harness passed against a binary with NO last-owner mutex."
+            echo "::error::It cannot detect the regression it exists to catch. Fix the harness."
+            exit 1
+          fi
+          echo "Control behaved correctly: the harness fails when the mutex is absent."
+
+      - name: "Server log on failure"
+        if: failure()
+        run: |
+          tail -100 "$RUNNER_TEMP/vw/vw.log" || true
+          tail -100 "$RUNNER_TEMP/vw-control/vw.log" || true
+
+  # Heavy: pulls Authentik, starts four containers, waits on its scheduler.
+  # Weekly and on demand only.
+  authentik:
+    name: Authentik full lifecycle
+    if: ${{ github.event_name != 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: "-Dwarnings"
+    steps:
+      - name: "Install dependencies"
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libssl-dev pkg-config sqlite3
+
+      - name: "Checkout"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust Caching
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: "v2025.09-rust-e2e"
+
+      - name: "Build"
+        run: cargo build --profile ci --features sqlite
+
+      # 0.0.0.0 so the Authentik containers can reach it across the docker0
+      # bridge; the owner-race job stays on loopback.
+      - name: "Start Vaultwarden and seed an organisation"
+        run: |
+          set -euo pipefail
+          tools/ci-seed-vaultwarden.sh "$RUNNER_TEMP/vw" \
+            "$GITHUB_WORKSPACE/target/ci/vaultwarden" 0.0.0.0 > "$RUNNER_TEMP/seed.env"
+          # Masked before it reaches $GITHUB_ENV, whose values are NOT masked by
+          # default and would otherwise appear verbatim in any later step that
+          # dumps the environment.
+          TOKEN_VALUE=$(sed -n 's/^TOKEN=//p' "$RUNNER_TEMP/seed.env")
+          echo "::add-mask::$TOKEN_VALUE"
+          cat "$RUNNER_TEMP/seed.env" >> "$GITHUB_ENV"
+
+      # On GitHub's Linux runners containers reach the host through the docker0
+      # bridge, not host.docker.internal - that name is Docker Desktop only.
+      #
+      # The token goes through the environment, not argv: anything else on the
+      # runner can read a command line out of ps(1). tools/scim-replay.sh made
+      # the same call and documents it.
+      - name: "Run the full lifecycle through Authentik"
+        run: |
+          HOST_IP=$(ip -4 addr show docker0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+          echo "authentik will reach vaultwarden at $HOST_IP:8000"
+          SCIM_TOKEN="$TOKEN" tools/scim-authentik-e2e.sh \
+            --domain "http://$HOST_IP:8000" \
+            --org "$ORG" \
+            --db "$RUNNER_TEMP/vw/vw-data/db.sqlite3"
+
+      - name: "Server log on failure"
+        if: failure()
+        run: tail -100 "$RUNNER_TEMP/vw/vw.log" || true

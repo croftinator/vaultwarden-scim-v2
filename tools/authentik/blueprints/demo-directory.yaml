@@ -1,0 +1,124 @@
+# The demo directory: the people and teams the walkthrough talks about.
+#
+# Applied automatically by the Authentik worker, which watches /blueprints/custom.
+# Declarative on purpose: tools/scim-authentik-e2e.sh builds its directory through
+# a sequence of API calls, which is fine for a harness that throws everything away
+# afterwards, but means the demo's contents would live in a shell script rather
+# than somewhere you can read and edit them.
+#
+# `state: present` creates if absent and updates otherwise, so re-applying is
+# safe and editing this file then restarting the worker is the edit loop.
+#
+# These accounts have NO passwords. They exist to be provisioned INTO Vaultwarden
+# by SCIM and to be deprovisioned again; the walkthrough signs in as the Owner,
+# who is a Vaultwarden account, not one of these. Giving them passwords would
+# imply they can sign in, which would then need per-user secrets in a file that
+# is committed - see rule 4 in CLAUDE.md.
+version: 1
+metadata:
+  name: SCIM demo directory
+  labels:
+    blueprints.goauthentik.io/description: |
+      Users and groups for the Vaultwarden SCIM + SSO demo.
+
+entries:
+  # --- Groups -------------------------------------------------------------
+  #
+  # Two groups, because one group cannot show the interesting case. Engineering
+  # is synced to Vaultwarden and drives collection access; Contractors is
+  # deliberately NOT provisioned, so the walkthrough can show that SCIM syncs
+  # what it is told to and leaves the rest of the directory alone.
+  - model: authentik_core.group
+    id: group-engineering
+    identifiers:
+      name: Engineering
+    state: present
+    attrs:
+      is_superuser: false
+
+  - model: authentik_core.group
+    id: group-contractors
+    identifiers:
+      name: Contractors
+    state: present
+    attrs:
+      is_superuser: false
+
+  # --- People -------------------------------------------------------------
+  #
+  # example.com addresses on purpose: RFC 2606 reserves it, so nothing here can
+  # ever reach a real mailbox even if a misconfigured server tried. Mailpit
+  # catches the invites regardless.
+  - model: authentik_core.user
+    id: user-ada
+    identifiers:
+      username: ada.lovelace
+    state: present
+    attrs:
+      name: Ada Lovelace
+      email: ada.lovelace@example.com
+      is_active: true
+      type: internal
+      groups:
+        - !KeyOf group-engineering
+
+  - model: authentik_core.user
+    id: user-grace
+    identifiers:
+      username: grace.hopper
+    state: present
+    attrs:
+      name: Grace Hopper
+      email: grace.hopper@example.com
+      is_active: true
+      type: internal
+      groups:
+        - !KeyOf group-engineering
+
+  - model: authentik_core.user
+    id: user-alan
+    identifiers:
+      username: alan.turing
+    state: present
+    attrs:
+      name: Alan Turing
+      email: alan.turing@example.com
+      is_active: true
+      type: internal
+      groups:
+        - !KeyOf group-engineering
+
+  # Katherine stays INVITED throughout, as the contrast case: revoking her
+  # yields status -128 (0 minus the 128 offset) rather than -126.
+  #
+  # She is deliberately NOT the subject of the lossless-restore demonstration.
+  # An Invited member has an empty akey, so "the wrapped key survived revocation"
+  # would be trivially true of a row that never held one - an assertion that
+  # looks green and proves nothing. The walkthrough deprovisions Ada instead,
+  # after she has been confirmed and actually has a key to preserve.
+  - model: authentik_core.user
+    id: user-katherine
+    identifiers:
+      username: katherine.johnson
+    state: present
+    attrs:
+      name: Katherine Johnson
+      email: katherine.johnson@example.com
+      is_active: true
+      type: internal
+      groups:
+        - !KeyOf group-engineering
+
+  # Not in Engineering, so never provisioned. Present to prove the negative.
+  - model: authentik_core.user
+    id: user-charles
+    identifiers:
+      username: charles.babbage
+    state: present
+    attrs:
+      name: Charles Babbage
+      email: charles.babbage@example.com
+      is_active: true
+      type: internal
+      groups:
+        - !KeyOf group-contractors

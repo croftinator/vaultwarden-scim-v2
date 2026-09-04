@@ -1,3 +1,25 @@
+<!--
+  FORK NOTE: this README is upstream's, kept byte-for-byte below so their edits
+  merge cleanly. Everything specific to this fork lives in README-SCIM.md - put
+  fork content THERE, not here. Rewriting this file was the single largest
+  permanent merge cost in the fork: with the surrounding context gone, git could
+  not even place an upstream hunk.
+-->
+
+> [!IMPORTANT]
+> **This is a fork that adds a SCIM v2 provisioning server**
+> (RFC 7643 / RFC 7644), so organization membership can be driven from an
+> identity provider. Everything below is upstream's README and describes
+> Vaultwarden itself.
+>
+> **Fork documentation: [README-SCIM.md](README-SCIM.md)** - what it does, which
+> providers are verified, and the setup guides. Start there.
+>
+> No identity provider has been validated against a live tenant yet. Do not roll
+> this out to production without testing it yourself first.
+
+---
+
 ![Vaultwarden Logo](./resources/vaultwarden-logo-auto.svg)
 
 An alternative server implementation of the Bitwarden Client API, written in Rust and compatible with [official Bitwarden clients](https://bitwarden.com/download/) [[disclaimer](#disclaimer)], perfect for self-hosted deployment where running the official resource-heavy service might not be ideal.

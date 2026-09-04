@@ -297,7 +297,33 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for EtagC
 
 // Log all the routes from the main paths list, and the attachments endpoint
 // Effectively ignores, any static file route, and the alive endpoint
-const LOGGED_ROUTES: [&str; 7] = ["/api", "/admin", "/identity", "/icons", "/attachments", "/events", "/notifications"];
+const LOGGED_ROUTES: [&str; 8] =
+    ["/api", "/admin", "/identity", "/icons", "/attachments", "/events", "/notifications", "/scim"];
+
+// The query string as it should appear in the request log.
+//
+// SCIM list requests carry directory identity in the query itself
+// (`?filter=userName eq "person@example.com"`), so under /scim only the
+// parameter NAMES survive - which is what is actually useful when reading a
+// sync log, without writing every provisioned user's address into it.
+//
+// Everything else keeps the previous first-30-characters behaviour, but cut on
+// a character boundary: slicing a byte range out of a multi-byte query panics,
+// and this fairing runs before any request guard.
+fn log_query(uri_subpath: &str, query: &str) -> String {
+    if uri_subpath.starts_with("/scim") {
+        return query
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((name, _)) => format!("{name}=<redacted>"),
+                None => pair.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+    }
+    let end = query.char_indices().map(|(i, c)| i + c.len_utf8()).take_while(|&i| i <= 30).last().unwrap_or(0);
+    query[..end].to_owned()
+}
 
 // Boolean is extra debug, when true, we ignore the whitelist above and also print the mounts
 pub struct BetterLogging(pub bool);
@@ -345,7 +371,7 @@ impl Fairing for BetterLogging {
         let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
         if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             match uri.query() {
-                Some(q) => info!(target: "request", "{method} {uri_path_str}?{}", &q[..q.len().min(30)]),
+                Some(q) => info!(target: "request", "{method} {uri_path_str}?{}", log_query(uri_subpath, q.as_str())),
                 None => info!(target: "request", "{method} {uri_path_str}"),
             }
         }
@@ -980,5 +1006,58 @@ mod tests {
                 });
             }
         });
+    }
+}
+
+// FORK ADDITION (SCIM): tests for `log_query`, which is small, unexported, and
+// does two independent load-bearing jobs.
+//
+// Deliberately NOT behind the `unstable` feature like the module above, whose
+// two tests are also `#[ignore]`d - so in a normal `cargo test` run this file
+// had no runnable coverage at all. Both behaviours below regress silently: the
+// fairing runs before any request guard, so a bad slice takes the process down
+// on an unauthenticated request, and the redaction is a privacy control with no
+// visible symptom when it stops working.
+#[cfg(test)]
+mod log_query_tests {
+    use super::log_query;
+
+    #[test]
+    fn scim_queries_keep_parameter_names_and_drop_their_values() {
+        // A SCIM list request carries directory identity in the query itself, so
+        // an unredacted request log records every provisioned user's address.
+        let logged = log_query("/scim/v2/abc/Users", "filter=userName%20eq%20%22person@example.com%22&startIndex=1");
+        assert!(!logged.contains("person@example.com"), "a directory address must never reach the log: {logged}");
+        assert_eq!(logged, "filter=<redacted>&startIndex=<redacted>");
+    }
+
+    #[test]
+    fn a_valueless_scim_parameter_passes_through_unchanged() {
+        assert_eq!(log_query("/scim/v2/abc/Users", "bare"), "bare");
+    }
+
+    #[test]
+    fn non_scim_queries_keep_the_first_thirty_characters() {
+        let query = "a".repeat(50);
+        let logged = log_query("/api/sync", &query);
+        assert_eq!(logged.len(), 30);
+        assert!(query.starts_with(&logged));
+    }
+
+    #[test]
+    fn a_short_non_scim_query_is_not_padded_or_truncated() {
+        assert_eq!(log_query("/api/sync", "short=1"), "short=1");
+    }
+
+    #[test]
+    fn a_multibyte_query_is_cut_on_a_character_boundary() {
+        // The predecessor sliced a raw byte range, so a query whose 30-byte
+        // boundary fell inside a character panicked - inside a fairing that runs
+        // before every request guard, on unauthenticated input.
+        for query in [&"é".repeat(40), &"🔒".repeat(20), &"日本語".repeat(15)] {
+            let logged = log_query("/api/sync", query);
+            assert!(logged.len() <= 30, "must not exceed the byte budget: {logged:?}");
+            assert!(query.starts_with(&logged), "must be a prefix cut on a character boundary: {logged:?}");
+        }
     }
 }

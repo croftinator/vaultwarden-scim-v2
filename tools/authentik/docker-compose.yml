@@ -1,0 +1,91 @@
+# Authentik, pinned, for tools/scim-authentik-e2e.sh.
+#
+# This file exists so the e2e harness stops doing
+#     curl -fsSL -o docker-compose.yml https://goauthentik.io/docker-compose.yml
+# at run time. That fetch pulled an unpinned compose file from a third-party
+# host and immediately executed it, which is the opposite of how everything else
+# in this repository is built: GitHub Actions are SHA-pinned, Cargo.lock is
+# committed and authoritative, and CLAUDE.md pins container images to a minor so
+# "nothing re-resolves on a build". It also meant a green weekly run said nothing
+# repeatable, because the Authentik version under test drifted silently.
+#
+# Deliberately smaller than the vendor's file: the upstream compose ships
+# optional services (geoip, outposts) this harness never touches.
+#
+# BUMPING: change AUTHENTIK_TAG in tools/scim-authentik-e2e.sh, run the harness
+# locally, and commit the two together. A wrong tag fails loudly at pull time,
+# which is the intended failure mode - the previous arrangement could not fail
+# at all, it just tested something different.
+services:
+  postgresql:
+    image: docker.io/library/postgres:16.6-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 5s
+    volumes:
+      - database:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: ${PG_PASS:?}
+      POSTGRES_USER: ${PG_USER:-authentik}
+      POSTGRES_DB: ${PG_DB:-authentik}
+
+  redis:
+    image: docker.io/library/redis:7.4-alpine
+    command: --save 60 1 --loglevel warning
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 3s
+    volumes:
+      - redis:/data
+
+  server:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG:?}
+    restart: unless-stopped
+    command: server
+    environment:
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?}
+    env_file:
+      - .env
+    ports:
+      - "${COMPOSE_PORT_HTTP:-9000}:9000"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG:?}
+    restart: unless-stopped
+    command: worker
+    environment:
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${PG_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?}
+    env_file:
+      - .env
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  database:
+    driver: local
+  redis:
+    driver: local

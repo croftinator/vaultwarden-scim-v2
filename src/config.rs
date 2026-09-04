@@ -561,6 +561,8 @@ make_config! {
         /// Auth Request cleanup schedule |> Cron schedule of the job that cleans old auth requests from the auth request.
         /// Defaults to every minute. Set blank to disable this job.
         auth_request_purge_schedule:   String, false,  def,    "30 * * * * *".to_owned();
+        /// Rate limiter prune schedule |> Cron schedule for dropping fully replenished rate-limiter buckets, which are otherwise never evicted. Defaults to hourly at 15 minutes past.
+        ratelimit_prune_schedule:      String, false,  def,    "0 15 * * * *".to_owned();
         /// Duo Auth context cleanup schedule |> Cron schedule of the job that cleans expired Duo contexts from the database. Does nothing if Duo MFA is disabled or set to use the legacy iframe prompt.
         /// Defaults to once every minute. Set blank to disable this job.
         duo_context_purge_schedule:   String, false,  def,    "30 * * * * *".to_owned();
@@ -794,6 +796,13 @@ make_config! {
 
         /// Enable groups (BETA!) (Know the risks!) |> Enables groups support for organizations (Currently contains known issues!).
         org_groups_enabled:            bool, false, def, false;
+
+        /// Enable SCIM v2 provisioning (BETA!) |> Master switch for the /scim/v2 endpoints. An organization also needs a generated SCIM API key before its endpoints accept requests.
+        scim_enabled:                  bool, false, def, false;
+        /// Seconds between SCIM requests |> Number of seconds, on average, between SCIM requests from the same IP address before rate limiting kicks in
+        scim_ratelimit_seconds:        u64, false, def, 1;
+        /// Max burst size for SCIM requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `scim_ratelimit_seconds`. Entra ID sends bursts during sync cycles.
+        scim_ratelimit_max_burst:      u32, false, def, 60;
 
         /// Increase note size limit (Know the risks!) |> Sets the secure note size limit to 100_000 instead of the default 10_000.
         /// WARNING: This could cause issues with clients. Also exports will not work on Bitwarden servers!
@@ -1031,6 +1040,21 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         println!("[WARNING] To enable the admin page without a token, use `DISABLE_ADMIN_TOKEN`.");
     }
 
+    if cfg.scim_enabled && !cfg.org_events_enabled {
+        println!("[WARNING] `SCIM_ENABLED` is set, but `ORG_EVENTS_ENABLED` is not.");
+        println!("[WARNING] SCIM provisioning changes will not appear in the organization event log.");
+    }
+
+    // Both feed NonZeroU32/Quota::with_period, which panic inside a LazyLock on
+    // zero. That poisons the lock, so every later SCIM request re-panics and the
+    // endpoint stays dead until restart. Fail at config load instead.
+    if cfg.scim_ratelimit_seconds == 0 {
+        err!("`SCIM_RATELIMIT_SECONDS` must be greater than 0");
+    }
+    if cfg.scim_ratelimit_max_burst == 0 {
+        err!("`SCIM_RATELIMIT_MAX_BURST` must be greater than 0");
+    }
+
     if cfg.push_enabled && (cfg.push_installation_id == String::new() || cfg.push_installation_key == String::new()) {
         err!(
             "Misconfigured Push Notification service\n\
@@ -1263,6 +1287,10 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
 
     if !cfg.event_cleanup_schedule.is_empty() && cfg.event_cleanup_schedule.parse::<Schedule>().is_err() {
         err!("`EVENT_CLEANUP_SCHEDULE` is not a valid cron expression")
+    }
+
+    if !cfg.ratelimit_prune_schedule.is_empty() && cfg.ratelimit_prune_schedule.parse::<Schedule>().is_err() {
+        err!("`RATELIMIT_PRUNE_SCHEDULE` is not a valid cron expression")
     }
 
     if !cfg.auth_request_purge_schedule.is_empty() && cfg.auth_request_purge_schedule.parse::<Schedule>().is_err() {
@@ -1868,3 +1896,66 @@ handlebars::handlebars_helper!(webver: | web_vault_version: String |
 handlebars::handlebars_helper!(vwver: | vw_version: String |
     semver::VersionReq::parse(&vw_version).expect("Invalid Vaultwarden version compare string").matches(&VW_VERSION)
 );
+
+// FORK ADDITION (SCIM): coverage for the SCIM-related validators.
+//
+// `validate_config` is a pure function over `ConfigItems`, so these are cheap -
+// and the failures they prevent are not. A zero rate-limit value panics inside
+// `NonZeroU32::new(..).expect(..)` / `Quota::with_period` within a `LazyLock`,
+// which POISONS the lock: every subsequent SCIM request re-panics and the
+// endpoint stays dead until the process restarts. Both `err!` blocks could be
+// deleted with the whole suite still green.
+#[cfg(test)]
+mod scim_config_validation_tests {
+    use super::{ConfigBuilder, ConfigItems, validate_config};
+
+    // A config carrying every DECLARED default, not Rust's zero-values.
+    //
+    // ConfigItems::default() is all zeroes and empty strings, so validate_config
+    // returns at DATABASE_URL long before reaching anything SCIM owns - and
+    // hand-patching the fields in between just chases whichever validator comes
+    // next. ConfigBuilder::build() applies the defaults declared in the macro,
+    // which is the same path the server takes at startup.
+    fn valid_config() -> ConfigItems {
+        let mut cfg = ConfigBuilder::default().build();
+        cfg.database_url = String::from("sqlite:///tmp/vw-config-validation-test.sqlite3");
+        cfg
+    }
+
+    // Asserts on the MESSAGE, not merely on is_err(). validate_config returns at
+    // the FIRST failure, so "it errored" would pass even with the SCIM guards
+    // deleted - some other validator would have refused the same input. Naming
+    // the setting is what makes each of these a test of the guard it claims to
+    // test.
+    fn refusal_mentions(mutate: impl FnOnce(&mut ConfigItems), needle: &str) {
+        let mut cfg = valid_config();
+        mutate(&mut cfg);
+        let message = validate_config(&cfg, false).expect_err("this configuration must be refused").to_string();
+        assert!(message.contains(needle), "expected the refusal to name {needle}, got: {message}");
+    }
+
+    #[test]
+    fn the_declared_defaults_validate() {
+        // The control. Without it the three refusals below could all be passing
+        // because the baseline itself is invalid.
+        assert!(validate_config(&valid_config(), false).is_ok(), "the shipped defaults must validate");
+    }
+
+    #[test]
+    fn a_zero_scim_ratelimit_period_is_refused() {
+        refusal_mentions(|cfg| cfg.scim_ratelimit_seconds = 0, "SCIM_RATELIMIT_SECONDS");
+    }
+
+    #[test]
+    fn a_zero_scim_ratelimit_burst_is_refused() {
+        refusal_mentions(|cfg| cfg.scim_ratelimit_max_burst = 0, "SCIM_RATELIMIT_MAX_BURST");
+    }
+
+    #[test]
+    fn a_malformed_prune_schedule_is_refused() {
+        refusal_mentions(
+            |cfg| cfg.ratelimit_prune_schedule = String::from("not a cron expression"),
+            "RATELIMIT_PRUNE_SCHEDULE",
+        );
+    }
+}

@@ -24,5 +24,8 @@ extend-ignore-re = [
     # https://github.com/bitwarden/clients/blob/9612a4ac45063e372a6fbe87eb253c7cb3c588fb/libs/common/src/auth/services/anonymous-hub.service.ts#L45
     "AuthRequestResponseRecieved",
     # Ignore Punycode/IDN tests
-    "xn--.+"
+    "xn--.+",
+    # FORK ADDITION (SCIM): product name, cited in the deployment guide's
+    # break-glass section as an example of an out-of-band secret store.
+    "HashiCorp"
 ]
