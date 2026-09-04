@@ -76,7 +76,7 @@ fn check_scim_enabled() -> EmptyResult {
 // lifecycle, and that row keeps no history. See EventType for why the numbers
 // sit outside Bitwarden's range.
 async fn log_scim_key_event(event_type: EventType, headers: &OwnerHeaders, org_id: &OrganizationId, conn: &DbConn) {
-    log_event(event_type as i32, org_id, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn).await;
+    log_event(event_type, org_id, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn).await;
 }
 
 // The single place a SCIM token is minted. Generates the secret, replaces any

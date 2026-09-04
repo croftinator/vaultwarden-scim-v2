@@ -145,16 +145,8 @@ pub(super) async fn save_member(member: &Membership, conn: &DbConn) -> Result<()
 }
 
 async fn log_scim_event(event_type: EventType, member: &Membership, token: &ScimToken, conn: &DbConn) {
-    log_event(
-        event_type as i32,
-        &member.uuid,
-        &token.org_uuid,
-        &SCIM_ACTOR.into(),
-        SCIM_DEVICE_TYPE,
-        &token.ip.ip,
-        conn,
-    )
-    .await;
+    log_event(event_type, &member.uuid, &token.org_uuid, &SCIM_ACTOR.into(), SCIM_DEVICE_TYPE, &token.ip.ip, conn)
+        .await;
 }
 
 #[derive(FromForm)]

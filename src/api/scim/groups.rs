@@ -109,8 +109,7 @@ fn scim_group_body(group: &Group, token: &ScimToken, members: Option<&[Membershi
 }
 
 async fn log_group_event(event_type: EventType, group_uuid: &GroupId, token: &ScimToken, conn: &DbConn) {
-    log_event(event_type as i32, group_uuid, &token.org_uuid, &SCIM_ACTOR.into(), SCIM_DEVICE_TYPE, &token.ip.ip, conn)
-        .await;
+    log_event(event_type, group_uuid, &token.org_uuid, &SCIM_ACTOR.into(), SCIM_DEVICE_TYPE, &token.ip.ip, conn).await;
 }
 
 // The 400 every unresolvable member value produces. Deliberately identical for
